@@ -6,6 +6,7 @@
 // those specializations as targeting a non-template.
 #include <d3d11.h>
 #include <codecapi.h>
+#include <d3d10.h>  // ID3D10Multithread, which also guards D3D11 devices
 #include <icodecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
@@ -558,6 +559,19 @@ std::expected<void, EncoderError> H264Encoder::open(ID3D11Device* device, const 
         return std::unexpected(make_error(EncoderError::Code::mf_startup_failed, hresult, "MFStartup"));
     }
     impl_->mf_started = true;
+
+    // An async encoder MFT runs on its own worker thread and uses this same
+    // device and its immediate context (through the device manager) while
+    // the capture thread is still issuing CopyResource / VideoProcessorBlt
+    // on it. An immediate context isn't thread-safe unless multithread
+    // protection is on; without it, encoder output goes missing or the
+    // driver stalls, differently on every run.
+    ComPtr<ID3D10Multithread> multithread;
+    hresult = device->QueryInterface(__uuidof(ID3D10Multithread), &multithread);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::device_manager_failed, hresult, "ID3D10Multithread"));
+    }
+    multithread->SetMultithreadProtected(TRUE);
 
     if (auto result = create_device_manager(device, impl_->device_manager); !result.has_value()) {
         return std::unexpected(result.error());
