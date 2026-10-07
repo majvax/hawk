@@ -651,7 +651,34 @@ std::expected<std::vector<EncodedPacket>, EncoderError> H264Encoder::encode(
     // E_UNEXPECTED). With no input request outstanding, this frame is
     // dropped (skipping the GPU conversion too), which is fine for live capture.
     const bool is_async = impl_->event_generator.Get() != nullptr;
+
+    // Output lags input, so take everything announced so far, not just one
+    // access unit — otherwise it sits in the encoder until a later call and
+    // the stream visibly stalls behind the screen.
+    const auto drain_outputs = [&]() -> std::expected<void, EncoderError> {
+        if (auto polled = impl_->poll_events(); !polled.has_value()) {
+            return std::unexpected(polled.error());
+        }
+        while (impl_->pending_outputs > 0) {
+            --impl_->pending_outputs;
+            auto packet = impl_->pull_output(timestamp);
+            if (!packet.has_value()) {
+                return std::unexpected(packet.error());
+            }
+            if (packet->has_value()) {
+                packets.push_back(std::move(**packet));
+            }
+        }
+        return {};
+    };
+
+    // Collect last tick's output before deciding whether to submit: the MFT
+    // only asks for its next input once that output has been taken, so
+    // checking for an input request first skips every other frame.
     if (is_async) {
+        if (auto drained = drain_outputs(); !drained.has_value()) {
+            return std::unexpected(drained.error());
+        }
         if (auto polled = impl_->poll_events(); !polled.has_value()) {
             return std::unexpected(polled.error());
         }
@@ -681,21 +708,8 @@ std::expected<std::vector<EncodedPacket>, EncoderError> H264Encoder::encode(
         return packets;
     }
 
-    // Output lags input, so take everything announced so far, not just one
-    // access unit — otherwise it sits in the encoder until a later call and
-    // the stream visibly stalls behind the screen.
-    if (auto polled = impl_->poll_events(); !polled.has_value()) {
-        return std::unexpected(polled.error());
-    }
-    while (impl_->pending_outputs > 0) {
-        --impl_->pending_outputs;
-        auto packet = impl_->pull_output(timestamp);
-        if (!packet.has_value()) {
-            return std::unexpected(packet.error());
-        }
-        if (packet->has_value()) {
-            packets.push_back(std::move(**packet));
-        }
+    if (auto drained = drain_outputs(); !drained.has_value()) {
+        return std::unexpected(drained.error());
     }
     return packets;
 }

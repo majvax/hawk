@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace capture = hawk::capture;
 
@@ -204,16 +205,20 @@ int main(int argc, char* argv[]) {
     //    is re-encoded each tick, which keeps the stream alive and flushes
     //    frames still in flight in the encoder — without this, output freezes
     //    whenever the screen stops changing.
+    //
+    // The wait between ticks happens here, never inside AcquireNextFrame:
+    // the device is multithread-protected (see H264Encoder::open) and DXGI
+    // holds that lock for the whole AcquireNextFrame timeout, which starves
+    // the async encoder's worker thread and drops most frames. So each tick
+    // only polls for the newest frame (timeout 0) and then sleeps unlocked.
     constexpr auto                frame_interval = std::chrono::microseconds{1'000'000 / capture::default_encoder_fps};
     auto                          next_tick = std::chrono::steady_clock::now();
     std::optional<capture::Frame> last_frame;
 
     for (;;) {
-        const auto until_tick = next_tick - std::chrono::steady_clock::now();
-        const auto wait_ms =
-            until_tick > until_tick.zero() ? std::chrono::ceil<std::chrono::milliseconds>(until_tick).count() : 0;
+        std::this_thread::sleep_until(next_tick);
 
-        auto frame = duplicator.capture_frame(static_cast<std::uint32_t>(wait_ms));
+        auto frame = duplicator.capture_frame(0);
         if (frame.has_value()) {
             last_frame = *frame;
             ++captured_count;
@@ -221,14 +226,12 @@ int main(int argc, char* argv[]) {
             spdlog::error("capture: {}", capture::to_string(frame.error()));
             return EXIT_FAILURE;
         }
-        if (!last_frame.has_value()) {
-            continue;  // nothing captured yet; just try again
-        }
-        if (std::chrono::steady_clock::now() < next_tick) {
-            continue;  // a frame came in early; hold it until the tick
-        }
 
         next_tick += frame_interval;
+        if (!last_frame.has_value()) {
+            continue;  // nothing captured yet; try again next tick
+        }
+
         if (next_tick < std::chrono::steady_clock::now()) {
             next_tick = std::chrono::steady_clock::now() + frame_interval;  // fell behind; don't burst to catch up
         }
