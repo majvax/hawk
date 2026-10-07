@@ -1,4 +1,10 @@
 build/
+build-*/
 .cache/
 .vscode/
 bin/
+
+# TypeScript server (src/server)
+node_modules/
+dist/
+certs/

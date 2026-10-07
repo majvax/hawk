@@ -1,0 +1,519 @@
+#include "encoder.hpp"
+
+// d3d11.h must come first: it pulls in <unknwn.h>, which declares the
+// __mingw_uuidof_s primary template that codecapi.h's DEFINE_CODECAPI_GUID
+// macro explicitly specializes. Included in the other order, GCC rejects
+// those specializations as targeting a non-template.
+#include <d3d11.h>
+#include <codecapi.h>
+#include <icodecapi.h>
+#include <mfapi.h>
+#include <mferror.h>
+#include <mfidl.h>
+#include <mftransform.h>
+#include <wrl/client.h>
+
+#include <cstring>
+#include <format>
+#include <utility>
+
+// COM reference counting here is funnelled entirely through
+// Microsoft::WRL::ComPtr rather than manual Release() calls (unlike
+// duplication.cpp's handful of interfaces): this pipeline touches a dozen+
+// COM interfaces across many fallible steps, and ComPtr's RAII is what
+// makes that tractable to get right without a Windows box to iterate on.
+using Microsoft::WRL::ComPtr;
+
+namespace hawk::capture {
+
+namespace {
+
+[[nodiscard]] EncoderError make_error(EncoderError::Code code, long hresult, std::string_view context) {
+    return EncoderError{
+        .code = code,
+        .native_code = static_cast<std::uint32_t>(hresult),
+        .message = std::format("{}: HRESULT 0x{:08X}", context, static_cast<std::uint32_t>(hresult)),
+    };
+}
+
+[[nodiscard]] EncoderError make_simple_error(EncoderError::Code code, std::string message) {
+    return EncoderError{.code = code, .native_code = 0, .message = std::move(message)};
+}
+
+constexpr LONGLONG hundred_ns_per_second = 10'000'000LL;
+
+[[nodiscard]] std::expected<void, EncoderError> create_device_manager(ID3D11Device* device,
+                                                                       ComPtr<IMFDXGIDeviceManager>& out) {
+    UINT    reset_token = 0;
+    HRESULT hresult = MFCreateDXGIDeviceManager(&reset_token, &out);
+    if (FAILED(hresult)) {
+        return std::unexpected(
+            make_error(EncoderError::Code::device_manager_failed, hresult, "MFCreateDXGIDeviceManager"));
+    }
+
+    hresult = out->ResetDevice(device, reset_token);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::device_manager_failed, hresult, "ResetDevice"));
+    }
+    return {};
+}
+
+// Everything needed to turn a BGRA8 texture into the NV12 texture the
+// encoder consumes, entirely on the GPU.
+struct VideoProcessor {
+    ComPtr<ID3D11VideoDevice>              device;
+    ComPtr<ID3D11VideoContext>             context;
+    ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
+    ComPtr<ID3D11VideoProcessor>           processor;
+    ComPtr<ID3D11Texture2D>                nv12_texture;
+};
+
+[[nodiscard]] std::expected<VideoProcessor, EncoderError> create_video_processor(ID3D11Device*        device,
+                                                                                  const EncoderConfig& config) {
+    VideoProcessor video;
+
+    HRESULT hresult = device->QueryInterface(__uuidof(ID3D11VideoDevice), &video.device);
+    if (FAILED(hresult)) {
+        return std::unexpected(
+            make_error(EncoderError::Code::device_manager_failed, hresult, "ID3D11VideoDevice"));
+    }
+
+    ComPtr<ID3D11DeviceContext> immediate_context;
+    device->GetImmediateContext(&immediate_context);
+    hresult = immediate_context.As(&video.context);
+    if (FAILED(hresult)) {
+        return std::unexpected(
+            make_error(EncoderError::Code::device_manager_failed, hresult, "ID3D11VideoContext"));
+    }
+
+    const D3D11_VIDEO_PROCESSOR_CONTENT_DESC content_desc{
+        .InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        .InputFrameRate = {.Numerator = config.fps, .Denominator = 1},
+        .InputWidth = config.width,
+        .InputHeight = config.height,
+        .OutputFrameRate = {.Numerator = config.fps, .Denominator = 1},
+        .OutputWidth = config.width,
+        .OutputHeight = config.height,
+        .Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    };
+    hresult = video.device->CreateVideoProcessorEnumerator(&content_desc, &video.enumerator);
+    if (FAILED(hresult)) {
+        return std::unexpected(
+            make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessorEnumerator"));
+    }
+
+    hresult = video.device->CreateVideoProcessor(video.enumerator.Get(), 0, &video.processor);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessor"));
+    }
+
+    const D3D11_TEXTURE2D_DESC nv12_desc{
+        .Width = config.width,
+        .Height = config.height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_NV12,
+        .SampleDesc = {.Count = 1, .Quality = 0},
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_RENDER_TARGET,
+        .CPUAccessFlags = 0,
+        .MiscFlags = 0,
+    };
+    hresult = device->CreateTexture2D(&nv12_desc, nullptr, &video.nv12_texture);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::convert_failed, hresult, "CreateTexture2D(nv12)"));
+    }
+
+    return video;
+}
+
+[[nodiscard]] std::expected<ComPtr<IMFTransform>, EncoderError> activate_hardware_h264_encoder() {
+    MFT_REGISTER_TYPE_INFO wanted_output{.guidMajorType = MFMediaType_Video, .guidSubtype = MFVideoFormat_H264};
+    IMFActivate**           activations = nullptr;
+    UINT32                  activation_count = 0;
+    HRESULT hresult = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                                nullptr, &wanted_output, &activations, &activation_count);
+    if (SUCCEEDED(hresult) && activation_count == 0) {
+        hresult = MF_E_NO_MORE_TYPES;
+    }
+    if (FAILED(hresult)) {
+        if (activations != nullptr) {
+            CoTaskMemFree(static_cast<void*>(activations));
+        }
+        return std::unexpected(make_simple_error(EncoderError::Code::no_hardware_encoder,
+                                                  "no hardware H.264 encoder MFT found on this system"));
+    }
+
+    ComPtr<IMFTransform> transform;
+    hresult = activations[0]->ActivateObject(__uuidof(IMFTransform), &transform);
+    for (UINT32 i = 0; i < activation_count; ++i) {
+        activations[i]->Release();
+    }
+    CoTaskMemFree(static_cast<void*>(activations));
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::no_hardware_encoder, hresult, "ActivateObject"));
+    }
+    return transform;
+}
+
+[[nodiscard]] std::expected<void, EncoderError> configure_output_type(IMFTransform&        transform,
+                                                                       const EncoderConfig& config) {
+    ComPtr<IMFMediaType> out_type;
+    HRESULT              hresult = MFCreateMediaType(&out_type);
+    if (SUCCEEDED(hresult)) {
+        hresult = out_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = out_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = out_type->SetUINT32(MF_MT_AVG_BITRATE, config.bitrate_bps);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = out_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = MFSetAttributeSize(out_type.Get(), MF_MT_FRAME_SIZE, config.width, config.height);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = MFSetAttributeRatio(out_type.Get(), MF_MT_FRAME_RATE, config.fps, 1);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = MFSetAttributeRatio(out_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = transform.SetOutputType(0, out_type.Get(), 0);
+    }
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::configure_failed, hresult, "SetOutputType"));
+    }
+    return {};
+}
+
+[[nodiscard]] std::expected<void, EncoderError> configure_input_type(IMFTransform&        transform,
+                                                                      const EncoderConfig& config) {
+    ComPtr<IMFMediaType> in_type;
+    HRESULT              hresult = MFCreateMediaType(&in_type);
+    if (SUCCEEDED(hresult)) {
+        hresult = in_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = in_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = in_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = MFSetAttributeSize(in_type.Get(), MF_MT_FRAME_SIZE, config.width, config.height);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = MFSetAttributeRatio(in_type.Get(), MF_MT_FRAME_RATE, config.fps, 1);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = MFSetAttributeRatio(in_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = transform.SetInputType(0, in_type.Get(), 0);
+    }
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::configure_failed, hresult, "SetInputType"));
+    }
+    return {};
+}
+
+// Best-effort: ask for real-time, low-latency behavior if this encoder
+// exposes ICodecAPI. Not every hardware MFT implements it, and that's not
+// fatal — it just means we take whatever its defaults are.
+void enable_low_latency_mode(IMFTransform& transform) {
+    ComPtr<ICodecAPI> codec_api;
+    if (FAILED(transform.QueryInterface(__uuidof(ICodecAPI), &codec_api))) {
+        return;
+    }
+
+    VARIANT enabled{};
+    enabled.vt = VT_BOOL;
+    enabled.boolVal = VARIANT_TRUE;
+    codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &enabled);
+    codec_api->SetValue(&CODECAPI_AVEncCommonRealTime, &enabled);
+}
+
+}  // namespace
+
+std::string_view to_string(EncoderError::Code code) noexcept {
+    switch (code) {
+        case EncoderError::Code::mf_startup_failed:
+            return "mf_startup_failed";
+        case EncoderError::Code::no_hardware_encoder:
+            return "no_hardware_encoder";
+        case EncoderError::Code::configure_failed:
+            return "configure_failed";
+        case EncoderError::Code::device_manager_failed:
+            return "device_manager_failed";
+        case EncoderError::Code::convert_failed:
+            return "convert_failed";
+        case EncoderError::Code::encode_failed:
+            return "encode_failed";
+    }
+    return "unknown";
+}
+
+std::string to_string(const EncoderError& error) {
+    if (error.native_code != 0) {
+        return std::format("[{}] {} (native code 0x{:08X})", to_string(error.code), error.message,
+                            error.native_code);
+    }
+    return std::format("[{}] {}", to_string(error.code), error.message);
+}
+
+struct H264Encoder::Impl {
+    ComPtr<IMFDXGIDeviceManager>            device_manager;
+    ComPtr<IMFTransform>                    transform;
+    ComPtr<ID3D11VideoDevice>               video_device;
+    ComPtr<ID3D11VideoContext>              video_context;
+    ComPtr<ID3D11VideoProcessorEnumerator>  video_enumerator;
+    ComPtr<ID3D11VideoProcessor>            video_processor;
+    ComPtr<ID3D11Texture2D>                 nv12_texture;  // GPU conversion target, reused every frame
+
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t fps = 0;
+    DWORD         output_stream_size = 0;
+    bool          mft_provides_output_samples = false;
+    bool          mf_started = false;
+
+    Impl() = default;
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+    Impl(Impl&&) = delete;
+    Impl& operator=(Impl&&) = delete;
+
+    ~Impl() {
+        if (transform.Get() != nullptr) {
+            transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        }
+        // Explicit, ordered teardown before MFShutdown() tears down the MF
+        // platform out from under any of these — ComPtr destructors alone
+        // would run in declaration order, but Reset() here makes that
+        // ordering an explicit invariant rather than an accident of layout.
+        transform.Reset();
+        video_processor.Reset();
+        video_enumerator.Reset();
+        nv12_texture.Reset();
+        video_context.Reset();
+        video_device.Reset();
+        device_manager.Reset();
+        if (mf_started) {
+            MFShutdown();
+        }
+    }
+};
+
+H264Encoder::H264Encoder() : impl_(std::make_unique<Impl>()) {}
+H264Encoder::~H264Encoder() = default;
+H264Encoder::H264Encoder(H264Encoder&&) noexcept = default;
+H264Encoder& H264Encoder::operator=(H264Encoder&&) noexcept = default;
+
+std::expected<void, EncoderError> H264Encoder::open(ID3D11Device* device, const EncoderConfig& config) {
+    impl_->width = config.width;
+    impl_->height = config.height;
+    impl_->fps = config.fps;
+
+    HRESULT hresult = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::mf_startup_failed, hresult, "MFStartup"));
+    }
+    impl_->mf_started = true;
+
+    if (auto result = create_device_manager(device, impl_->device_manager); !result.has_value()) {
+        return std::unexpected(result.error());
+    }
+
+    auto video = create_video_processor(device, config);
+    if (!video.has_value()) {
+        return std::unexpected(video.error());
+    }
+    impl_->video_device = std::move(video->device);
+    impl_->video_context = std::move(video->context);
+    impl_->video_enumerator = std::move(video->enumerator);
+    impl_->video_processor = std::move(video->processor);
+    impl_->nv12_texture = std::move(video->nv12_texture);
+
+    // Hardware H.264 encoder MFT — Quick Sync / NVENC / VCE, whichever this
+    // system exposes.
+    auto transform = activate_hardware_h264_encoder();
+    if (!transform.has_value()) {
+        return std::unexpected(transform.error());
+    }
+    impl_->transform = std::move(*transform);
+
+    hresult = impl_->transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                                               reinterpret_cast<ULONG_PTR>(impl_->device_manager.Get()));
+    if (FAILED(hresult)) {
+        return std::unexpected(
+            make_error(EncoderError::Code::configure_failed, hresult, "MFT_MESSAGE_SET_D3D_MANAGER"));
+    }
+
+    // Output type first: most hardware encoder MFTs require this before
+    // they'll accept an input type.
+    if (auto result = configure_output_type(*impl_->transform.Get(), config); !result.has_value()) {
+        return std::unexpected(result.error());
+    }
+    if (auto result = configure_input_type(*impl_->transform.Get(), config); !result.has_value()) {
+        return std::unexpected(result.error());
+    }
+
+    enable_low_latency_mode(*impl_->transform.Get());
+
+    MFT_OUTPUT_STREAM_INFO stream_info{};
+    hresult = impl_->transform->GetOutputStreamInfo(0, &stream_info);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::configure_failed, hresult, "GetOutputStreamInfo"));
+    }
+    constexpr auto provides_or_can_provide_samples = static_cast<DWORD>(MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) |
+                                                      static_cast<DWORD>(MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES);
+    impl_->mft_provides_output_samples = (stream_info.dwFlags & provides_or_can_provide_samples) != 0;
+    impl_->output_stream_size = stream_info.cbSize;
+
+    impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+    return {};
+}
+
+std::expected<std::optional<EncodedPacket>, EncoderError> H264Encoder::encode(
+    ID3D11Texture2D* bgra_texture, std::chrono::microseconds timestamp) {
+    // --- BGRA8 -> NV12, entirely on the GPU ---
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_view_desc{
+        .FourCC = 0,
+        .ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D,
+        .Texture2D = {.MipSlice = 0, .ArraySlice = 0},
+    };
+
+    ComPtr<ID3D11VideoProcessorInputView> input_view;
+    HRESULT hresult = impl_->video_device->CreateVideoProcessorInputView(
+        bgra_texture, impl_->video_enumerator.Get(), &input_view_desc, &input_view);
+    if (FAILED(hresult)) {
+        return std::unexpected(
+            make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessorInputView"));
+    }
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{
+        .ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D,
+        .Texture2D = {.MipSlice = 0},
+    };
+
+    ComPtr<ID3D11VideoProcessorOutputView> output_view;
+    hresult = impl_->video_device->CreateVideoProcessorOutputView(impl_->nv12_texture.Get(),
+                                                                   impl_->video_enumerator.Get(), &output_view_desc,
+                                                                   &output_view);
+    if (FAILED(hresult)) {
+        return std::unexpected(
+            make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessorOutputView"));
+    }
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = input_view.Get();
+    hresult = impl_->video_context->VideoProcessorBlt(impl_->video_processor.Get(), output_view.Get(), 0, 1, &stream);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::convert_failed, hresult, "VideoProcessorBlt"));
+    }
+
+    // --- wrap the NV12 texture in a sample and feed the encoder ---
+    ComPtr<IMFMediaBuffer> input_buffer;
+    hresult = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), impl_->nv12_texture.Get(), 0, FALSE,
+                                        &input_buffer);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "MFCreateDXGISurfaceBuffer"));
+    }
+
+    const LONGLONG sample_time = timestamp.count() * 10;  // microseconds -> 100ns units
+    const LONGLONG sample_duration = hundred_ns_per_second / impl_->fps;
+
+    ComPtr<IMFSample> input_sample;
+    hresult = MFCreateSample(&input_sample);
+    if (SUCCEEDED(hresult)) {
+        hresult = input_sample->AddBuffer(input_buffer.Get());
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = input_sample->SetSampleTime(sample_time);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = input_sample->SetSampleDuration(sample_duration);
+    }
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "build input sample"));
+    }
+
+    hresult = impl_->transform->ProcessInput(0, input_sample.Get(), 0);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ProcessInput"));
+    }
+
+    // --- pull output, if the encoder has any ready yet ---
+    MFT_OUTPUT_DATA_BUFFER output_buffer{};
+    if (!impl_->mft_provides_output_samples) {
+        ComPtr<IMFSample>      preallocated_sample;
+        ComPtr<IMFMediaBuffer> preallocated_buffer;
+        hresult = MFCreateSample(&preallocated_sample);
+        if (SUCCEEDED(hresult)) {
+            hresult = MFCreateMemoryBuffer(impl_->output_stream_size, &preallocated_buffer);
+        }
+        if (SUCCEEDED(hresult)) {
+            hresult = preallocated_sample->AddBuffer(preallocated_buffer.Get());
+        }
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "allocate output sample"));
+        }
+        output_buffer.pSample = preallocated_sample.Detach();
+    }
+
+    DWORD status = 0;
+    hresult = impl_->transform->ProcessOutput(0, 1, &output_buffer, &status);
+
+    // Whatever ProcessOutput left in pSample/pEvents, we now own exactly one
+    // reference to it (ours, carried through from the branch above, or one
+    // the MFT allocated and AddRef'd) — Attach takes ownership of that
+    // without an extra AddRef, on every path including the error ones below.
+    ComPtr<IMFSample>     result_sample;
+    ComPtr<IMFCollection> result_events;
+    result_sample.Attach(output_buffer.pSample);
+    result_events.Attach(output_buffer.pEvents);
+
+    if (hresult == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+        return std::optional<EncodedPacket>{};  // still buffering; nothing to emit yet
+    }
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ProcessOutput"));
+    }
+    if (result_sample.Get() == nullptr) {
+        return std::unexpected(
+            make_simple_error(EncoderError::Code::encode_failed, "ProcessOutput succeeded with no sample"));
+    }
+
+    UINT32 is_keyframe = 0;
+    result_sample->GetUINT32(MFSampleExtension_CleanPoint, &is_keyframe);
+
+    ComPtr<IMFMediaBuffer> result_buffer;
+    hresult = result_sample->ConvertToContiguousBuffer(&result_buffer);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ConvertToContiguousBuffer"));
+    }
+
+    BYTE* raw_data = nullptr;
+    DWORD data_length = 0;
+    hresult = result_buffer->Lock(&raw_data, nullptr, &data_length);
+    if (FAILED(hresult)) {
+        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "Lock(output buffer)"));
+    }
+
+    EncodedPacket packet{.data = {}, .is_keyframe = is_keyframe != 0, .timestamp = timestamp};
+    packet.data.resize(data_length);
+    std::memcpy(packet.data.data(), raw_data, data_length);
+    result_buffer->Unlock();
+
+    return std::optional<EncodedPacket>{std::move(packet)};
+}
+
+}  // namespace hawk::capture

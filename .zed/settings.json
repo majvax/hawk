@@ -1,0 +1,11 @@
+{
+  "lsp": {
+    "clangd": {
+      "binary": {
+        "arguments": [
+          "--query-driver=/usr/bin/x86_64-w64-mingw32-*"
+        ]
+      }
+    }
+  }
+}
