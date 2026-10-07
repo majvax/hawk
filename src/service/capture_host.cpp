@@ -302,7 +302,13 @@ struct CaptureHost::Impl {
         }
 
         if (result == ERROR_BROKEN_PIPE) {
-            spdlog::warn("capture: hawk-capture exited or closed the pipe");
+            DWORD exit_code = STILL_ACTIVE;
+            GetExitCodeProcess(process.get(), &exit_code);
+            if (exit_code == STILL_ACTIVE) {
+                spdlog::warn("capture: hawk-capture closed the pipe");
+            } else {
+                spdlog::warn("capture: hawk-capture exited with code {:#x}", exit_code);
+            }
         } else if (result != NO_ERROR && result != ERROR_OPERATION_ABORTED) {
             spdlog::error("capture: reading from hawk-capture failed: Win32 error {}", result);
         }

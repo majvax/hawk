@@ -5,9 +5,11 @@
 #include <objbase.h>
 #include <timeapi.h>
 
+#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <optional>
@@ -130,6 +132,26 @@ private:
     return std::nullopt;
 }
 
+// Launched by hawk-service there is no console to log to, so log to
+// %TEMP%\hawk-capture.log (the logged-on user's temp directory) instead.
+void init_logging(bool launched_by_service) {
+    if (launched_by_service) {
+        std::array<char, MAX_PATH + 1> temp{};
+        const DWORD length = GetTempPathA(static_cast<DWORD>(temp.size()), temp.data());
+        if (length != 0 && length < temp.size()) {
+            try {
+                auto logger = spdlog::basic_logger_mt("hawk-capture", std::string(temp.data(), length) + "hawk-capture.log",
+                                                      /*truncate=*/true);
+                spdlog::set_default_logger(logger);
+                spdlog::flush_on(spdlog::level::info);
+                return;
+            } catch (const spdlog::spdlog_ex&) {  // fall through to stdout
+            }
+        }
+    }
+    spdlog::set_default_logger(spdlog::stdout_color_mt("hawk-capture"));
+}
+
 }  // namespace
 
 // Standalone helper: must run as an ordinary process inside the interactive
@@ -139,12 +161,11 @@ private:
 // pipe and exits once the service closes it. Run on its own, without
 // `--pipe`, it only logs packet stats.
 int main(int argc, char* argv[]) {
-    auto logger = spdlog::stdout_color_mt("hawk-capture");
-    spdlog::set_default_logger(logger);
+    const auto pipe_name = pipe_name_from_args(std::span(argv, static_cast<std::size_t>(argc)));
+    init_logging(pipe_name.has_value());
 
     PacketPipe pipe;
-    if (const auto pipe_name = pipe_name_from_args(std::span(argv, static_cast<std::size_t>(argc)));
-        pipe_name.has_value() && !pipe.open(*pipe_name)) {
+    if (pipe_name.has_value() && !pipe.open(*pipe_name)) {
         return EXIT_FAILURE;
     }
 
