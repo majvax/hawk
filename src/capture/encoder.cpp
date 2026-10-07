@@ -153,6 +153,22 @@ struct VideoProcessor {
     if (FAILED(hresult)) {
         return std::unexpected(make_error(EncoderError::Code::no_hardware_encoder, hresult, "ActivateObject"));
     }
+
+    // Most hardware encoder MFTs (since Windows 8) are asynchronous and
+    // reject nearly every call — including MFT_MESSAGE_SET_D3D_MANAGER —
+    // with MF_E_TRANSFORM_ASYNC_LOCKED until this is set. We still drive it
+    // with plain synchronous ProcessInput/ProcessOutput calls rather than
+    // pumping its event queue; see encode()'s MF_E_NOTACCEPTING handling for
+    // the one place that matters in practice for a simple capture loop.
+    ComPtr<IMFAttributes> attributes;
+    if (SUCCEEDED(transform->GetAttributes(&attributes))) {
+        UINT32 is_async = 0;
+        attributes->GetUINT32(MF_TRANSFORM_ASYNC, &is_async);
+        if (is_async != 0) {
+            attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+        }
+    }
+
     return transform;
 }
 
@@ -447,6 +463,13 @@ std::expected<std::optional<EncodedPacket>, EncoderError> H264Encoder::encode(
     }
 
     hresult = impl_->transform->ProcessInput(0, input_sample.Get(), 0);
+    if (hresult == MF_E_NOTACCEPTING) {
+        // The encoder (most hardware H.264 MFTs are asynchronous, see
+        // activate_hardware_h264_encoder()) hasn't finished the previous
+        // frame yet. Dropping this frame is fine for live capture; the
+        // caller will offer the next one.
+        return std::optional<EncodedPacket>{};
+    }
     if (FAILED(hresult)) {
         return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ProcessInput"));
     }
