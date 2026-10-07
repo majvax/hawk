@@ -27,6 +27,14 @@ constexpr DWORD             pipe_buffer_size = 1024 * 1024;
 constexpr DWORD             capture_exit_timeout_ms = 2000;
 constexpr DWORD             no_console_session = 0xFFFFFFFF;
 
+// What hawk-capture's end of the pipe is opened with, and so exactly what the
+// pipe's DACL grants the logged-on user. FILE_READ_ATTRIBUTES is not
+// optional: CreateFile() adds it to the access it asks the object manager
+// for, so a grant of only the write rights is denied with ERROR_ACCESS_DENIED
+// before hawk-capture gets a handle. Keep this in sync with the CreateFileA
+// call in capture/main.cpp.
+constexpr DWORD capture_client_access = FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+
 [[nodiscard]] CaptureHostError make_error(CaptureHostError::Code code, DWORD native_code, std::string_view context) {
     return CaptureHostError{
         .code = code,
@@ -97,7 +105,7 @@ private:
 // anyone else already squats the name.
 [[nodiscard]] std::expected<UniqueHandle, CaptureHostError> create_pipe(const std::wstring& name,
                                                                          const std::wstring& user_sid) {
-    const std::wstring   sddl = std::format(L"D:P(A;;GA;;;SY)(A;;GW;;;{})", user_sid);
+    const std::wstring   sddl = std::format(L"D:P(A;;GA;;;SY)(A;;0x{:08X};;;{})", capture_client_access, user_sid);
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor,
                                                              nullptr) == FALSE) {

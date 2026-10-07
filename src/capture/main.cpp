@@ -80,7 +80,12 @@ public:
     PacketPipe& operator=(PacketPipe&&) = delete;
 
     [[nodiscard]] bool open(const std::string& name) {
-        pipe_ = CreateFileA(name.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        // Not GENERIC_WRITE: that also asks for FILE_APPEND_DATA, which on a
+        // pipe is FILE_CREATE_PIPE_INSTANCE, and the service's DACL grants us
+        // only what writing actually needs. FILE_READ_ATTRIBUTES is in the
+        // set because CreateFile requests it for us either way.
+        constexpr DWORD access = FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        pipe_ = CreateFileA(name.c_str(), access, 0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (pipe_ == INVALID_HANDLE_VALUE) {
             spdlog::error("capture: failed to open pipe {}: Win32 error {}", name, GetLastError());
             return false;
