@@ -168,7 +168,11 @@ std::expected<void, CaptureError> DesktopDuplicator::open(std::uint32_t output_i
         .Format = DXGI_FORMAT_B8G8R8A8_UNORM,
         .SampleDesc = {.Count = 1, .Quality = 0},
         .Usage = D3D11_USAGE_DEFAULT,
-        .BindFlags = D3D11_BIND_SHADER_RESOURCE,
+        // D3D11 video-processor input views (see H264Encoder's BGRA->NV12
+        // step) require the source resource to carry this bind flag;
+        // SHADER_RESOURCE alone makes CreateVideoProcessorInputView fail
+        // with E_INVALIDARG.
+        .BindFlags = D3D11_BIND_RENDER_TARGET,
         .CPUAccessFlags = 0,
         .MiscFlags = 0,
     };

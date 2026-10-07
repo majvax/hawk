@@ -33,10 +33,11 @@ struct CaptureError {
 [[nodiscard]] std::string      to_string(const CaptureError& error);
 
 // A captured frame, resident entirely on the GPU: BGRA8, D3D11_USAGE_DEFAULT,
-// bound as a shader resource so it can feed straight into a video processor
-// for color conversion (e.g. H264Encoder). Borrows the DesktopDuplicator's
-// copy texture: valid only until the next capture_frame() call or the
-// duplicator's destruction, whichever is first.
+// bound as a render target (what D3D11 video-processor input views require)
+// so it can feed straight into a video processor for color conversion (e.g.
+// H264Encoder). Borrows the DesktopDuplicator's copy texture: valid only
+// until the next capture_frame() call or the duplicator's destruction,
+// whichever is first.
 struct Frame {
     std::uint32_t    width = 0;
     std::uint32_t    height = 0;
