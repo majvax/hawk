@@ -156,10 +156,10 @@ struct VideoProcessor {
 
     // Most hardware encoder MFTs (since Windows 8) are asynchronous and
     // reject nearly every call — including MFT_MESSAGE_SET_D3D_MANAGER —
-    // with MF_E_TRANSFORM_ASYNC_LOCKED until this is set. We still drive it
-    // with plain synchronous ProcessInput/ProcessOutput calls rather than
-    // pumping its event queue; see encode()'s MF_E_NOTACCEPTING handling for
-    // the one place that matters in practice for a simple capture loop.
+    // with MF_E_TRANSFORM_ASYNC_LOCKED until this is set. Unlocking is not
+    // enough on its own: an async MFT must then be driven by its event
+    // queue (see H264Encoder::Impl::poll_events()), or ProcessOutput fails
+    // with E_UNEXPECTED.
     ComPtr<IMFAttributes> attributes;
     if (SUCCEEDED(transform->GetAttributes(&attributes))) {
         UINT32 is_async = 0;
@@ -297,6 +297,129 @@ struct H264Encoder::Impl {
     bool          mft_provides_output_samples = false;
     bool          mf_started = false;
 
+    // Async MFT bookkeeping. An async MFT accepts ProcessInput only after
+    // METransformNeedInput and ProcessOutput only after
+    // METransformHaveOutput (anything else is MF_E_NOTACCEPTING /
+    // E_UNEXPECTED), so we count the outstanding requests of each kind.
+    ComPtr<IMFMediaEventGenerator> event_generator;  // null for a synchronous MFT
+    std::uint32_t                  pending_input_requests = 0;
+    std::uint32_t                  pending_outputs = 0;
+
+    // Drains the MFT's event queue without blocking.
+    [[nodiscard]] std::expected<void, EncoderError> poll_events() {
+        for (;;) {
+            ComPtr<IMFMediaEvent> event;
+            HRESULT hresult = event_generator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+            if (hresult == MF_E_NO_EVENTS_AVAILABLE) {
+                return {};
+            }
+            if (FAILED(hresult)) {
+                return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "GetEvent"));
+            }
+
+            HRESULT event_status = S_OK;
+            event->GetStatus(&event_status);
+            if (FAILED(event_status)) {
+                return std::unexpected(
+                    make_error(EncoderError::Code::encode_failed, event_status, "encoder event status"));
+            }
+
+            MediaEventType type = MEUnknown;
+            event->GetType(&type);
+            switch (type) {
+                case METransformNeedInput:
+                    ++pending_input_requests;
+                    break;
+                case METransformHaveOutput:
+                    ++pending_outputs;
+                    break;
+                case MEError:
+                    return std::unexpected(make_simple_error(EncoderError::Code::encode_failed, "encoder MEError"));
+                default:
+                    break;
+            }
+        }
+    }
+
+    // BGRA8 -> NV12 on the GPU, then hands the NV12 frame to the encoder.
+    // Returns false if the encoder refused it (frame dropped).
+    [[nodiscard]] std::expected<bool, EncoderError> submit_frame(ID3D11Texture2D*          bgra_texture,
+                                                                 std::chrono::microseconds timestamp) {
+        // --- BGRA8 -> NV12, entirely on the GPU ---
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_view_desc{
+            .FourCC = 0,
+            .ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D,
+            .Texture2D = {.MipSlice = 0, .ArraySlice = 0},
+        };
+
+        ComPtr<ID3D11VideoProcessorInputView> input_view;
+        HRESULT hresult = video_device->CreateVideoProcessorInputView(
+            bgra_texture, video_enumerator.Get(), &input_view_desc, &input_view);
+        if (FAILED(hresult)) {
+            return std::unexpected(
+                make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessorInputView"));
+        }
+
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{
+            .ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D,
+            .Texture2D = {.MipSlice = 0},
+        };
+
+        ComPtr<ID3D11VideoProcessorOutputView> output_view;
+        hresult = video_device->CreateVideoProcessorOutputView(nv12_texture.Get(),
+                                                                       video_enumerator.Get(), &output_view_desc,
+                                                                       &output_view);
+        if (FAILED(hresult)) {
+            return std::unexpected(
+                make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessorOutputView"));
+        }
+
+        D3D11_VIDEO_PROCESSOR_STREAM stream{};
+        stream.Enable = TRUE;
+        stream.pInputSurface = input_view.Get();
+        hresult = video_context->VideoProcessorBlt(video_processor.Get(), output_view.Get(), 0, 1, &stream);
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::convert_failed, hresult, "VideoProcessorBlt"));
+        }
+
+        // --- wrap the NV12 texture in a sample and feed the encoder ---
+        ComPtr<IMFMediaBuffer> input_buffer;
+        hresult = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_texture.Get(), 0, FALSE,
+                                            &input_buffer);
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "MFCreateDXGISurfaceBuffer"));
+        }
+
+        const LONGLONG sample_time = timestamp.count() * 10;  // microseconds -> 100ns units
+        const LONGLONG sample_duration = hundred_ns_per_second / fps;
+
+        ComPtr<IMFSample> input_sample;
+        hresult = MFCreateSample(&input_sample);
+        if (SUCCEEDED(hresult)) {
+            hresult = input_sample->AddBuffer(input_buffer.Get());
+        }
+        if (SUCCEEDED(hresult)) {
+            hresult = input_sample->SetSampleTime(sample_time);
+        }
+        if (SUCCEEDED(hresult)) {
+            hresult = input_sample->SetSampleDuration(sample_duration);
+        }
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "build input sample"));
+        }
+
+        hresult = transform->ProcessInput(0, input_sample.Get(), 0);
+        if (hresult == MF_E_NOTACCEPTING) {
+            // A synchronous MFT that still has output pending. Dropping this
+            // frame is fine for live capture; the caller will offer the next one.
+            return false;
+        }
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ProcessInput"));
+        }
+        return true;
+    }
+
     Impl() = default;
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
@@ -312,6 +435,7 @@ struct H264Encoder::Impl {
         // platform out from under any of these — ComPtr destructors alone
         // would run in declaration order, but Reset() here makes that
         // ordering an explicit invariant rather than an accident of layout.
+        event_generator.Reset();
         transform.Reset();
         video_processor.Reset();
         video_enumerator.Reset();
@@ -363,6 +487,19 @@ std::expected<void, EncoderError> H264Encoder::open(ID3D11Device* device, const 
     }
     impl_->transform = std::move(*transform);
 
+    ComPtr<IMFAttributes> transform_attributes;
+    if (SUCCEEDED(impl_->transform->GetAttributes(&transform_attributes))) {
+        UINT32 is_async = 0;
+        transform_attributes->GetUINT32(MF_TRANSFORM_ASYNC, &is_async);
+        if (is_async != 0) {
+            hresult = impl_->transform.As(&impl_->event_generator);
+            if (FAILED(hresult)) {
+                return std::unexpected(
+                    make_error(EncoderError::Code::configure_failed, hresult, "IMFMediaEventGenerator"));
+            }
+        }
+    }
+
     hresult = impl_->transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
                                                reinterpret_cast<ULONG_PTR>(impl_->device_manager.Get()));
     if (FAILED(hresult)) {
@@ -399,82 +536,44 @@ std::expected<void, EncoderError> H264Encoder::open(ID3D11Device* device, const 
 
 std::expected<std::optional<EncodedPacket>, EncoderError> H264Encoder::encode(
     ID3D11Texture2D* bgra_texture, std::chrono::microseconds timestamp) {
-    // --- BGRA8 -> NV12, entirely on the GPU ---
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_view_desc{
-        .FourCC = 0,
-        .ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D,
-        .Texture2D = {.MipSlice = 0, .ArraySlice = 0},
-    };
-
-    ComPtr<ID3D11VideoProcessorInputView> input_view;
-    HRESULT hresult = impl_->video_device->CreateVideoProcessorInputView(
-        bgra_texture, impl_->video_enumerator.Get(), &input_view_desc, &input_view);
-    if (FAILED(hresult)) {
-        return std::unexpected(
-            make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessorInputView"));
+    // An async MFT only accepts input it has asked for, and only hands out
+    // output it has announced; anything else fails (ProcessOutput returns
+    // E_UNEXPECTED). With no input request outstanding, this frame is
+    // dropped (skipping the GPU conversion too), which is fine for live capture.
+    const bool is_async = impl_->event_generator.Get() != nullptr;
+    if (is_async) {
+        if (auto polled = impl_->poll_events(); !polled.has_value()) {
+            return std::unexpected(polled.error());
+        }
     }
 
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{
-        .ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D,
-        .Texture2D = {.MipSlice = 0},
-    };
-
-    ComPtr<ID3D11VideoProcessorOutputView> output_view;
-    hresult = impl_->video_device->CreateVideoProcessorOutputView(impl_->nv12_texture.Get(),
-                                                                   impl_->video_enumerator.Get(), &output_view_desc,
-                                                                   &output_view);
-    if (FAILED(hresult)) {
-        return std::unexpected(
-            make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessorOutputView"));
+    if (!is_async || impl_->pending_input_requests > 0) {
+        auto submitted = impl_->submit_frame(bgra_texture, timestamp);
+        if (!submitted.has_value()) {
+            return std::unexpected(submitted.error());
+        }
+        if (!*submitted) {
+            return std::optional<EncodedPacket>{};
+        }
+        if (is_async) {
+            --impl_->pending_input_requests;
+        }
     }
 
-    D3D11_VIDEO_PROCESSOR_STREAM stream{};
-    stream.Enable = TRUE;
-    stream.pInputSurface = input_view.Get();
-    hresult = impl_->video_context->VideoProcessorBlt(impl_->video_processor.Get(), output_view.Get(), 0, 1, &stream);
-    if (FAILED(hresult)) {
-        return std::unexpected(make_error(EncoderError::Code::convert_failed, hresult, "VideoProcessorBlt"));
-    }
-
-    // --- wrap the NV12 texture in a sample and feed the encoder ---
-    ComPtr<IMFMediaBuffer> input_buffer;
-    hresult = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), impl_->nv12_texture.Get(), 0, FALSE,
-                                        &input_buffer);
-    if (FAILED(hresult)) {
-        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "MFCreateDXGISurfaceBuffer"));
-    }
-
-    const LONGLONG sample_time = timestamp.count() * 10;  // microseconds -> 100ns units
-    const LONGLONG sample_duration = hundred_ns_per_second / impl_->fps;
-
-    ComPtr<IMFSample> input_sample;
-    hresult = MFCreateSample(&input_sample);
-    if (SUCCEEDED(hresult)) {
-        hresult = input_sample->AddBuffer(input_buffer.Get());
-    }
-    if (SUCCEEDED(hresult)) {
-        hresult = input_sample->SetSampleTime(sample_time);
-    }
-    if (SUCCEEDED(hresult)) {
-        hresult = input_sample->SetSampleDuration(sample_duration);
-    }
-    if (FAILED(hresult)) {
-        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "build input sample"));
-    }
-
-    hresult = impl_->transform->ProcessInput(0, input_sample.Get(), 0);
-    if (hresult == MF_E_NOTACCEPTING) {
-        // The encoder (most hardware H.264 MFTs are asynchronous, see
-        // activate_hardware_h264_encoder()) hasn't finished the previous
-        // frame yet. Dropping this frame is fine for live capture; the
-        // caller will offer the next one.
-        return std::optional<EncodedPacket>{};
-    }
-    if (FAILED(hresult)) {
-        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ProcessInput"));
+    if (is_async) {
+        // The output for this frame may already be announced; otherwise it
+        // is picked up on a later call.
+        if (auto polled = impl_->poll_events(); !polled.has_value()) {
+            return std::unexpected(polled.error());
+        }
+        if (impl_->pending_outputs == 0) {
+            return std::optional<EncodedPacket>{};
+        }
+        --impl_->pending_outputs;
     }
 
     // --- pull output, if the encoder has any ready yet ---
+    HRESULT                hresult = S_OK;
     MFT_OUTPUT_DATA_BUFFER output_buffer{};
     if (!impl_->mft_provides_output_samples) {
         ComPtr<IMFSample>      preallocated_sample;
@@ -518,6 +617,13 @@ std::expected<std::optional<EncodedPacket>, EncoderError> H264Encoder::encode(
     UINT32 is_keyframe = 0;
     result_sample->GetUINT32(MFSampleExtension_CleanPoint, &is_keyframe);
 
+    // Output can lag input by a frame or more, so stamp the packet with the
+    // time of the frame it actually encodes, not the one just submitted.
+    LONGLONG output_time = 0;
+    const auto packet_timestamp = SUCCEEDED(result_sample->GetSampleTime(&output_time))
+                                      ? std::chrono::microseconds{output_time / 10}  // 100ns units -> microseconds
+                                      : timestamp;
+
     ComPtr<IMFMediaBuffer> result_buffer;
     hresult = result_sample->ConvertToContiguousBuffer(&result_buffer);
     if (FAILED(hresult)) {
@@ -531,7 +637,7 @@ std::expected<std::optional<EncodedPacket>, EncoderError> H264Encoder::encode(
         return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "Lock(output buffer)"));
     }
 
-    EncodedPacket packet{.data = {}, .is_keyframe = is_keyframe != 0, .timestamp = timestamp};
+    EncodedPacket packet{.data = {}, .is_keyframe = is_keyframe != 0, .timestamp = packet_timestamp};
     packet.data.resize(data_length);
     std::memcpy(packet.data.data(), raw_data, data_length);
     result_buffer->Unlock();
