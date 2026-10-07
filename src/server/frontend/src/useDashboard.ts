@@ -9,10 +9,10 @@ import {
 
 export type ConnectionStatus = "connecting" | "open" | "closed";
 
-// Baseline H.264 profile; the hardware encoder on the host is configured for
-// plain H.264 and the decoder only needs a codec string to start on an
-// Annex-B stream (no description/SPS out of band).
-const DECODER_CODEC = "avc1.42E01E";
+// Main profile, level 4.2: what the host's hardware encoder actually emits
+// (profile_idc 77, level_idc 42 in its SPS). The stream is Annex-B with the
+// SPS/PPS inline on keyframes, so no description is needed out of band.
+const DECODER_CODEC = "avc1.4D402A";
 
 export interface Dashboard {
   devices: DeviceSnapshot[];
