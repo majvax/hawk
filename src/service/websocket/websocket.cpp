@@ -194,6 +194,9 @@ std::string to_string(const WebSocketError& error) {
 
 struct WebSocketClient::Impl {
     std::mutex mutex;
+    // WinHTTP allows one send and one receive in flight at a time, so sends
+    // from different threads are serialized here; receive() stays unlocked.
+    std::mutex send_mutex;
     HINTERNET hSession = nullptr;
     HINTERNET hConnect = nullptr;
     HINTERNET hWebSocket = nullptr;
@@ -311,6 +314,7 @@ std::expected<void, WebSocketError> WebSocketClient::send_text(std::string_view 
         socket = impl_->hWebSocket;
     }
 
+    std::scoped_lock send_lock(impl_->send_mutex);
     const DWORD result = WinHttpWebSocketSend(
         socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
         const_cast<void*>(static_cast<const void*>(message.data())), static_cast<DWORD>(message.size()));
@@ -331,6 +335,7 @@ std::expected<void, WebSocketError> WebSocketClient::send_binary(std::span<const
         socket = impl_->hWebSocket;
     }
 
+    std::scoped_lock send_lock(impl_->send_mutex);
     const DWORD result = WinHttpWebSocketSend(
         socket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
         const_cast<void*>(static_cast<const void*>(data.data())), static_cast<DWORD>(data.size()));

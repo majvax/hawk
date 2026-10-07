@@ -1,3 +1,4 @@
+#include "capture_host.hpp"
 #include "websocket/websocket.hpp"
 
 #include <windows.h>
@@ -10,6 +11,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -19,6 +22,7 @@
 #include <vector>
 
 namespace net = hawk::net;
+namespace svc = hawk::service;
 
 namespace {
 
@@ -38,12 +42,33 @@ struct HelloMessage {
     std::string machine_id;
 };
 
+// A command from the relay. Only `type` is read; any other fields are
+// ignored, so commands can grow parameters without breaking this parser.
+struct RelayCommand {
+    std::string type;
+};
+
+// Binary frame carrying one H.264 access unit to the relay:
+//   [0]      u8   kind, kVideoFrameKind = H.264 Annex B
+//   [1]      u8   flags, bit 0 = keyframe
+//   [2..9]   i64  timestamp in microseconds since the stream started, little-endian
+//   [10..]        the access unit
+constexpr std::byte   kVideoFrameKind{0x01};
+constexpr std::byte   kVideoFrameKeyframeFlag{0x01};
+constexpr std::size_t kVideoFrameHeaderSize = 10;
+
 }  // namespace
 
 template <>
 struct glz::meta<HelloMessage> {
     using T                     = HelloMessage;
     static constexpr auto value = object("type", &T::type, "machine_id", &T::machine_id);
+};
+
+template <>
+struct glz::meta<RelayCommand> {
+    using T                     = RelayCommand;
+    static constexpr auto value = object("type", &T::type);
 };
 
 namespace {
@@ -95,14 +120,60 @@ void InitLogging() {
     return {};
 }
 
+[[nodiscard]] std::vector<std::byte> BuildVideoFrame(const svc::CapturePacket& packet) {
+    std::vector<std::byte> frame(kVideoFrameHeaderSize + packet.data.size());
+    frame[0] = kVideoFrameKind;
+    frame[1] = packet.is_keyframe ? kVideoFrameKeyframeFlag : std::byte{0};
+    const auto timestamp = static_cast<std::uint64_t>(packet.timestamp.count());
+    for (std::size_t i = 0; i < sizeof(timestamp); ++i) {
+        frame[2 + i] = static_cast<std::byte>((timestamp >> (8 * i)) & 0xFFU);
+    }
+    std::ranges::copy(packet.data, frame.begin() + kVideoFrameHeaderSize);
+    return frame;
+}
+
+// Launches hawk-capture in the logged-on user's session and forwards every
+// packet it produces to the relay as a binary frame.
+void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture) {
+    if (capture.is_running()) {
+        spdlog::info("relay: start_capture ignored, capture already running");
+        return;
+    }
+
+    auto started = capture.start([&client](const svc::CapturePacket& packet) {
+        if (auto sent = client.send_binary(BuildVideoFrame(packet)); !sent.has_value()) {
+            spdlog::warn("relay: failed to forward video packet: {}", net::to_string(sent.error()));
+        }
+    });
+    if (!started.has_value()) {
+        spdlog::error("relay: failed to start capture: {}", svc::to_string(started.error()));
+    }
+}
+
+void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc::CaptureHost& capture) {
+    RelayCommand command;
+    if (auto error = glz::read<glz::opts{.error_on_unknown_keys = false}>(command, text); error) {
+        spdlog::warn("relay: received unparseable message: {}", text);
+        return;
+    }
+
+    if (command.type == "start_capture") {
+        StartCapture(client, capture);
+    } else if (command.type == "stop_capture") {
+        capture.stop();
+    } else {
+        spdlog::info("relay: ignoring unknown command \"{}\"", command.type);
+    }
+}
+
 // Handles one received message. Returns true if the connection should be
 // treated as over (no immediate reconnect attempt) rather than retried.
-[[nodiscard]] bool HandleRelayMessage(const net::WebSocketMessage& message) {
+[[nodiscard]] bool HandleRelayMessage(const net::WebSocketMessage& message, net::WebSocketClient& client,
+                                      svc::CaptureHost& capture) {
     return std::visit(
-        []<typename T>(const T& payload) -> bool {
+        [&]<typename T>(const T& payload) -> bool {
             if constexpr (std::is_same_v<T, std::string>) {
-                spdlog::info("relay: received text message: {}", payload);
-                // TODO: parse and dispatch the relay command protocol here.
+                HandleRelayCommand(payload, client, capture);
                 return false;
             } else if constexpr (std::is_same_v<T, std::vector<std::byte>>) {
                 spdlog::info("relay: received binary message ({} bytes)", payload.size());
@@ -118,6 +189,9 @@ void InitLogging() {
 
 void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClient*>& active_client) {
     net::WebSocketClient client;
+    // Declared after `client` so it's destroyed (stopped) first: its reader
+    // thread sends through `client`.
+    svc::CaptureHost capture;
 
     while (!stop_token.stop_requested()) {
         if (auto connected = client.connect(kRelayServerUrl); !connected.has_value()) {
@@ -140,12 +214,15 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
                 spdlog::warn("relay: receive failed: {}", net::to_string(message.error()));
                 break;
             }
-            if (HandleRelayMessage(*message)) {
+            if (HandleRelayMessage(*message, client, capture)) {
                 peer_closed = true;
                 break;
             }
         }
 
+        // Capture only runs on behalf of a viewer reached through this
+        // connection; stop it before the socket it forwards to goes away.
+        capture.stop();
         active_client.store(nullptr);
         client.close();
 

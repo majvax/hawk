@@ -58,8 +58,10 @@ struct WebSocketError {
 //
 // Thread-safety: close() may be called from a different thread than the one
 // blocked in receive() in order to cancel it — this mirrors how a service's
-// control handler stops a worker thread. All other methods must not be
-// called concurrently with each other on the same instance.
+// control handler stops a worker thread. send_text()/send_binary() may be
+// called from any thread, including while another is blocked in receive();
+// concurrent sends are serialized internally. connect() and receive() must
+// not be called concurrently with each other or with themselves.
 class WebSocketClient {
 public:
     struct ConnectOptions {

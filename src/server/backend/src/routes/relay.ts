@@ -6,9 +6,13 @@ import type { DeviceRegistry } from "../registry.js";
 const HELLO_TIMEOUT_MS = 5_000;
 
 function toUtf8(raw: Buffer | ArrayBuffer | Buffer[]): string {
-  if (Buffer.isBuffer(raw)) return raw.toString("utf8");
-  if (Array.isArray(raw)) return Buffer.concat(raw).toString("utf8");
-  return Buffer.from(raw).toString("utf8");
+  return toBuffer(raw).toString("utf8");
+}
+
+function toBuffer(raw: Buffer | ArrayBuffer | Buffer[]): Buffer {
+  if (Buffer.isBuffer(raw)) return raw;
+  if (Array.isArray(raw)) return Buffer.concat(raw);
+  return Buffer.from(raw);
 }
 
 // Endpoint devices (the hawk-service client) connect to. The only message
@@ -26,8 +30,13 @@ export function registerRelayRoute<RawServer extends RawServerBase = RawServerDe
       socket.close(1002, "expected hello");
     }, HELLO_TIMEOUT_MS);
 
-    socket.on("message", (raw: Buffer | ArrayBuffer | Buffer[]) => {
-      if (deviceId !== undefined) return; // no further message types are handled yet
+    socket.on("message", (raw: Buffer | ArrayBuffer | Buffer[], isBinary: boolean) => {
+      // Once registered, binary messages are encoded video frames: forward
+      // them verbatim (header + H.264 access unit) to watching dashboards.
+      if (deviceId !== undefined) {
+        if (isBinary) registry.forwardFrame(deviceId, toBuffer(raw));
+        return;
+      }
 
       let parsed: unknown;
       try {

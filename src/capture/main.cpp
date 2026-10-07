@@ -1,3 +1,4 @@
+#include "common/capture_pipe.hpp"
 #include "duplication.hpp"
 #include "encoder.hpp"
 
@@ -10,6 +11,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <optional>
+#include <span>
+#include <string>
+#include <string_view>
 
 namespace capture = hawk::capture;
 
@@ -59,16 +63,85 @@ private:
     bool ok_;
 };
 
+// Client end of the pipe hawk-service creates for us; see
+// common/capture_pipe.hpp for the wire format.
+class PacketPipe {
+public:
+    PacketPipe() = default;
+    ~PacketPipe() {
+        if (pipe_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(pipe_);
+        }
+    }
+
+    PacketPipe(const PacketPipe&) = delete;
+    PacketPipe& operator=(const PacketPipe&) = delete;
+    PacketPipe(PacketPipe&&) = delete;
+    PacketPipe& operator=(PacketPipe&&) = delete;
+
+    [[nodiscard]] bool open(const std::string& name) {
+        pipe_ = CreateFileA(name.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (pipe_ == INVALID_HANDLE_VALUE) {
+            spdlog::error("capture: failed to open pipe {}: Win32 error {}", name, GetLastError());
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool is_open() const noexcept { return pipe_ != INVALID_HANDLE_VALUE; }
+
+    // Returns false once hawk-service has closed its end.
+    [[nodiscard]] bool write(const capture::EncodedPacket& packet) {
+        const hawk::ipc::CapturePacketHeader header{
+            .size = static_cast<std::uint32_t>(packet.data.size()),
+            .timestamp_us = packet.timestamp.count(),
+            .flags = packet.is_keyframe ? hawk::ipc::capture_flag_keyframe : std::uint8_t{0},
+        };
+        return write_all(std::as_bytes(std::span(&header, 1))) && write_all(packet.data);
+    }
+
+private:
+    [[nodiscard]] bool write_all(std::span<const std::byte> data) {
+        while (!data.empty()) {
+            DWORD written = 0;
+            if (WriteFile(pipe_, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) == FALSE) {
+                return false;
+            }
+            data = data.subspan(written);
+        }
+        return true;
+    }
+
+    HANDLE pipe_ = INVALID_HANDLE_VALUE;
+};
+
+// hawk-service launches us with `--pipe <name>`.
+[[nodiscard]] std::optional<std::string> pipe_name_from_args(std::span<char* const> args) {
+    for (std::size_t i = 1; i + 1 < args.size(); ++i) {
+        if (std::string_view(args[i]) == "--pipe") {
+            return std::string(args[i + 1]);
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 // Standalone helper: must run as an ordinary process inside the interactive
 // user's own session, not the service (Session 0 has no desktop to see).
-// Captures the desktop, encodes it to H.264 on the GPU, and logs packet
-// stats — handing encoded packets off to hawk-service over a local pipe is
-// the next piece, not yet wired up here.
-int main() {
+// Captures the desktop and encodes it to H.264 on the GPU. Launched by
+// hawk-service with `--pipe <name>`, it streams the packets back over that
+// pipe and exits once the service closes it. Run on its own, without
+// `--pipe`, it only logs packet stats.
+int main(int argc, char* argv[]) {
     auto logger = spdlog::stdout_color_mt("hawk-capture");
     spdlog::set_default_logger(logger);
+
+    PacketPipe pipe;
+    if (const auto pipe_name = pipe_name_from_args(std::span(argv, static_cast<std::size_t>(argc)));
+        pipe_name.has_value() && !pipe.open(*pipe_name)) {
+        return EXIT_FAILURE;
+    }
 
     ComScope com;
     if (!com.ok()) {
@@ -157,6 +230,10 @@ int main() {
         for (const auto& packet : *packets) {
             ++packet_count;
             bytes_this_window += packet.data.size();
+            if (pipe.is_open() && !pipe.write(packet)) {
+                spdlog::info("capture: hawk-service closed the pipe, exiting");
+                return EXIT_SUCCESS;
+            }
         }
 
         if (now - window_start >= std::chrono::seconds(1)) {

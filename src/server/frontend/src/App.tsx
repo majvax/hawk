@@ -1,9 +1,9 @@
 import type { JSX } from "react";
 
-import { useDevices } from "./useDevices.js";
+import { type ConnectionStatus, useDashboard } from "./useDashboard.js";
 
 export function App(): JSX.Element {
-  const { devices, status } = useDevices();
+  const { devices, status, viewingId, canvasRef, startView, stopView } = useDashboard();
 
   return (
     <main>
@@ -20,6 +20,7 @@ export function App(): JSX.Element {
             <tr>
               <th>Machine</th>
               <th>Connected since</th>
+              <th />
             </tr>
           </thead>
           <tbody>
@@ -27,16 +28,35 @@ export function App(): JSX.Element {
               <tr key={device.id}>
                 <td>{device.machineId}</td>
                 <td>{new Date(device.connectedAt).toLocaleString()}</td>
+                <td>
+                  {viewingId === device.id ? (
+                    <button type="button" onClick={stopView}>
+                      Stop
+                    </button>
+                  ) : (
+                    <button type="button" onClick={() => startView(device.id)}>
+                      View
+                    </button>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
+
+      <section style={{ marginTop: 16, display: viewingId === null ? "none" : "block" }}>
+        <h2>Live view</h2>
+        <canvas
+          ref={canvasRef}
+          style={{ maxWidth: "100%", background: "#000", border: "1px solid #444" }}
+        />
+      </section>
     </main>
   );
 }
 
-function StatusDot({ status }: { status: "connecting" | "open" | "closed" }): JSX.Element {
+function StatusDot({ status }: { status: ConnectionStatus }): JSX.Element {
   const color = status === "open" ? "limegreen" : status === "connecting" ? "orange" : "crimson";
   return (
     <span

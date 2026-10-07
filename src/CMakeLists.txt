@@ -8,6 +8,7 @@ endif()
 
 add_executable(hawk-service
     service/main.cpp
+    service/capture_host.cpp
     service/websocket/websocket.cpp
 )
 
@@ -26,6 +27,8 @@ target_link_libraries(hawk-service PRIVATE
     glaze::glaze
     winhttp
     advapi32
+    wtsapi32
+    userenv
 )
 
 # ServiceMain's entry point is wmain(); mingw needs -municode to select the
