@@ -13,6 +13,8 @@
 #include <mftransform.h>
 #include <wrl/client.h>
 
+#include <array>
+#include <cstddef>
 #include <cstring>
 #include <format>
 #include <utility>
@@ -42,6 +44,14 @@ namespace {
 
 constexpr LONGLONG hundred_ns_per_second = 10'000'000LL;
 
+// An async encoder still reads an input texture after ProcessInput returns,
+// for as many frames as its pipeline is deep. Converting every frame into
+// one shared NV12 texture would overwrite a frame mid-encode, so we rotate
+// through a ring sized past a low-latency hardware encoder's usual 1-2
+// frames in flight.
+constexpr std::size_t nv12_ring_size = 4;
+using Nv12Ring = std::array<ComPtr<ID3D11Texture2D>, nv12_ring_size>;
+
 [[nodiscard]] std::expected<void, EncoderError> create_device_manager(ID3D11Device* device,
                                                                        ComPtr<IMFDXGIDeviceManager>& out) {
     UINT    reset_token = 0;
@@ -65,7 +75,7 @@ struct VideoProcessor {
     ComPtr<ID3D11VideoContext>             context;
     ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
     ComPtr<ID3D11VideoProcessor>           processor;
-    ComPtr<ID3D11Texture2D>                nv12_texture;
+    Nv12Ring                               nv12_textures;
 };
 
 [[nodiscard]] std::expected<VideoProcessor, EncoderError> create_video_processor(ID3D11Device*        device,
@@ -119,9 +129,11 @@ struct VideoProcessor {
         .CPUAccessFlags = 0,
         .MiscFlags = 0,
     };
-    hresult = device->CreateTexture2D(&nv12_desc, nullptr, &video.nv12_texture);
-    if (FAILED(hresult)) {
-        return std::unexpected(make_error(EncoderError::Code::convert_failed, hresult, "CreateTexture2D(nv12)"));
+    for (auto& nv12_texture : video.nv12_textures) {
+        hresult = device->CreateTexture2D(&nv12_desc, nullptr, &nv12_texture);
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::convert_failed, hresult, "CreateTexture2D(nv12)"));
+        }
     }
 
     return video;
@@ -288,7 +300,8 @@ struct H264Encoder::Impl {
     ComPtr<ID3D11VideoContext>              video_context;
     ComPtr<ID3D11VideoProcessorEnumerator>  video_enumerator;
     ComPtr<ID3D11VideoProcessor>            video_processor;
-    ComPtr<ID3D11Texture2D>                 nv12_texture;  // GPU conversion target, reused every frame
+    Nv12Ring                                nv12_textures;  // GPU conversion targets, used in rotation
+    std::size_t                             next_nv12 = 0;
 
     std::uint32_t width = 0;
     std::uint32_t height = 0;
@@ -365,10 +378,11 @@ struct H264Encoder::Impl {
             .Texture2D = {.MipSlice = 0},
         };
 
+        ID3D11Texture2D* nv12_texture = nv12_textures.at(next_nv12).Get();
+
         ComPtr<ID3D11VideoProcessorOutputView> output_view;
-        hresult = video_device->CreateVideoProcessorOutputView(nv12_texture.Get(),
-                                                                       video_enumerator.Get(), &output_view_desc,
-                                                                       &output_view);
+        hresult = video_device->CreateVideoProcessorOutputView(nv12_texture, video_enumerator.Get(),
+                                                               &output_view_desc, &output_view);
         if (FAILED(hresult)) {
             return std::unexpected(
                 make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessorOutputView"));
@@ -384,8 +398,7 @@ struct H264Encoder::Impl {
 
         // --- wrap the NV12 texture in a sample and feed the encoder ---
         ComPtr<IMFMediaBuffer> input_buffer;
-        hresult = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_texture.Get(), 0, FALSE,
-                                            &input_buffer);
+        hresult = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_texture, 0, FALSE, &input_buffer);
         if (FAILED(hresult)) {
             return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "MFCreateDXGISurfaceBuffer"));
         }
@@ -417,7 +430,86 @@ struct H264Encoder::Impl {
         if (FAILED(hresult)) {
             return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ProcessInput"));
         }
+        // Only a texture the encoder accepted is in flight; a refused one is
+        // free to be converted into again next frame.
+        next_nv12 = (next_nv12 + 1) % nv12_ring_size;
         return true;
+    }
+
+    // Pulls one access unit. `fallback_timestamp` is used only if the MFT
+    // didn't carry the input sample time through.
+    [[nodiscard]] std::expected<std::optional<EncodedPacket>, EncoderError> pull_output(
+        std::chrono::microseconds fallback_timestamp) {
+        HRESULT                hresult = S_OK;
+        MFT_OUTPUT_DATA_BUFFER output_buffer{};
+        if (!mft_provides_output_samples) {
+            ComPtr<IMFSample>      preallocated_sample;
+            ComPtr<IMFMediaBuffer> preallocated_buffer;
+            hresult = MFCreateSample(&preallocated_sample);
+            if (SUCCEEDED(hresult)) {
+                hresult = MFCreateMemoryBuffer(output_stream_size, &preallocated_buffer);
+            }
+            if (SUCCEEDED(hresult)) {
+                hresult = preallocated_sample->AddBuffer(preallocated_buffer.Get());
+            }
+            if (FAILED(hresult)) {
+                return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "allocate output sample"));
+            }
+            output_buffer.pSample = preallocated_sample.Detach();
+        }
+
+        DWORD status = 0;
+        hresult = transform->ProcessOutput(0, 1, &output_buffer, &status);
+
+        // Whatever ProcessOutput left in pSample/pEvents, we now own exactly one
+        // reference to it (ours, carried through from the branch above, or one
+        // the MFT allocated and AddRef'd) — Attach takes ownership of that
+        // without an extra AddRef, on every path including the error ones below.
+        ComPtr<IMFSample>     result_sample;
+        ComPtr<IMFCollection> result_events;
+        result_sample.Attach(output_buffer.pSample);
+        result_events.Attach(output_buffer.pEvents);
+
+        if (hresult == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            return std::optional<EncodedPacket>{};  // still buffering; nothing to emit yet
+        }
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ProcessOutput"));
+        }
+        if (result_sample.Get() == nullptr) {
+            return std::unexpected(
+                make_simple_error(EncoderError::Code::encode_failed, "ProcessOutput succeeded with no sample"));
+        }
+
+        UINT32 is_keyframe = 0;
+        result_sample->GetUINT32(MFSampleExtension_CleanPoint, &is_keyframe);
+
+        // Output can lag input by a frame or more, so stamp the packet with the
+        // time of the frame it actually encodes, not the one just submitted.
+        LONGLONG output_time = 0;
+        const auto packet_timestamp = SUCCEEDED(result_sample->GetSampleTime(&output_time))
+                                          ? std::chrono::microseconds{output_time / 10}  // 100ns units -> microseconds
+                                          : fallback_timestamp;
+
+        ComPtr<IMFMediaBuffer> result_buffer;
+        hresult = result_sample->ConvertToContiguousBuffer(&result_buffer);
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ConvertToContiguousBuffer"));
+        }
+
+        BYTE* raw_data = nullptr;
+        DWORD data_length = 0;
+        hresult = result_buffer->Lock(&raw_data, nullptr, &data_length);
+        if (FAILED(hresult)) {
+            return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "Lock(output buffer)"));
+        }
+
+        EncodedPacket packet{.data = {}, .is_keyframe = is_keyframe != 0, .timestamp = packet_timestamp};
+        packet.data.resize(data_length);
+        std::memcpy(packet.data.data(), raw_data, data_length);
+        result_buffer->Unlock();
+
+        return std::optional<EncodedPacket>{std::move(packet)};
     }
 
     Impl() = default;
@@ -439,7 +531,9 @@ struct H264Encoder::Impl {
         transform.Reset();
         video_processor.Reset();
         video_enumerator.Reset();
-        nv12_texture.Reset();
+        for (auto& nv12_texture : nv12_textures) {
+            nv12_texture.Reset();
+        }
         video_context.Reset();
         video_device.Reset();
         device_manager.Reset();
@@ -477,7 +571,7 @@ std::expected<void, EncoderError> H264Encoder::open(ID3D11Device* device, const 
     impl_->video_context = std::move(video->context);
     impl_->video_enumerator = std::move(video->enumerator);
     impl_->video_processor = std::move(video->processor);
-    impl_->nv12_texture = std::move(video->nv12_texture);
+    impl_->nv12_textures = std::move(video->nv12_textures);
 
     // Hardware H.264 encoder MFT — Quick Sync / NVENC / VCE, whichever this
     // system exposes.
@@ -534,8 +628,10 @@ std::expected<void, EncoderError> H264Encoder::open(ID3D11Device* device, const 
     return {};
 }
 
-std::expected<std::optional<EncodedPacket>, EncoderError> H264Encoder::encode(
+std::expected<std::vector<EncodedPacket>, EncoderError> H264Encoder::encode(
     ID3D11Texture2D* bgra_texture, std::chrono::microseconds timestamp) {
+    std::vector<EncodedPacket> packets;
+
     // An async MFT only accepts input it has asked for, and only hands out
     // output it has announced; anything else fails (ProcessOutput returns
     // E_UNEXPECTED). With no input request outstanding, this frame is
@@ -553,96 +649,41 @@ std::expected<std::optional<EncodedPacket>, EncoderError> H264Encoder::encode(
             return std::unexpected(submitted.error());
         }
         if (!*submitted) {
-            return std::optional<EncodedPacket>{};
+            return packets;
         }
         if (is_async) {
             --impl_->pending_input_requests;
         }
     }
 
-    if (is_async) {
-        // The output for this frame may already be announced; otherwise it
-        // is picked up on a later call.
-        if (auto polled = impl_->poll_events(); !polled.has_value()) {
-            return std::unexpected(polled.error());
+    if (!is_async) {
+        auto packet = impl_->pull_output(timestamp);
+        if (!packet.has_value()) {
+            return std::unexpected(packet.error());
         }
-        if (impl_->pending_outputs == 0) {
-            return std::optional<EncodedPacket>{};
+        if (packet->has_value()) {
+            packets.push_back(std::move(**packet));
         }
+        return packets;
+    }
+
+    // Output lags input, so take everything announced so far, not just one
+    // access unit — otherwise it sits in the encoder until a later call and
+    // the stream visibly stalls behind the screen.
+    if (auto polled = impl_->poll_events(); !polled.has_value()) {
+        return std::unexpected(polled.error());
+    }
+    while (impl_->pending_outputs > 0) {
         --impl_->pending_outputs;
-    }
-
-    // --- pull output, if the encoder has any ready yet ---
-    HRESULT                hresult = S_OK;
-    MFT_OUTPUT_DATA_BUFFER output_buffer{};
-    if (!impl_->mft_provides_output_samples) {
-        ComPtr<IMFSample>      preallocated_sample;
-        ComPtr<IMFMediaBuffer> preallocated_buffer;
-        hresult = MFCreateSample(&preallocated_sample);
-        if (SUCCEEDED(hresult)) {
-            hresult = MFCreateMemoryBuffer(impl_->output_stream_size, &preallocated_buffer);
+        auto packet = impl_->pull_output(timestamp);
+        if (!packet.has_value()) {
+            return std::unexpected(packet.error());
         }
-        if (SUCCEEDED(hresult)) {
-            hresult = preallocated_sample->AddBuffer(preallocated_buffer.Get());
+        if (packet->has_value()) {
+            packets.push_back(std::move(**packet));
         }
-        if (FAILED(hresult)) {
-            return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "allocate output sample"));
-        }
-        output_buffer.pSample = preallocated_sample.Detach();
     }
-
-    DWORD status = 0;
-    hresult = impl_->transform->ProcessOutput(0, 1, &output_buffer, &status);
-
-    // Whatever ProcessOutput left in pSample/pEvents, we now own exactly one
-    // reference to it (ours, carried through from the branch above, or one
-    // the MFT allocated and AddRef'd) — Attach takes ownership of that
-    // without an extra AddRef, on every path including the error ones below.
-    ComPtr<IMFSample>     result_sample;
-    ComPtr<IMFCollection> result_events;
-    result_sample.Attach(output_buffer.pSample);
-    result_events.Attach(output_buffer.pEvents);
-
-    if (hresult == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-        return std::optional<EncodedPacket>{};  // still buffering; nothing to emit yet
-    }
-    if (FAILED(hresult)) {
-        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ProcessOutput"));
-    }
-    if (result_sample.Get() == nullptr) {
-        return std::unexpected(
-            make_simple_error(EncoderError::Code::encode_failed, "ProcessOutput succeeded with no sample"));
-    }
-
-    UINT32 is_keyframe = 0;
-    result_sample->GetUINT32(MFSampleExtension_CleanPoint, &is_keyframe);
-
-    // Output can lag input by a frame or more, so stamp the packet with the
-    // time of the frame it actually encodes, not the one just submitted.
-    LONGLONG output_time = 0;
-    const auto packet_timestamp = SUCCEEDED(result_sample->GetSampleTime(&output_time))
-                                      ? std::chrono::microseconds{output_time / 10}  // 100ns units -> microseconds
-                                      : timestamp;
-
-    ComPtr<IMFMediaBuffer> result_buffer;
-    hresult = result_sample->ConvertToContiguousBuffer(&result_buffer);
-    if (FAILED(hresult)) {
-        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "ConvertToContiguousBuffer"));
-    }
-
-    BYTE* raw_data = nullptr;
-    DWORD data_length = 0;
-    hresult = result_buffer->Lock(&raw_data, nullptr, &data_length);
-    if (FAILED(hresult)) {
-        return std::unexpected(make_error(EncoderError::Code::encode_failed, hresult, "Lock(output buffer)"));
-    }
-
-    EncodedPacket packet{.data = {}, .is_keyframe = is_keyframe != 0, .timestamp = packet_timestamp};
-    packet.data.resize(data_length);
-    std::memcpy(packet.data.data(), raw_data, data_length);
-    result_buffer->Unlock();
-
-    return std::optional<EncodedPacket>{std::move(packet)};
+    return packets;
 }
 
 }  // namespace hawk::capture

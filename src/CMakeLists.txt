@@ -59,6 +59,7 @@ target_link_libraries(hawk-capture PRIVATE
     mfuuid
     ole32
     oleaut32
+    winmm
 )
 
 target_set_warning(hawk-capture OFF)

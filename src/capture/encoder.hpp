@@ -33,7 +33,7 @@ struct EncoderError {
 [[nodiscard]] std::string_view to_string(EncoderError::Code code) noexcept;
 [[nodiscard]] std::string      to_string(const EncoderError& error);
 
-inline constexpr std::uint32_t default_encoder_fps = 30;
+inline constexpr std::uint32_t default_encoder_fps = 60;
 inline constexpr std::uint32_t default_encoder_bitrate_bps = 4'000'000;
 
 struct EncoderConfig {
@@ -75,10 +75,11 @@ public:
     [[nodiscard]] std::expected<void, EncoderError> open(ID3D11Device* device, const EncoderConfig& config);
 
     // Submits one BGRA8 GPU texture, sized to match the EncoderConfig given
-    // to open(), for encoding. Returns std::nullopt when the encoder is
-    // still buffering and hasn't produced an access unit yet — rare with a
-    // low-latency hardware encoder, but callers should handle it.
-    [[nodiscard]] std::expected<std::optional<EncodedPacket>, EncoderError> encode(
+    // to open(), for encoding, and returns every access unit the encoder has
+    // finished so far. Output lags input, so the result is often empty and
+    // the packets may belong to earlier frames (see EncodedPacket::timestamp).
+    // The frame itself may be dropped if the encoder isn't ready for input.
+    [[nodiscard]] std::expected<std::vector<EncodedPacket>, EncoderError> encode(
         ID3D11Texture2D* bgra_texture, std::chrono::microseconds timestamp);
 
 private:
