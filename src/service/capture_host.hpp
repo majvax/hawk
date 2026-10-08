@@ -40,10 +40,10 @@ struct CapturePacket {
 // Runs hawk-capture.exe inside the active console session and receives its
 // encoded packets over a private named pipe.
 //
-// A Session 0 service can't see the desktop, so the capture has to run as
-// the logged-on user: start() takes that user's token (WTSQueryUserToken,
-// which requires running as SYSTEM) and launches hawk-capture.exe from the
-// service's own directory with CreateProcessAsUser.
+// A Session 0 service can't see the desktop, so the capture has to run
+// inside the console session: start() launches hawk-capture.exe from the
+// service's own directory with CreateProcessAsUser, as SYSTEM retargeted to
+// that session, so it can also capture the secure desktop.
 //
 // Like WebSocketClient, no Windows type crosses this interface.
 //

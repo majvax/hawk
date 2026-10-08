@@ -33,12 +33,13 @@ constexpr DWORD             no_console_session = 0xFFFFFFFF;
 constexpr DWORD input_buffer_size = 16 * 1024;
 // Input is sent from the relay thread, which has to keep servicing the
 // socket: rather than wait on a write hawk-capture isn't taking, give up on
-// the event. Losing one is nothing; stalling the relay link is not.
-constexpr DWORD input_connect_timeout_ms = 2000;
+// the event. Losing one is nothing; stalling the relay link is not. For the
+// same reason the relay thread never waits for hawk-capture to open the
+// input pipe at all (see poll_input_connection).
 constexpr DWORD input_write_timeout_ms = 1000;
 
 // What hawk-capture's end of the pipe is opened with, and so exactly what the
-// pipe's DACL grants the logged-on user. FILE_READ_ATTRIBUTES is not
+// pipe's DACL grants SYSTEM. FILE_READ_ATTRIBUTES is not
 // optional: CreateFile() adds it to the access it asks the object manager
 // for, so a grant of only the write rights is denied with ERROR_ACCESS_DENIED
 // before hawk-capture gets a handle. Keep this in sync with the CreateFileA
@@ -92,45 +93,18 @@ private:
     HANDLE handle_ = nullptr;
 };
 
-[[nodiscard]] std::expected<std::wstring, CaptureHostError> user_sid_string(HANDLE token) {
-    DWORD size = 0;
-    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
-    std::vector<std::byte> buffer(size);
-    if (GetTokenInformation(token, TokenUser, buffer.data(), size, &size) == FALSE) {
-        return std::unexpected(
-            make_error(CaptureHostError::Code::no_user_session, GetLastError(), "GetTokenInformation(TokenUser)"));
-    }
-
-    // TOKEN_USER is followed in the same buffer by the SID it points at.
-    const auto* user = reinterpret_cast<const TOKEN_USER*>(buffer.data());
-    LPWSTR      sid_text = nullptr;
-    if (ConvertSidToStringSidW(user->User.Sid, &sid_text) == FALSE) {
-        return std::unexpected(
-            make_error(CaptureHostError::Code::no_user_session, GetLastError(), "ConvertSidToStringSidW"));
-    }
-    std::wstring result(sid_text);
-    LocalFree(sid_text);
-    return result;
-}
-
-// One-directional, single-instance, local-only pipe that only SYSTEM and the
-// logged-on user can open — per the README, never a blanket grant to
-// Authenticated Users. `client_access` is exactly what hawk-capture opens
-// its end with, and so exactly what the DACL grants the user.
+// One-directional, single-instance, local-only pipe that only SYSTEM can
+// open. hawk-capture runs as SYSTEM (see system_token_for_session), so the
+// logged-on user needs no grant; giving them one would let any process they
+// run connect first and, even though verify_client then rejects it, take the
+// single instance away from hawk-capture. `client_access` is exactly what
+// hawk-capture opens its end with, and so exactly what the DACL grants.
 // FILE_FLAG_FIRST_PIPE_INSTANCE makes creation fail if anyone else already
 // squats the name.
-//
-// The medium mandatory label is no-read-up as well as no-write-up: the
-// user's own low-integrity (sandboxed) processes pass the DACL, and the
-// input pipe carries everything a viewer types. Which process actually
-// connected is still checked afterwards (see verify_client).
-[[nodiscard]] std::expected<UniqueHandle, CaptureHostError> create_pipe(const std::wstring& name,
-                                                                         const std::wstring& user_sid,
-                                                                         DWORD access_mode, DWORD pipe_mode,
-                                                                         DWORD client_access, DWORD out_buffer,
-                                                                         DWORD in_buffer) {
-    const std::wstring sddl =
-        std::format(L"D:P(A;;GA;;;SY)(A;;0x{:08X};;;{})S:(ML;;NWNR;;;ME)", client_access, user_sid);
+[[nodiscard]] std::expected<UniqueHandle, CaptureHostError> create_pipe(const std::wstring& name, DWORD access_mode,
+                                                                         DWORD pipe_mode, DWORD client_access,
+                                                                         DWORD out_buffer, DWORD in_buffer) {
+    const std::wstring sddl = std::format(L"D:P(A;;0x{:08X};;;SY)", client_access);
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor,
                                                              nullptr) == FALSE) {
@@ -283,10 +257,10 @@ private:
     return NO_ERROR;
 }
 
-// The pipe names are predictable and the DACL lets any of the user's own
-// processes in, so whoever connected first isn't necessarily hawk-capture.
-// Anyone else is disconnected: they'd otherwise be fed the viewer's
-// keystrokes, or get to forge the video stream.
+// The pipe names are predictable and the DACL admits any SYSTEM process, so
+// whoever connected first isn't necessarily hawk-capture. Anyone else is
+// disconnected: they'd otherwise be fed the viewer's keystrokes, or get to
+// forge the video stream.
 [[nodiscard]] DWORD verify_client(HANDLE pipe, HANDLE process) {
     ULONG client_pid = 0;
     if (GetNamedPipeClientProcessId(pipe, &client_pid) == FALSE) {
@@ -334,28 +308,53 @@ struct CaptureHost::Impl {
     UniqueHandle input_pipe;
     UniqueHandle input_event;
     bool         input_connected = false;
+    // The ConnectNamedPipe on the input pipe, while it waits for hawk-capture.
+    // It lives here, not on a stack, because it stays in flight across calls.
+    OVERLAPPED   input_connect{};
+    bool         input_connect_pending = false;
 
-    // hawk-capture opens the input pipe as it starts up, long before a
-    // viewer can press anything, so by the first event this has normally
-    // already happened and ConnectNamedPipe returns straight away.
-    [[nodiscard]] DWORD connect_input() {
-        OVERLAPPED overlapped{};
-        overlapped.hEvent = input_event.get();
-        ResetEvent(input_event.get());
-        if (ConnectNamedPipe(input_pipe.get(), &overlapped) == FALSE) {
-            const DWORD error = GetLastError();
-            if (error == ERROR_IO_PENDING) {
-                DWORD transferred = 0;
-                if (const DWORD result = finish_overlapped(input_pipe.get(), overlapped, stop_event.get(),
-                                                           process.get(), transferred, input_connect_timeout_ms);
-                    result != NO_ERROR) {
-                    return result;
+    // Whether hawk-capture has opened the input pipe yet, without waiting for
+    // it: it does so only once its D3D device and duplication are up, which
+    // can take a while, and a viewer may click before then. Returns
+    // ERROR_IO_INCOMPLETE while it hasn't — the event is dropped, and the
+    // next one asks again.
+    [[nodiscard]] DWORD poll_input_connection() {
+        if (!input_connect_pending) {
+            input_connect = OVERLAPPED{};
+            input_connect.hEvent = input_event.get();
+            ResetEvent(input_event.get());
+            if (ConnectNamedPipe(input_pipe.get(), &input_connect) == FALSE) {
+                const DWORD error = GetLastError();
+                if (error == ERROR_IO_PENDING) {
+                    input_connect_pending = true;
+                } else if (error != ERROR_PIPE_CONNECTED) {
+                    return error;
                 }
-            } else if (error != ERROR_PIPE_CONNECTED) {
-                return error;
             }
         }
+        if (input_connect_pending) {
+            DWORD transferred = 0;
+            if (GetOverlappedResult(input_pipe.get(), &input_connect, &transferred, FALSE) == FALSE) {
+                const DWORD error = GetLastError();
+                input_connect_pending = error == ERROR_IO_INCOMPLETE;
+                return error;
+            }
+            input_connect_pending = false;
+        }
         return verify_client(input_pipe.get(), process.get());
+    }
+
+    // Closes the input pipe, first cancelling a connect still in flight so
+    // `input_connect` is never left in use.
+    void close_input() noexcept {
+        if (input_connect_pending) {
+            CancelIoEx(input_pipe.get(), &input_connect);
+            DWORD transferred = 0;
+            GetOverlappedResult(input_pipe.get(), &input_connect, &transferred, TRUE);
+            input_connect_pending = false;
+        }
+        input_pipe.reset();
+        input_connected = false;
     }
 
     // Closes the input pipe for the rest of this run. Whatever went wrong
@@ -364,7 +363,7 @@ struct CaptureHost::Impl {
     // timeout each time — so there's no retrying it.
     void give_up_on_input(std::string_view what, DWORD error) {
         spdlog::warn("capture: {} (Win32 error {}); giving up on input until capture restarts", what, error);
-        input_pipe.reset();
+        close_input();
     }
 
     // The pipe is message-mode, so one packet is one message: a write either
@@ -374,8 +373,10 @@ struct CaptureHost::Impl {
             return false;
         }
         if (!input_connected) {
-            if (const DWORD result = connect_input(); result != NO_ERROR) {
-                give_up_on_input("hawk-capture never opened the input pipe", result);
+            if (const DWORD result = poll_input_connection(); result == ERROR_IO_INCOMPLETE) {
+                return false;  // hawk-capture is still starting up
+            } else if (result != NO_ERROR) {
+                give_up_on_input("connecting hawk-capture's input pipe failed", result);
                 return false;
             }
             input_connected = true;
@@ -508,17 +509,14 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
                                                 .message = "no session is attached to the console"});
     }
 
+    // hawk-capture runs as SYSTEM, not as the user, but there is still only
+    // something to capture once someone is logged on.
     HANDLE raw_token = nullptr;
     if (WTSQueryUserToken(session, &raw_token) == FALSE) {
         // ERROR_NO_TOKEN: nobody is logged on to the console session.
         return std::unexpected(make_error(CaptureHostError::Code::no_user_session, GetLastError(), "WTSQueryUserToken"));
     }
-    const UniqueHandle user_token(raw_token);
-
-    auto user_sid = user_sid_string(user_token.get());
-    if (!user_sid.has_value()) {
-        return std::unexpected(user_sid.error());
-    }
+    CloseHandle(raw_token);
 
     static std::atomic<std::uint32_t> pipe_counter{0};
     const std::uint32_t               serial = pipe_counter.fetch_add(1);
@@ -527,12 +525,12 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
     const std::wstring input_pipe_name =
         std::format(L"\\\\.\\pipe\\hawk-input-{}-{}", GetCurrentProcessId(), serial);
 
-    auto pipe = create_pipe(pipe_name, *user_sid, PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+    auto pipe = create_pipe(pipe_name, PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
                             capture_client_access, 0, pipe_buffer_size);
     if (!pipe.has_value()) {
         return std::unexpected(pipe.error());
     }
-    auto input_pipe = create_pipe(input_pipe_name, *user_sid, PIPE_ACCESS_OUTBOUND,
+    auto input_pipe = create_pipe(input_pipe_name, PIPE_ACCESS_OUTBOUND,
                                   PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE, input_client_access, input_buffer_size,
                                   0);
     if (!input_pipe.has_value()) {
@@ -584,9 +582,8 @@ void CaptureHost::stop() noexcept {
 
     // Closing the input pipe is also what tells hawk-capture's input reader
     // to let go of whatever it is still holding down.
-    impl_->input_pipe.reset();
+    impl_->close_input();
     impl_->input_event.reset();
-    impl_->input_connected = false;
 
     // Closing our end breaks hawk-capture's next write, which it takes as
     // the signal to exit.

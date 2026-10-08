@@ -3,7 +3,7 @@
 //! is the source of truth for access; API handlers mirror every change into
 //! the registry so open dashboards update (and lose access) immediately.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,7 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 
 use crate::db::{MachineRow, Role};
-use crate::protocol::{DashboardEvent, DeviceCommand, InputEvent, MachineView, is_keyframe};
+use crate::protocol::{DashboardEvent, DeviceCommand, InputEvent, MachineView, MouseButton, is_keyframe};
 
 pub type DashboardId = u64;
 
@@ -74,6 +74,45 @@ struct Viewer {
     /// This viewer has sent input, so it may have keys or buttons held down
     /// on the machine that must be released when it stops controlling.
     sent_input: bool,
+    /// What this viewer's input is holding down right now, so letting go on
+    /// its behalf leaves another controller's keys and buttons alone.
+    held: HashSet<Held>,
+}
+
+/// A key or button some viewer's input pressed and hasn't released.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Held {
+    Button(MouseButton),
+    Key(String),
+}
+
+impl Held {
+    fn released(self) -> InputEvent {
+        match self {
+            Self::Button(button) => InputEvent::MouseButton { button, down: false },
+            Self::Key(code) => InputEvent::Key { code, down: false },
+        }
+    }
+}
+
+/// More keys than a person can hold. The relay doesn't know which key codes
+/// the machine understands, so without a cap a dashboard could grow the set
+/// with made-up ones.
+const MAX_HELD: usize = 32;
+
+impl Viewer {
+    fn track(&mut self, event: &InputEvent) {
+        let (held, down) = match event {
+            InputEvent::MouseButton { button, down } => (Held::Button(*button), *down),
+            InputEvent::Key { code, down } => (Held::Key(code.clone()), *down),
+            InputEvent::MouseMove { .. } | InputEvent::Wheel { .. } => return,
+        };
+        if !down {
+            self.held.remove(&held);
+        } else if self.held.len() < MAX_HELD {
+            self.held.insert(held);
+        }
+    }
 }
 
 struct Device {
@@ -88,6 +127,29 @@ struct Device {
 impl Device {
     fn send(&self, command: DeviceCommand) {
         let _ = self.outbound.send(DeviceOutbound::Command(command));
+    }
+
+    /// Lets go of whatever `dashboard`'s input is holding on the machine.
+    /// With no other viewer holding anything, the machine releases
+    /// everything, which also catches a release the relay never saw.
+    /// Otherwise only this viewer's own keys and buttons are released, and
+    /// not those another viewer is holding too, so their drag or modifier
+    /// survives.
+    fn release_input(&mut self, dashboard: DashboardId) {
+        let Some(viewer) = self.viewers.get_mut(&dashboard) else { return };
+        if !std::mem::take(&mut viewer.sent_input) {
+            return;
+        }
+        let held = std::mem::take(&mut viewer.held);
+        if self.viewers.values().all(|viewer| viewer.held.is_empty()) {
+            self.send(DeviceCommand::ReleaseInput);
+            return;
+        }
+        for item in held {
+            if !self.viewers.values().any(|viewer| viewer.held.contains(&item)) {
+                self.send(DeviceCommand::Input { event: item.released() });
+            }
+        }
     }
 }
 
@@ -139,9 +201,9 @@ impl Inner {
     /// capture on the device. Returns whether it was watching.
     fn detach(&mut self, dashboard: DashboardId, machine_id: &str) -> bool {
         let Some(device) = self.devices.get_mut(machine_id) else { return false };
-        let Some(viewer) = device.viewers.remove(&dashboard) else { return false };
-        if viewer.sent_input {
-            device.send(DeviceCommand::ReleaseInput);
+        device.release_input(dashboard);
+        if device.viewers.remove(&dashboard).is_none() {
+            return false;
         }
         if device.viewers.is_empty() {
             device.send(DeviceCommand::StopCapture);
@@ -346,10 +408,14 @@ impl Registry {
             email: dashboard.handle.email.clone(),
             awaiting_keyframe: true,
             sent_input: false,
+            held: HashSet::new(),
         };
         let Some(device) = inner.devices.get_mut(machine_id) else { return false };
         let was_idle = device.viewers.is_empty();
-        device.viewers.insert(dashboard_id, viewer);
+        // Asked again while already watching: start over from the next
+        // keyframe, but keep what its input is holding, or it would never be
+        // released when this viewer leaves.
+        device.viewers.entry(dashboard_id).and_modify(|viewer| viewer.awaiting_keyframe = true).or_insert(viewer);
         if was_idle {
             device.send(DeviceCommand::StartCapture);
         }
@@ -373,6 +439,7 @@ impl Registry {
         let Some(device) = inner.devices.get_mut(machine_id) else { return false };
         let Some(viewer) = device.viewers.get_mut(&dashboard_id) else { return false };
         viewer.sent_input = true;
+        viewer.track(&event);
         device.send(DeviceCommand::Input { event });
         true
     }
@@ -416,14 +483,8 @@ impl Registry {
         if row.role < Role::Control
             && let Some(device) = inner.devices.get_mut(&row.public_id)
         {
-            let mut released = false;
             for id in &ids {
-                if let Some(viewer) = device.viewers.get_mut(id) {
-                    released |= std::mem::take(&mut viewer.sent_input);
-                }
-            }
-            if released {
-                device.send(DeviceCommand::ReleaseInput);
+                device.release_input(*id);
             }
         }
         inner.publish(&row.public_id);
@@ -573,5 +634,46 @@ mod tests {
         assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
         assert!(!registry.input(dashboard, MACHINE, click()));
         assert!(device_rx.try_recv().is_err());
+    }
+
+    /// Re-requesting a view it already has doesn't make the relay forget
+    /// what this viewer's input is holding.
+    #[test]
+    fn restarting_a_view_keeps_held_input() {
+        let (registry, dashboard, mut device_rx) = watching(Role::Control);
+        assert!(registry.input(dashboard, MACHINE, click()));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::Input { .. }))));
+        assert!(registry.start_view(dashboard, MACHINE));
+        assert!(device_rx.try_recv().is_err());
+
+        registry.remove_dashboard(dashboard);
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StopCapture))));
+    }
+
+    /// With two controllers, the one leaving lets go only of its own keys:
+    /// the other's held button stays down, and a key both hold stays down.
+    #[test]
+    fn leaving_keeps_another_controllers_input() {
+        let (registry, owner, mut device_rx) = watching(Role::Owner);
+        let other = registry.add_dashboard(handle(2), vec![row(Role::Control)]);
+        assert!(registry.start_view(other, MACHINE));
+        let key = |code: &str, down| InputEvent::Key { code: code.to_owned(), down };
+        assert!(registry.input(owner, MACHINE, click()));
+        assert!(registry.input(owner, MACHINE, key("ShiftLeft", true)));
+        assert!(registry.input(other, MACHINE, key("ShiftLeft", true)));
+        assert!(registry.input(other, MACHINE, key("KeyA", true)));
+        while device_rx.try_recv().is_ok() {}
+
+        registry.stop_view(other, MACHINE);
+        let Ok(DeviceOutbound::Command(DeviceCommand::Input { event })) = device_rx.try_recv() else {
+            panic!("expected a key release");
+        };
+        assert_eq!(event, key("KeyA", false));
+        assert!(device_rx.try_recv().is_err());
+
+        // The last one holding anything leaving releases everything.
+        registry.stop_view(owner, MACHINE);
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
     }
 }

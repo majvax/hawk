@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -214,11 +215,31 @@ constexpr std::array<DWORD, 3> button_up_flags{MOUSEEVENTF_LEFTUP, MOUSEEVENTF_R
     return std::nullopt;
 }
 
+// The captured monitor's rectangle, shared between the capture loop, which
+// updates it when a reacquired duplication finds the monitor has moved, and
+// the input thread, which positions every pointer move against it.
+class SharedBounds {
+public:
+    [[nodiscard]] DesktopBounds get() const {
+        const std::scoped_lock lock(mutex_);
+        return bounds_;
+    }
+
+    void set(DesktopBounds bounds) {
+        const std::scoped_lock lock(mutex_);
+        bounds_ = bounds;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    DesktopBounds      bounds_{};
+};
+
 // Replays input events with SendInput, remembering what it has pressed so it
 // can let go of all of it on demand.
 class Injector {
 public:
-    explicit Injector(DesktopBounds bounds) : bounds_(bounds) {}
+    explicit Injector(const SharedBounds& bounds) : bounds_(bounds) {}
     ~Injector() { release_all(); }
 
     Injector(const Injector&) = delete;
@@ -318,10 +339,11 @@ private:
     // the duplicated frames are rotated too, which the encoder would have to
     // deal with first.
     void move(double x, double y) const {
-        const auto width = std::max(1, bounds_.right - bounds_.left);
-        const auto height = std::max(1, bounds_.bottom - bounds_.top);
-        const auto pixel_x = bounds_.left + std::lround(std::clamp(x, 0.0, 1.0) * (width - 1));
-        const auto pixel_y = bounds_.top + std::lround(std::clamp(y, 0.0, 1.0) * (height - 1));
+        const DesktopBounds bounds = bounds_.get();
+        const auto          width = std::max(1, bounds.right - bounds.left);
+        const auto          height = std::max(1, bounds.bottom - bounds.top);
+        const auto          pixel_x = bounds.left + std::lround(std::clamp(x, 0.0, 1.0) * (width - 1));
+        const auto          pixel_y = bounds.top + std::lround(std::clamp(y, 0.0, 1.0) * (height - 1));
 
         const auto virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
         const auto virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -387,7 +409,7 @@ private:
         }
     }
 
-    DesktopBounds                  bounds_;
+    const SharedBounds&            bounds_;
     std::vector<const KeyMapping*> keys_held_;  // into key_mappings, which is static
     std::array<bool, 3>            buttons_held_{};
 };
@@ -398,6 +420,7 @@ struct InputChannel::Impl {
     HANDLE       pipe = INVALID_HANDLE_VALUE;
     HANDLE       io_event = nullptr;    // manual-reset; the read's OVERLAPPED event
     HANDLE       stop_event = nullptr;  // manual-reset; set by close()
+    SharedBounds bounds;
     std::jthread reader;
 
     ~Impl() { close(); }
@@ -426,7 +449,7 @@ struct InputChannel::Impl {
     // which releases anything still held; then the pipe is closed, so that
     // hawk-service's next write fails at once rather than filling the pipe
     // and waiting on a reader that is gone.
-    void read_events(DesktopBounds bounds) {
+    void read_events() {
         {
             Injector injector(bounds);
             pump(injector);
@@ -523,9 +546,14 @@ bool InputChannel::open(const std::string& pipe_name, DesktopBounds bounds) {
         return false;
     }
 
-    impl_->reader = std::jthread([impl = impl_.get(), bounds] { impl->read_events(bounds); });
+    impl_->bounds.set(bounds);
+    impl_->reader = std::jthread([impl = impl_.get()] { impl->read_events(); });
     spdlog::info("input: listening for input from hawk-service");
     return true;
+}
+
+void InputChannel::set_bounds(DesktopBounds bounds) {
+    impl_->bounds.set(bounds);
 }
 
 void InputChannel::close() noexcept {

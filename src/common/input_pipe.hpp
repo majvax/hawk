@@ -10,7 +10,7 @@
 // so a packet is written and read as a raw struct.
 //
 // The pipe is created by hawk-service (outbound only, remote clients
-// rejected, DACL limited to SYSTEM and the logged-on user) alongside the
+// rejected, DACL limited to SYSTEM, which hawk-capture runs as) alongside the
 // video pipe, and its name is handed to hawk-capture on its command line as
 // `--input-pipe <name>`. Keeping input off the video pipe is the control /
 // data channel separation the README asks for: a stalled video reader can't

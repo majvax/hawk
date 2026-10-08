@@ -37,6 +37,11 @@ public:
     // relative to. Failures are logged; input simply stays unavailable.
     [[nodiscard]] bool open(const std::string& pipe_name, DesktopBounds bounds);
 
+    // Where the captured monitor now sits, after a reacquired duplication
+    // found it moved on the virtual desktop. Safe to call from any thread,
+    // and when the channel was never opened.
+    void set_bounds(DesktopBounds bounds);
+
     // Stops reading and releases anything still held. Safe to call when the
     // channel was never opened.
     void close() noexcept;

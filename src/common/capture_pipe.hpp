@@ -8,7 +8,7 @@
 // architecture, so the header is written and read as a raw struct.
 //
 // The pipe itself is created by hawk-service (inbound only, remote clients
-// rejected, DACL limited to SYSTEM and the logged-on user) and its name is
+// rejected, DACL limited to SYSTEM, which hawk-capture runs as) and its name is
 // handed to hawk-capture on its command line as `--pipe <name>`.
 namespace hawk::ipc {
 

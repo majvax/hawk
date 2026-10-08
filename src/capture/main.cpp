@@ -275,6 +275,9 @@ int main(int argc, char* argv[]) {
                 static_cast<void>(capture::follow_input_desktop(capture_desktop));
                 if (auto reacquired = duplicator.reacquire(); reacquired.has_value()) {
                     // 'recovered' is logged above once a real frame arrives.
+                    // The resolution is unchanged, but the monitor may have
+                    // moved on the virtual desktop while we weren't looking.
+                    input.set_bounds(duplicator.bounds());
                 } else if (reacquired.error().code == capture::CaptureError::Code::access_lost) {
                     // The display mode changed while the duplication was
                     // down; the encoder is sized to the old resolution, so

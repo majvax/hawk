@@ -331,6 +331,9 @@ async fn handle_dashboard(
     });
 
     let mut input_budget = InputBudget::new();
+    // Releases draw on their own budget: a burst of moves that drains the
+    // main one must not swallow the key-up after it and leave a key held.
+    let mut release_budget = InputBudget::new();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -351,7 +354,7 @@ async fn handle_dashboard(
                 // Dropped quietly: a view-only or flooding dashboard gets
                 // nothing through, and no reply it could time against.
                 if let Some(event) = event.sanitized()
-                    && input_budget.take()
+                    && if event.is_release() { release_budget.take() } else { input_budget.take() }
                 {
                     registry.input(dashboard_id, &device_id, event);
                 }

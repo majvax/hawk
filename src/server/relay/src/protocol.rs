@@ -59,7 +59,7 @@ pub enum DeviceCommand {
     ReleaseInput,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MouseButton {
     Left,
@@ -89,6 +89,11 @@ const MAX_WHEEL: i32 = 1200;
 const MAX_KEY_CODE_LEN: usize = 31;
 
 impl InputEvent {
+    /// Letting go of a key or button, as opposed to pressing one or moving.
+    pub fn is_release(&self) -> bool {
+        matches!(self, Self::MouseButton { down: false, .. } | Self::Key { down: false, .. })
+    }
+
     /// The event with its values brought into range, or None if it can't
     /// be made sense of.
     pub fn sanitized(self) -> Option<Self> {
