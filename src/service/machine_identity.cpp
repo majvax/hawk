@@ -5,6 +5,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <format>
@@ -20,6 +21,7 @@ const std::filesystem::path kDataDirectory = R"(C:\ProgramData\HawkService)";
 const std::filesystem::path kIdentityPath = kDataDirectory / "machine.txt";
 const std::filesystem::path kEnrollCodePath = kDataDirectory / "enroll-code.txt";
 const std::filesystem::path kLegacyCredentialPath = kDataDirectory / "credential.bin";
+const std::filesystem::path kRelayPinsPath = kDataDirectory / "relay-pins.txt";
 
 [[nodiscard]] std::optional<std::string> read_file(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
@@ -145,6 +147,23 @@ void delete_legacy_credential() {
         remove_file(kLegacyCredentialPath);
         spdlog::info("identity: removed the old credential file; this machine now authenticates with its key");
     }
+}
+
+std::vector<std::string> load_relay_pins() {
+    std::vector<std::string> pins;
+    const auto contents = read_file(kRelayPinsPath);
+    if (!contents.has_value()) {
+        return pins;
+    }
+    std::size_t start = 0;
+    while (start <= contents->size()) {
+        const auto end = std::min(contents->find('\n', start), contents->size());
+        if (auto pin = trim(contents->substr(start, end - start)); !pin.empty()) {
+            pins.push_back(std::move(pin));
+        }
+        start = end + 1;
+    }
+    return pins;
 }
 
 }  // namespace hawk::service

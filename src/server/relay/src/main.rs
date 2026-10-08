@@ -17,8 +17,10 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::routing::{delete, get, post};
+use base64::Engine;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use sha2::{Digest, Sha256};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -35,6 +37,9 @@ pub struct AppState {
     pub limiter: Arc<LoginLimiter>,
     /// Session cookies get the Secure flag whenever we serve TLS.
     pub secure_cookies: bool,
+    /// SHA-256 of the TLS certificate's public key (SPKI), base64: what
+    /// machines pin. None when serving without TLS.
+    pub relay_pin: Option<String>,
 }
 
 struct Config {
@@ -109,9 +114,18 @@ fn spawn_cleanup(state: AppState) {
     });
 }
 
-/// Loads the cert/key into a rustls config, or None when either file is
-/// missing (plain http/ws for localhost-only development).
-fn load_tls(config: &Config) -> Result<Option<rustls::ServerConfig>, String> {
+/// The pin machines check the relay against: base64 SHA-256 of the leaf
+/// certificate's SubjectPublicKeyInfo. Pinning the key rather than the whole
+/// certificate survives renewals that keep the key.
+fn spki_pin(cert: &CertificateDer<'_>) -> Result<String, String> {
+    let parsed = webpki::EndEntityCert::try_from(cert).map_err(|error| format!("parsing TLS certificate: {error}"))?;
+    let digest = Sha256::digest(parsed.subject_public_key_info().as_ref());
+    Ok(base64::engine::general_purpose::STANDARD.encode(digest))
+}
+
+/// Loads the cert/key into a rustls config (and the cert's pin), or None
+/// when either file is missing (plain http/ws for localhost-only development).
+fn load_tls(config: &Config) -> Result<Option<(rustls::ServerConfig, String)>, String> {
     if !config.tls_cert.exists() || !config.tls_key.exists() {
         return Ok(None);
     }
@@ -120,6 +134,7 @@ fn load_tls(config: &Config) -> Result<Option<rustls::ServerConfig>, String> {
         .map_err(|error| format!("reading {}: {error}", config.tls_cert.display()))?;
     let key = PrivateKeyDer::from_pem_file(&config.tls_key)
         .map_err(|error| format!("reading {}: {error}", config.tls_key.display()))?;
+    let pin = spki_pin(certs.first().ok_or_else(|| format!("no certificate in {}", config.tls_cert.display()))?)?;
     let mut server = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -127,7 +142,7 @@ fn load_tls(config: &Config) -> Result<Option<rustls::ServerConfig>, String> {
     // HTTP/1.1 only: WebSocket upgrades ride on it, and the server isn't
     // built with HTTP/2 support.
     server.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Some(server))
+    Ok(Some((server, pin)))
 }
 
 #[tokio::main]
@@ -138,7 +153,13 @@ async fn main() -> Result<(), String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let config = Config::from_env()?;
-    let tls = load_tls(&config)?;
+    let (tls, relay_pin) = match load_tls(&config)? {
+        Some((tls, pin)) => {
+            info!(pin = %pin, "relay certificate pin (machines check this; see install-service.ps1 -RelayPin)");
+            (Some(tls), Some(pin))
+        }
+        None => (None, None),
+    };
     let db = Db::open(&config.db_path)?;
     info!("database at {}", config.db_path.display());
 
@@ -151,6 +172,7 @@ async fn main() -> Result<(), String> {
         db,
         limiter: Arc::new(LoginLimiter::default()),
         secure_cookies: tls.is_some(),
+        relay_pin,
     };
     spawn_cleanup(state.clone());
 

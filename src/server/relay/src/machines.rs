@@ -20,6 +20,8 @@ pub struct EnrollmentCode {
     /// Shown once; only its hash is stored.
     code: String,
     expires_at: i64,
+    /// What the machine should pin the relay's TLS key to; None without TLS.
+    relay_pin: Option<String>,
 }
 
 /// A one-time code that enrolls one machine under the caller's account.
@@ -33,7 +35,7 @@ pub async fn create_enrollment_code(
     let expires_at = now + auth::ENROLLMENT_TTL.whole_seconds();
     let owner_id = current.user.id;
     state.db.call(move |conn| db::create_enrollment_code(conn, &hash, owner_id, now, expires_at)).await?;
-    Ok(Json(EnrollmentCode { code, expires_at }))
+    Ok(Json(EnrollmentCode { code, expires_at, relay_pin: state.relay_pin.clone() }))
 }
 
 #[derive(Deserialize)]

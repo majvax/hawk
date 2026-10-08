@@ -399,6 +399,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
     svc::CaptureHost capture;
 
     bool warned_not_enrolled = false;
+    bool warned_unpinned = false;
     while (!stop_token.stop_requested()) {
         auto session = PrepareSession();
         if (!session.has_value()) {
@@ -412,10 +413,27 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         }
         warned_not_enrolled = false;
 
-        if (auto connected = client.connect(kRelayServerUrl); !connected.has_value()) {
-            spdlog::error("relay: connect failed: {}", net::to_string(connected.error()));
+        net::WebSocketClient::ConnectOptions options;
+        options.pinned_keys = svc::load_relay_pins();
+        if (options.pinned_keys.empty() && !warned_unpinned) {
+            spdlog::warn("relay: no relay key pinned; only the certificate chain is checked. Reinstall with "
+                         "install-service.ps1 -RelayPin <pin> (shown with the enrollment code) to pin it");
+            warned_unpinned = true;
+        }
+
+        if (auto connected = client.connect(kRelayServerUrl, options); !connected.has_value()) {
             DiscardFailedEnrollment(session);  // a fresh key is made next attempt
-            SleepUnlessStopped(stop_token, kReconnectDelay);
+            if (connected.error().code == net::WebSocketError::Code::pin_mismatch) {
+                // Either the relay's key changed or someone is in the middle:
+                // either way, nothing is sent until a pinned key shows up.
+                spdlog::error("relay: refusing {}: {}. If the relay's TLS key really changed, reinstall with the "
+                              "new -RelayPin",
+                              kRelayServerUrl, connected.error().message);
+                SleepUnlessStopped(stop_token, kRejectedRetryDelay);
+            } else {
+                spdlog::error("relay: connect failed: {}", net::to_string(connected.error()));
+                SleepUnlessStopped(stop_token, kReconnectDelay);
+            }
             continue;
         }
 

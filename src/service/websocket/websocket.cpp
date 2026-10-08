@@ -1,12 +1,17 @@
 #include "websocket.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
+#include <wincrypt.h>
 #include <winhttp.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <cstdint>
 #include <cstring>
+#include <expected>
 #include <format>
 #include <mutex>
 #include <utility>
@@ -162,6 +167,59 @@ constexpr std::uint16_t default_ws_port = 80;
     return block;
 }
 
+// Base64 SHA-256 of the DER SubjectPublicKeyInfo of the server certificate
+// on `request`, or the reason it couldn't be computed.
+[[nodiscard]] std::expected<std::string, std::string> server_key_pin(HINTERNET request) {
+    PCCERT_CONTEXT certificate = nullptr;
+    DWORD          size = sizeof(certificate);
+    if (WinHttpQueryOption(request, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &certificate, &size) == FALSE ||
+        certificate == nullptr) {
+        return std::unexpected(std::format("no server certificate (error {})", GetLastError()));
+    }
+
+    BYTE* spki = nullptr;
+    DWORD spki_size = 0;
+    const BOOL encoded = CryptEncodeObjectEx(X509_ASN_ENCODING, X509_PUBLIC_KEY_INFO,
+                                             &certificate->pCertInfo->SubjectPublicKeyInfo, CRYPT_ENCODE_ALLOC_FLAG,
+                                             nullptr, &spki, &spki_size);
+    CertFreeCertificateContext(certificate);
+    if (encoded == FALSE) {
+        return std::unexpected(std::format("encoding the public key failed (error {})", GetLastError()));
+    }
+
+    std::array<UCHAR, 32> digest{};
+    BCRYPT_ALG_HANDLE     sha256 = nullptr;
+    BCRYPT_HASH_HANDLE    hash = nullptr;
+    NTSTATUS              status = BCryptOpenAlgorithmProvider(&sha256, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (BCRYPT_SUCCESS(status)) {
+        status = BCryptCreateHash(sha256, &hash, nullptr, 0, nullptr, 0, 0);
+    }
+    if (BCRYPT_SUCCESS(status)) {
+        status = BCryptHashData(hash, spki, spki_size, 0);
+    }
+    if (BCRYPT_SUCCESS(status)) {
+        status = BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+    }
+    if (hash != nullptr) {
+        BCryptDestroyHash(hash);
+    }
+    if (sha256 != nullptr) {
+        BCryptCloseAlgorithmProvider(sha256, 0);
+    }
+    LocalFree(spki);
+    if (!BCRYPT_SUCCESS(status)) {
+        return std::unexpected(std::format("hashing the public key failed (0x{:08X})", static_cast<std::uint32_t>(status)));
+    }
+
+    const DWORD flags = CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF;
+    DWORD       length = 0;
+    CryptBinaryToStringA(digest.data(), static_cast<DWORD>(digest.size()), flags, nullptr, &length);
+    std::string pin(length, '\0');
+    CryptBinaryToStringA(digest.data(), static_cast<DWORD>(digest.size()), flags, pin.data(), &length);
+    pin.resize(length);
+    return pin;
+}
+
 }  // namespace
 
 std::string_view to_string(WebSocketError::Code code) noexcept {
@@ -180,6 +238,8 @@ std::string_view to_string(WebSocketError::Code code) noexcept {
             return "not_connected";
         case WebSocketError::Code::already_connected:
             return "already_connected";
+        case WebSocketError::Code::pin_mismatch:
+            return "pin_mismatch";
     }
     return "unknown";
 }
@@ -282,6 +342,21 @@ std::expected<void, WebSocketError> WebSocketClient::connect(std::string_view ur
         WinHttpCloseHandle(connect_handle);
         WinHttpCloseHandle(session);
         return std::unexpected(std::move(error));
+    }
+
+    if (!options.pinned_keys.empty()) {
+        auto pin = server_key_pin(request);
+        const bool matches =
+            pin.has_value() && std::ranges::find(options.pinned_keys, *pin) != options.pinned_keys.end();
+        if (!matches) {
+            WebSocketError error = make_simple_error(
+                WebSocketError::Code::pin_mismatch,
+                pin.has_value() ? std::format("server key {} is not pinned", *pin) : pin.error());
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect_handle);
+            WinHttpCloseHandle(session);
+            return std::unexpected(std::move(error));
+        }
     }
 
     HINTERNET socket = WinHttpWebSocketCompleteUpgrade(request, 0);

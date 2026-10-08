@@ -81,6 +81,7 @@ export const deleteInvite = (id: number) => request<void>("DELETE", `/api/admin/
 export interface EnrollmentCode {
   code: string; // shown once; the server keeps only its hash
   expiresAt: number;
+  relayPin: string | null; // the relay's TLS key pin; null when serving without TLS
 }
 
 export interface Share {

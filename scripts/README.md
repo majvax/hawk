@@ -16,8 +16,9 @@ In the dashboard, open **Machines → Add machine** to get a one-time
 enrollment code (valid for an hour), then on the PC:
 
 ```powershell
-# from the repo root, after building into bin\
-powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1 -EnrollCode 7K3QD-WX2MP
+# from the repo root, after building into bin\ (copy the exact command the
+# dashboard shows; it includes your relay's pin)
+powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1 -EnrollCode 7K3QD-WX2MP -RelayPin wqsPIpg8...xW0=
 ```
 
 The service connects to the relay (`wss://127.0.0.1:8080/v1/ws` by
@@ -37,7 +38,15 @@ default — see `kRelayServerUrl` in `src/service/main.cpp`) and enrolls:
   used; a rejected code is deleted too, and leaves the existing enrollment
   and key untouched.
 
-Reinstalling an enrolled machine doesn't need `-EnrollCode`. To move a machine to another account, remove it in the dashboard and
+`-RelayPin` pins the relay's TLS key (`relay-pins.txt`): the service then
+refuses any relay whose certificate doesn't carry that key, even one that
+chains to a root this PC trusts, before sending anything. Pass several
+(`-RelayPin pinA,pinB`) to also accept a backup key ahead of a rotation.
+Without it the service still works, checking only the certificate chain, and
+logs a warning.
+
+Reinstalling an enrolled machine needs neither option (pins already set are
+kept). To move a machine to another account, remove it in the dashboard and
 enroll it again with a new code; the old key is deleted from the TPM.
 
 Once enrolled, the service waits for a `start_capture` command. It launches `hawk-capture.exe` into the logged-on

@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace hawk::service {
 
@@ -31,5 +32,10 @@ void                                     delete_enroll_code();
 // Removes the bearer credential that machines enrolled before key-based
 // authentication kept; it's no longer accepted by the relay.
 void delete_legacy_credential();
+
+// The relay TLS keys this machine accepts (base64 SHA-256 of the SPKI, one
+// per line), written by install-service.ps1 -RelayPin. Empty means pinning
+// is off and only the normal certificate chain check applies.
+[[nodiscard]] std::vector<std::string> load_relay_pins();
 
 }  // namespace hawk::service

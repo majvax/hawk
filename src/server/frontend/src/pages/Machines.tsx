@@ -16,6 +16,11 @@ import { type ConnectionStatus, useDashboard } from "../useDashboard.js";
 
 const ROLE_LABEL: Record<Role, string> = { owner: "owner", control: "can control", view: "view only" };
 
+function installCommand(enrollment: EnrollmentCode): string {
+  const pin = enrollment.relayPin === null ? "" : ` -RelayPin ${enrollment.relayPin}`;
+  return `powershell -ExecutionPolicy Bypass -File scripts\\install-service.ps1 -EnrollCode ${enrollment.code}${pin}`;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "request failed";
 }
@@ -56,8 +61,12 @@ export function MachinesPage({ onSocketClosed }: { onSocketClosed: () => void })
             Enrollment code: <code className="code">{enrollment.code}</code> — single use, expires{" "}
             {formatTime(enrollment.expiresAt)}. On the PC, from an elevated PowerShell in the Hawk folder:
           </p>
-          <pre>powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1 -EnrollCode {enrollment.code}</pre>
-          <p className="muted">The machine shows up here once it connects. This code won't be shown again.</p>
+          <pre>{installCommand(enrollment)}</pre>
+          <p className="muted">
+            The machine shows up here once it connects. This code won't be shown again.
+            {enrollment.relayPin !== null &&
+              " -RelayPin makes the machine accept only this relay's TLS key, even from a certificate it would otherwise trust."}
+          </p>
           <button type="button" onClick={() => setEnrollment(null)}>
             Done
           </button>

@@ -68,8 +68,8 @@ Every machine has exactly one owner and its own key pair.
 
 - **Enrolling:** in the dashboard, **Machines > Add machine** issues a
   one-time enrollment code (like `7K3QD-WX2MP`, valid 1 hour) and the exact
-  install command, `install-service.ps1 -EnrollCode <code>` (see
-  `scripts/README.md`). The service creates an ECDSA P-256 key in the
+  install command, `install-service.ps1 -EnrollCode <code> -RelayPin <pin>`
+  (see `scripts/README.md`). The service creates an ECDSA P-256 key in the
   machine's TPM (or the software key store without one) and sends the
   public key with the code. The relay stores the public key, and consumes
   the code only once the machine has proven it holds the private key.
@@ -121,6 +121,21 @@ Authorities** store first. For anything beyond your own LAN, skip the
 self-signed cert entirely and use one from a real CA (e.g. Let's Encrypt)
 for an actual domain pointed at this server.
 
+### Pinning
+
+On top of the chain check, machines pin the relay's **TLS key**: the relay
+logs `relay certificate pin` at startup (base64 SHA-256 of the
+certificate's SubjectPublicKeyInfo) and the dashboard puts it in every
+install command as `-RelayPin`. A machine with a pin refuses any other key,
+even from a certificate that chains to a root it trusts (a rogue or
+corporate CA), before sending anything.
+
+Because it pins the key, not the certificate, renewing the certificate is
+fine **as long as the key stays the same** (e.g. certbot `--reuse-key`). To
+change the key: put the new key's pin on every machine first, alongside the
+old one (`install-service.ps1 -RelayPin <old>,<new>`), then switch the relay
+to it. A machine whose pins don't match logs `refusing ...: server key <pin>
+is not pinned` and retries every 30s.
 
 ## Roadmap
 

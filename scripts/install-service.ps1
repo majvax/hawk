@@ -22,11 +22,19 @@
     e.g. 7K3QD-WX2MP. Needed the first time, or to re-enroll a machine that
     was removed. The service uses it once to get this machine's credential,
     then deletes it. Omit it when reinstalling an already enrolled machine.
+
+.PARAMETER RelayPin
+    The relay's TLS key pin, shown in the dashboard next to the enrollment
+    code (and in the relay's log at startup). The service then refuses any
+    relay whose certificate doesn't carry that key, even one the machine
+    would otherwise trust. Pass several (comma-separated) to also accept a
+    backup key ahead of a rotation. Omit it to keep the pins already set.
 #>
 [CmdletBinding()]
 param(
     [string]$BinPath = (Join-Path $PSScriptRoot "..\bin\hawk-service.exe"),
-    [string]$EnrollCode
+    [string]$EnrollCode,
+    [string[]]$RelayPin
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,6 +47,17 @@ if (-not (Test-Path $BinPath)) {
 $CapturePath = Join-Path (Split-Path $BinPath) "hawk-capture.exe"
 if (-not (Test-Path $CapturePath)) {
     Write-Warning "hawk-capture.exe not found next to the service at '$CapturePath'. Capture will fail to launch until it is there."
+}
+
+# Validate everything before touching the installed service, so a typo
+# never leaves it removed or stopped.
+$pins = @()
+if ($RelayPin) {
+    $pins = @($RelayPin | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($pin in $pins) {
+        # base64 of a 32-byte SHA-256: 44 characters ending in '='.
+        if ($pin -notmatch '^[A-Za-z0-9+/]{43}=$') { throw "'$pin' doesn't look like a relay pin" }
+    }
 }
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
@@ -55,9 +74,15 @@ if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed with exit code $LASTEXITC
 
 sc.exe description $ServiceName "Hawk remote desktop background service." | Out-Null
 
+$DataDir = Join-Path $env:ProgramData "HawkService"
+New-Item -ItemType Directory -Force $DataDir | Out-Null
+
+if ($pins.Count -gt 0) {
+    Set-Content -Path (Join-Path $DataDir "relay-pins.txt") -Value $pins -Encoding ascii
+    Write-Host "Relay key pinned ($($pins.Count) pin(s))."
+}
+
 if ($EnrollCode) {
-    $DataDir = Join-Path $env:ProgramData "HawkService"
-    New-Item -ItemType Directory -Force $DataDir | Out-Null
     Set-Content -Path (Join-Path $DataDir "enroll-code.txt") -Value $EnrollCode.Trim() -NoNewline -Encoding ascii
     Write-Host "Enrollment code saved; the service will enroll this machine on its next connect."
 }

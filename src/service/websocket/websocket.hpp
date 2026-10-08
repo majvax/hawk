@@ -40,6 +40,7 @@ struct WebSocketError {
         receive_failed,
         not_connected,
         already_connected,
+        pin_mismatch,  // TLS key doesn't match ConnectOptions::pinned_keys
     };
 
     Code          code;
@@ -70,6 +71,14 @@ public:
         std::chrono::milliseconds connect_timeout;
         std::chrono::milliseconds send_timeout;
         std::chrono::milliseconds receive_timeout;  // 0 = infinite
+
+        // Certificate pinning for wss://. When non-empty, the server's leaf
+        // certificate must have one of these public keys, given as base64
+        // SHA-256 of its DER SubjectPublicKeyInfo. Checked right after the
+        // TLS handshake, before connect() returns, so nothing is ever sent
+        // over a connection that fails it. The usual chain validation
+        // against the Windows trust store still applies on top.
+        std::vector<std::string> pinned_keys;
 
         // A nested class's default member initializers aren't usable until
         // its *outer* class is complete, which makes them unusable as a
