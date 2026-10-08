@@ -21,13 +21,24 @@ powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1 -EnrollCode
 ```
 
 The service connects to the relay (`wss://127.0.0.1:8080/v1/ws` by
-default — see `kRelayServerUrl` in `src/service/main.cpp`), trades the code
-for this machine's own credential, and from then on appears under your
-account. The credential is kept in `C:\ProgramData\HawkService\credential.bin`,
-encrypted with DPAPI for the SYSTEM account only; the code file is deleted
-once used. Reinstalling an enrolled machine doesn't need `-EnrollCode`; to
-move a machine to another account, remove it in the dashboard and enroll it
-again with a new code.
+default — see `kRelayServerUrl` in `src/service/main.cpp`) and enrolls:
+
+- It creates an ECDSA P-256 key **inside the TPM** (Microsoft Platform
+  Crypto Provider), non-exportable, so the private key never leaves the
+  chip. Without a usable TPM it falls back to a non-exportable key in the
+  Windows software key store; the dashboard shows which one each machine
+  has. Secure Boot is not required.
+- It sends the public key with the code, and proves it holds the private key
+  by signing a challenge from the relay. From then on, every connection is
+  a fresh challenge signed in the TPM. There's no secret on disk or on the
+  wire to steal or replay.
+- `C:\ProgramData\HawkService\machine.txt` records which machine it enrolled
+  as and the key's name (neither is secret). The code file is deleted once
+  used; a rejected code is deleted too, and leaves the existing enrollment
+  and key untouched.
+
+Reinstalling an enrolled machine doesn't need `-EnrollCode`. To move a machine to another account, remove it in the dashboard and
+enroll it again with a new code; the old key is deleted from the TPM.
 
 Once enrolled, the service waits for a `start_capture` command. It launches `hawk-capture.exe` into the logged-on
 user's session on demand, so a user must be signed in at the console for

@@ -97,6 +97,7 @@ impl Inner {
             online: device.is_some(),
             connected_at: device.map(|device| device.connected_at.format(&Rfc3339).unwrap_or_default()),
             last_seen_at: row.last_seen_at,
+            key_storage: row.key_storage.clone(),
             viewers: (row.role == Role::Owner).then(|| {
                 let mut emails: Vec<String> = device
                     .map(|device| device.viewers.values().map(|viewer| viewer.email.clone()).collect())

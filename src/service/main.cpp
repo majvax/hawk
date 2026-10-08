@@ -1,8 +1,10 @@
 #include "capture_host.hpp"
-#include "credential_store.hpp"
+#include "machine_identity.hpp"
+#include "machine_key.hpp"
 #include "websocket/websocket.hpp"
 
 #include <windows.h>
+#include <wincrypt.h>
 
 #include <glaze/glaze.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
@@ -14,7 +16,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -37,29 +41,42 @@ namespace {
 // anything beyond localhost, use a cert from a real CA instead.
 constexpr std::string_view kRelayServerUrl = "wss://127.0.0.1:8080/v1/ws";
 constexpr std::chrono::seconds kReconnectDelay{5};
-// After the relay refuses this machine (unknown credential or code), or
-// while there's nothing to identify with, retry less eagerly.
+// After the relay refuses this machine (unknown machine, bad code, failed
+// key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
 // RFC 6455 "policy violation": the relay's answer to an unknown machine.
 constexpr std::uint16_t kPolicyViolationCode = 1008;
 constexpr std::wstring_view kServiceName = L"HawkService";
 
-// Exactly one of `credential` / `enroll_code` is set; unset members are left
-// out of the JSON.
+// What the machine signs to answer the relay's challenge; must match
+// machine_auth_message() in src/server/relay/src/protocol.rs.
+constexpr std::string_view kMachineAuthContext{"hawk-machine-auth-v1\0", 21};
+
+// Opens every connection. An enrolled machine sends `machine`; a new one
+// sends `enroll_code`, `public_key` and `key_storage`. Unset members are
+// left out of the JSON.
 struct HelloMessage {
     std::string                type = "hello";
     std::string                machine_id;  // the hostname, shown to the owner
-    std::optional<std::string> credential;
+    std::optional<std::string> machine;
     std::optional<std::string> enroll_code;
+    std::optional<std::string> public_key;  // base64 uncompressed P-256 point
+    std::optional<std::string> key_storage;  // "tpm" or "software"
+};
+
+// Answers the relay's challenge.
+struct ProofMessage {
+    std::string type = "proof";
+    std::string signature;  // base64 r || s
 };
 
 // A message from the relay. Unknown fields are ignored, so commands can grow
-// parameters without breaking this parser. `machine_id` and `credential`
-// are only set on "enrolled".
+// parameters without breaking this parser. `nonce` is only set on
+// "challenge", `machine_id` only on "enrolled".
 struct RelayCommand {
     std::string type;
+    std::string nonce;
     std::string machine_id;
-    std::string credential;
 };
 
 // Binary frame carrying one H.264 access unit to the relay:
@@ -76,15 +93,21 @@ constexpr std::size_t kVideoFrameHeaderSize = 10;
 template <>
 struct glz::meta<HelloMessage> {
     using T                     = HelloMessage;
-    static constexpr auto value = object("type", &T::type, "machine_id", &T::machine_id, "credential",
-                                         &T::credential, "enroll_code", &T::enroll_code);
+    static constexpr auto value =
+        object("type", &T::type, "machine_id", &T::machine_id, "machine", &T::machine, "enroll_code",
+               &T::enroll_code, "public_key", &T::public_key, "key_storage", &T::key_storage);
+};
+
+template <>
+struct glz::meta<ProofMessage> {
+    using T                     = ProofMessage;
+    static constexpr auto value = object("type", &T::type, "signature", &T::signature);
 };
 
 template <>
 struct glz::meta<RelayCommand> {
     using T                     = RelayCommand;
-    static constexpr auto value =
-        object("type", &T::type, "machine_id", &T::machine_id, "credential", &T::credential);
+    static constexpr auto value = object("type", &T::type, "nonce", &T::nonce, "machine_id", &T::machine_id);
 };
 
 namespace {
@@ -123,38 +146,144 @@ void InitLogging() {
     }
 }
 
-// How this machine identifies itself to the relay: a pending enrollment
-// code wins over a stored credential (that's how a machine is re-enrolled).
-// Nothing at all means it was never enrolled.
-struct Identity {
-    std::optional<std::string> credential;
-    std::optional<std::string> enroll_code;
-};
-
-[[nodiscard]] std::optional<Identity> LoadIdentity() {
-    if (auto code = svc::load_enroll_code(); code.has_value()) {
-        return Identity{.credential = std::nullopt, .enroll_code = std::move(code)};
+[[nodiscard]] std::string Base64Encode(std::span<const std::byte> data) {
+    const auto* bytes = reinterpret_cast<const BYTE*>(data.data());
+    const auto  flags = CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF;
+    DWORD       length = 0;
+    if (CryptBinaryToStringA(bytes, static_cast<DWORD>(data.size()), flags, nullptr, &length) == FALSE) {
+        return {};
     }
-    if (auto credential = svc::load_credential(); credential.has_value()) {
-        return Identity{.credential = std::move(credential), .enroll_code = std::nullopt};
+    std::string text(length, '\0');
+    if (CryptBinaryToStringA(bytes, static_cast<DWORD>(data.size()), flags, text.data(), &length) == FALSE) {
+        return {};
     }
-    return std::nullopt;
+    text.resize(length);  // drop the terminator the size query counted
+    return text;
 }
 
-[[nodiscard]] std::string BuildHelloMessage(Identity identity) {
+[[nodiscard]] std::optional<std::vector<std::byte>> Base64Decode(std::string_view text) {
+    DWORD length = 0;
+    if (CryptStringToBinaryA(text.data(), static_cast<DWORD>(text.size()), CRYPT_STRING_BASE64, nullptr, &length,
+                             nullptr, nullptr) == FALSE) {
+        return std::nullopt;
+    }
+    std::vector<std::byte> data(length);
+    if (CryptStringToBinaryA(text.data(), static_cast<DWORD>(text.size()), CRYPT_STRING_BASE64,
+                             reinterpret_cast<BYTE*>(data.data()), &length, nullptr, nullptr) == FALSE) {
+        return std::nullopt;
+    }
+    data.resize(length);
+    return data;
+}
+
+// What one connection authenticates with. A pending enrollment code wins
+// over the stored identity (that's how a machine is re-enrolled): it gets a
+// brand-new key under a fresh name, so a rejected code never disturbs the
+// key the machine already has.
+struct Session {
+    svc::MachineKey            key;
+    std::wstring               key_name;
+    std::optional<std::string> machine_id;   // set when already enrolled
+    std::optional<std::string> enroll_code;  // set while enrolling
+};
+
+enum class SessionProblem : std::uint8_t {
+    not_enrolled,  // nothing to identify with yet
+    failed,        // logged already
+};
+
+[[nodiscard]] std::expected<Session, SessionProblem> PrepareSession() {
+    if (auto code = svc::load_enroll_code(); code.has_value()) {
+        std::wstring name = svc::new_machine_key_name();
+        auto         key = svc::MachineKey::create(name);
+        if (!key.has_value()) {
+            spdlog::error("relay: {}", key.error());
+            return std::unexpected(SessionProblem::failed);
+        }
+        spdlog::info("relay: enrolling with a new {} key", key->storage());
+        return Session{.key = std::move(*key),
+                       .key_name = std::move(name),
+                       .machine_id = std::nullopt,
+                       .enroll_code = std::move(code)};
+    }
+    if (auto identity = svc::load_machine_identity(); identity.has_value()) {
+        auto key = svc::MachineKey::open(identity->key_name);
+        if (!key.has_value()) {
+            spdlog::error("relay: this machine's key is missing ({}); remove it in the dashboard and enroll it again",
+                          key.error());
+            return std::unexpected(SessionProblem::failed);
+        }
+        return Session{.key = std::move(*key),
+                       .key_name = std::move(identity->key_name),
+                       .machine_id = std::move(identity->machine_id),
+                       .enroll_code = std::nullopt};
+    }
+    return std::unexpected(SessionProblem::not_enrolled);
+}
+
+// If `session` was enrolling and didn't get through, deletes the key it
+// created for that attempt. The session (and its open key handle) is
+// released first: the TPM provider won't delete a key that's still open.
+// Returns whether it was an enrollment attempt.
+bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
+    if (!session.has_value() || !session->enroll_code.has_value()) {
+        return false;
+    }
+    const std::wstring key_name = session->key_name;
+    session = std::unexpected(SessionProblem::failed);
+    if (auto destroyed = svc::MachineKey::destroy(key_name); !destroyed.has_value()) {
+        spdlog::warn("relay: couldn't delete the unused enrollment key: {}", destroyed.error());
+    }
+    return true;
+}
+
+[[nodiscard]] std::string BuildHelloMessage(const Session& session) {
     std::array<char, MAX_COMPUTERNAME_LENGTH + 1> name_buffer{};
     auto name_length = static_cast<DWORD>(name_buffer.size());
     GetComputerNameA(name_buffer.data(), &name_length);
 
     HelloMessage hello{
         .machine_id = std::string(name_buffer.data(), name_length),
-        .credential = std::move(identity.credential),
-        .enroll_code = std::move(identity.enroll_code),
+        .machine = session.machine_id,
+        .enroll_code = session.enroll_code,
+        .public_key = std::nullopt,
+        .key_storage = std::nullopt,
     };
+    if (session.enroll_code.has_value()) {
+        auto public_key = session.key.public_key();
+        if (!public_key.has_value()) {
+            spdlog::error("relay: exporting the public key failed: {}", public_key.error());
+            return {};
+        }
+        hello.public_key = Base64Encode(*public_key);
+        hello.key_storage = std::string(session.key.storage());
+    }
     if (auto json = glz::write_json(hello); json.has_value()) {
         return *json;
     }
     spdlog::error("relay: failed to serialize hello message");
+    return {};
+}
+
+// Signs the relay's challenge with the machine key.
+[[nodiscard]] std::string BuildProofMessage(const Session& session, std::string_view nonce_base64) {
+    const auto nonce = Base64Decode(nonce_base64);
+    if (!nonce.has_value()) {
+        spdlog::error("relay: received an unreadable challenge");
+        return {};
+    }
+    std::vector<std::byte> message(kMachineAuthContext.size());
+    std::ranges::transform(kMachineAuthContext, message.begin(), [](char c) { return static_cast<std::byte>(c); });
+    message.insert(message.end(), nonce->begin(), nonce->end());
+
+    auto signature = session.key.sign(message);
+    if (!signature.has_value()) {
+        spdlog::error("relay: signing the challenge failed: {}", signature.error());
+        return {};
+    }
+    if (auto json = glz::write_json(ProofMessage{.signature = Base64Encode(*signature)}); json.has_value()) {
+        return *json;
+    }
     return {};
 }
 
@@ -188,23 +317,42 @@ void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture) {
     }
 }
 
-void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc::CaptureHost& capture) {
+// The relay accepted this connection's enrollment: make the new key and
+// machine id this PC's identity, and retire what it had before.
+void CompleteEnrollment(Session& session, const std::string& machine_id) {
+    const auto previous = svc::load_machine_identity();
+    if (!svc::save_machine_identity({.machine_id = machine_id, .key_name = session.key_name})) {
+        spdlog::error("relay: enrolled as machine {}, but couldn't save that; remove the machine in the dashboard "
+                      "and enroll it again",
+                      machine_id);
+        return;
+    }
+    svc::delete_enroll_code();
+    if (previous.has_value() && previous->key_name != session.key_name) {
+        if (auto destroyed = svc::MachineKey::destroy(previous->key_name); !destroyed.has_value()) {
+            spdlog::warn("relay: couldn't delete the previous machine key: {}", destroyed.error());
+        }
+    }
+    svc::delete_legacy_credential();
+    session.machine_id = machine_id;
+    session.enroll_code.reset();
+    spdlog::info("relay: enrolled as machine {} ({} key)", machine_id, session.key.storage());
+}
+
+void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc::CaptureHost& capture,
+                        Session& session) {
     RelayCommand command;
     if (auto error = glz::read<glz::opts{.error_on_unknown_keys = false}>(command, text); error) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
 
-    if (command.type == "enrolled") {
-        // The code is spent either way; only the credential works from now on.
-        if (svc::save_credential(command.credential)) {
-            svc::delete_enroll_code();
-            spdlog::info("relay: enrolled as machine {}", command.machine_id);
-        } else {
-            spdlog::error("relay: enrolled as machine {}, but the credential couldn't be saved; "
-                          "remove the machine in the dashboard and enroll it again",
-                          command.machine_id);
+    if (command.type == "challenge") {
+        if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
+            spdlog::warn("relay: failed to send key proof: {}", net::to_string(sent.error()));
         }
+    } else if (command.type == "enrolled") {
+        CompleteEnrollment(session, command.machine_id);
     } else if (command.type == "start_capture") {
         StartCapture(client, capture);
     } else if (command.type == "stop_capture") {
@@ -217,11 +365,12 @@ void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc
 // Handles one received message. Returns the close code once the relay has
 // closed the connection, nullopt while it stays open.
 [[nodiscard]] std::optional<std::uint16_t> HandleRelayMessage(const net::WebSocketMessage& message,
-                                                              net::WebSocketClient& client, svc::CaptureHost& capture) {
+                                                              net::WebSocketClient& client, svc::CaptureHost& capture,
+                                                              Session& session) {
     return std::visit(
         [&]<typename T>(const T& payload) -> std::optional<std::uint16_t> {
             if constexpr (std::is_same_v<T, std::string>) {
-                HandleRelayCommand(payload, client, capture);
+                HandleRelayCommand(payload, client, capture, session);
                 return std::nullopt;
             } else if constexpr (std::is_same_v<T, std::vector<std::byte>>) {
                 spdlog::info("relay: received binary message ({} bytes)", payload.size());
@@ -251,9 +400,9 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
 
     bool warned_not_enrolled = false;
     while (!stop_token.stop_requested()) {
-        auto identity = LoadIdentity();
-        if (!identity.has_value()) {
-            if (!warned_not_enrolled) {
+        auto session = PrepareSession();
+        if (!session.has_value()) {
+            if (session.error() == SessionProblem::not_enrolled && !warned_not_enrolled) {
                 spdlog::warn("relay: this machine isn't enrolled. Create an enrollment code in the dashboard "
                              "(Machines > Add machine) and reinstall with install-service.ps1 -EnrollCode <code>");
                 warned_not_enrolled = true;
@@ -265,6 +414,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
 
         if (auto connected = client.connect(kRelayServerUrl); !connected.has_value()) {
             spdlog::error("relay: connect failed: {}", net::to_string(connected.error()));
+            DiscardFailedEnrollment(session);  // a fresh key is made next attempt
             SleepUnlessStopped(stop_token, kReconnectDelay);
             continue;
         }
@@ -272,7 +422,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         spdlog::info("relay: connected to {}", kRelayServerUrl);
         active_client.store(&client);
 
-        if (auto sent = client.send_text(BuildHelloMessage(std::move(*identity))); !sent.has_value()) {
+        if (auto sent = client.send_text(BuildHelloMessage(*session)); !sent.has_value()) {
             spdlog::warn("relay: failed to send hello message: {}", net::to_string(sent.error()));
         }
 
@@ -283,7 +433,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
                 spdlog::warn("relay: receive failed: {}", net::to_string(message.error()));
                 break;
             }
-            close_code = HandleRelayMessage(*message, client, capture);
+            close_code = HandleRelayMessage(*message, client, capture, *session);
             if (close_code.has_value()) {
                 break;
             }
@@ -295,9 +445,18 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         active_client.store(nullptr);
         client.close();
 
-        if (close_code == kPolicyViolationCode) {
-            spdlog::warn("relay: the relay refused this machine (removed, owner disabled, or an invalid "
-                         "enrollment code); retrying in {}s",
+        // An enrollment that didn't go through leaves no key behind.
+        const bool enrollment_failed = DiscardFailedEnrollment(session);
+
+        if (close_code == kPolicyViolationCode && enrollment_failed) {
+            // A wrong or expired code never becomes right; stop retrying it.
+            svc::delete_enroll_code();
+            spdlog::error("relay: the enrollment code was rejected (wrong, expired or already used). Create a new "
+                          "one in the dashboard and reinstall with install-service.ps1 -EnrollCode <code>");
+            SleepUnlessStopped(stop_token, kRejectedRetryDelay);
+        } else if (close_code == kPolicyViolationCode) {
+            spdlog::warn("relay: the relay refused this machine (removed, owner disabled, or the key proof "
+                         "failed); retrying in {}s",
                          kRejectedRetryDelay.count());
             SleepUnlessStopped(stop_token, kRejectedRetryDelay);
         } else if (!close_code.has_value()) {

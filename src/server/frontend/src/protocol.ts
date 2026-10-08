@@ -13,6 +13,7 @@ export interface Machine {
   online: boolean;
   connectedAt: string | null; // RFC 3339, while online
   lastSeenAt: number | null; // unix seconds
+  keyStorage: "tpm" | "software" | null; // null: must be re-enrolled
   viewers: string[] | null; // who's watching; owner only
 }
 

@@ -83,6 +83,7 @@ export function MachinesPage({ onSocketClosed }: { onSocketClosed: () => void })
                 <td>
                   {machine.name}
                   {machine.name !== machine.hostname && <span className="muted"> ({machine.hostname})</span>}
+                  {machine.role === "owner" && <KeyBadge storage={machine.keyStorage} />}
                 </td>
                 <td>
                   <span className={`dot ${machine.online ? "dot-open" : "dot-closed"}`} aria-hidden />
@@ -257,6 +258,26 @@ function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => vo
         </button>
       </div>
     </section>
+  );
+}
+
+// Where the machine keeps the key it authenticates with, as it reports it.
+function KeyBadge({ storage }: { storage: Machine["keyStorage"] }): JSX.Element {
+  if (storage === null) {
+    return (
+      <span className="badge warn" title="Enrolled before key-based authentication; remove and enroll it again">
+        re-enroll needed
+      </span>
+    );
+  }
+  return storage === "tpm" ? (
+    <span className="badge" title="Its key lives in the TPM and can't be copied off the machine">
+      TPM
+    </span>
+  ) : (
+    <span className="badge" title="No usable TPM: its key is in the Windows software key store">
+      software key
+    </span>
   );
 }
 

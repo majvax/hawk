@@ -64,20 +64,28 @@ Accounts are invite-only; there is no open sign-up.
 
 ## Machines
 
-Every machine has exactly one owner and its own credential.
+Every machine has exactly one owner and its own key pair.
 
 - **Enrolling:** in the dashboard, **Machines > Add machine** issues a
-  one-time enrollment code (like `7K3QD-WX2MP`, valid 1 hour). Install the
-  service on the PC with `install-service.ps1 -EnrollCode <code>` (see
-  `scripts/README.md`). On its first connect the service trades the code for
-  a long-lived per-machine credential; the relay stores only its hash.
-- **Connecting:** the service's hello carries that credential. An unknown,
-  missing or removed credential, a spent or expired code, or a disabled
-  owner closes the socket with `1008` (policy violation) before the machine
-  is registered.
-- **Removing** a machine (owner only) invalidates its credential,
-  disconnects it, and takes it away from everyone it was shared with. To
-  bring it back, or move it to another account, enroll it again.
+  one-time enrollment code (like `7K3QD-WX2MP`, valid 1 hour) and the exact
+  install command, `install-service.ps1 -EnrollCode <code>` (see
+  `scripts/README.md`). The service creates an ECDSA P-256 key in the
+  machine's TPM (or the software key store without one) and sends the
+  public key with the code. The relay stores the public key, and consumes
+  the code only once the machine has proven it holds the private key.
+- **Connecting:** hello, then the relay sends a fresh 32-byte challenge and
+  the machine signs it (`hawk-machine-auth-v1\0 || nonce`, verified with
+  `ring`). An unknown or removed machine, a failed proof, a spent or expired
+  code, or a disabled owner closes the socket with `1008` (policy violation)
+  before the machine is registered. Nothing secret is stored server-side or
+  sent over the wire. The dashboard shows owners whether each machine's key
+  is in a TPM ("software key" otherwise); that's as reported by the
+  machine, not attested.
+- **Removing** a machine (owner only) deletes its public key, disconnects
+  it, and takes it away from everyone it was shared with. To bring it back,
+  or move it to another account, enroll it again.
+- Machines enrolled before key-based authentication show "re-enroll needed"
+  and can't connect until they are.
 - Live connections are keyed by machine, so the dashboard also lists your
   machines while they're offline, with when they were last seen.
 
@@ -112,6 +120,7 @@ Windows trust store), so to point it at a local dev relay you need to import
 Authorities** store first. For anything beyond your own LAN, skip the
 self-signed cert entirely and use one from a real CA (e.g. Let's Encrypt)
 for an actual domain pointed at this server.
+
 
 ## Roadmap
 

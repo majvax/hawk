@@ -6,19 +6,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Role;
 
-/// The first (and only text) message a device sends after connecting. It
-/// carries either the machine's credential or, the first time, a one-time
-/// enrollment code from the owner's dashboard.
+/// Text messages a device sends. A connection opens with a hello, the relay
+/// answers with a challenge, and the device signs it with its machine key:
+///
+/// - an enrolled machine names itself (`machine`) and signs with the key it
+///   enrolled with;
+/// - a new machine sends a one-time `enroll_code` plus the public half of a
+///   key it just created, and signs with that key to prove it holds it.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceMessage {
     Hello {
         /// The machine's hostname, shown to the owner.
         machine_id: String,
+        /// The relay-assigned id of an enrolled machine.
         #[serde(default)]
-        credential: Option<String>,
+        machine: Option<String>,
         #[serde(default)]
         enroll_code: Option<String>,
+        /// Base64 uncompressed P-256 point; enrollment only.
+        #[serde(default)]
+        public_key: Option<String>,
+        /// "tpm" or "software"; enrollment only.
+        #[serde(default)]
+        key_storage: Option<String>,
+    },
+    Proof {
+        /// Base64 ECDSA P-256 signature, r||s, over
+        /// [`machine_auth_message`] for the challenge.
+        signature: String,
     },
 }
 
@@ -26,11 +42,19 @@ pub enum DeviceMessage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceCommand {
-    /// Reply to a hello with a valid enrollment code: the credential to send
-    /// from now on. Shown once; the relay keeps only its hash.
-    Enrolled { machine_id: String, credential: String },
+    /// Base64 32 random bytes, fresh per connection.
+    Challenge { nonce: String },
+    /// The enrollment went through; `machine_id` is what to send as
+    /// `machine` in future hellos.
+    Enrolled { machine_id: String },
     StartCapture,
     StopCapture,
+}
+
+/// What a device signs to answer a challenge. The fixed prefix keeps the
+/// signature from being valid for anything else the key might sign.
+pub fn machine_auth_message(nonce: &[u8]) -> Vec<u8> {
+    [b"hawk-machine-auth-v1\0".as_slice(), nonce].concat()
 }
 
 /// Messages a dashboard sends up to start/stop watching a machine's screen.
@@ -55,6 +79,9 @@ pub struct MachineView {
     pub connected_at: Option<String>,
     /// Unix seconds.
     pub last_seen_at: Option<i64>,
+    /// Where the machine keeps its key, as it reports it: "tpm" or
+    /// "software". None means it must be re-enrolled before it can connect.
+    pub key_storage: Option<String>,
     /// Who is watching right now. Only sent to the owner.
     pub viewers: Option<Vec<String>>,
 }

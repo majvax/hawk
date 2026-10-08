@@ -59,6 +59,14 @@ const MIGRATIONS: &[&str] = &["
         created_at INTEGER NOT NULL,
         PRIMARY KEY (machine_id, user_id)
     );
+", "
+    -- Machines authenticate with a key pair instead of a bearer credential.
+    -- key_fingerprint is SHA-256(public_key); rows enrolled before this
+    -- migration keep their old credential hash there, have no public_key,
+    -- and can't connect until they're enrolled again.
+    ALTER TABLE machines RENAME COLUMN credential_hash TO key_fingerprint;
+    ALTER TABLE machines ADD COLUMN public_key BLOB;   -- uncompressed P-256 point, 65 bytes
+    ALTER TABLE machines ADD COLUMN key_storage TEXT;  -- 'tpm' or 'software', as reported by the machine
 "];
 
 #[derive(Clone)]
@@ -350,6 +358,8 @@ pub struct MachineRow {
     pub name: String,
     pub hostname: String,
     pub last_seen_at: Option<i64>,
+    /// "tpm" or "software"; None for a machine that must be re-enrolled.
+    pub key_storage: Option<String>,
     pub role: Role,
 }
 
@@ -358,6 +368,12 @@ pub struct MachineRow {
 pub struct MachineAuth {
     pub public_id: String,
     pub owner_id: i64,
+}
+
+/// What a connecting machine must prove it holds the private half of.
+pub struct MachineKey {
+    pub owner_id: i64,
+    pub public_key: Vec<u8>,
 }
 
 pub struct ShareRow {
@@ -380,60 +396,63 @@ pub fn create_enrollment_code(
     Ok(())
 }
 
-/// Consumes an enrollment code and registers the machine under the code's
-/// owner, in one transaction. None if the code is unknown, used, expired, or
-/// its owner is disabled.
-pub fn enroll_machine(
-    conn: &Connection,
-    code_hash: &[u8],
-    public_id: &str,
-    hostname: &str,
-    credential_hash: &[u8],
-    now: i64,
-) -> rusqlite::Result<Option<MachineAuth>> {
-    let tx = conn.unchecked_transaction()?;
-    let code = tx
-        .query_row(
-            "SELECT c.id, c.owner_id FROM enrollment_codes c JOIN users u ON u.id = c.owner_id
-              WHERE c.code_hash = ?1 AND c.expires_at > ?2 AND u.disabled = 0",
-            params![code_hash, now],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()?;
-    let Some((code_id, owner_id)) = code else { return Ok(None) };
-    tx.execute("DELETE FROM enrollment_codes WHERE id = ?1", [code_id])?;
-    tx.execute(
-        "INSERT INTO machines (public_id, owner_id, name, hostname, credential_hash, created_at, last_seen_at)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?5)",
-        params![public_id, owner_id, hostname, credential_hash, now],
-    )?;
-    tx.commit()?;
-    Ok(Some(MachineAuth { public_id: public_id.to_owned(), owner_id }))
+/// The owner of a usable enrollment code: unknown, used, expired codes and
+/// disabled owners give None. Doesn't consume it.
+pub fn enrollment_code_owner(conn: &Connection, code_hash: &[u8], now: i64) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT c.owner_id FROM enrollment_codes c JOIN users u ON u.id = c.owner_id
+          WHERE c.code_hash = ?1 AND c.expires_at > ?2 AND u.disabled = 0",
+        params![code_hash, now],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
-/// Looks a device up by its credential (its owner must not be disabled) and
-/// records its current hostname and that it was seen now.
-pub fn authenticate_machine(
-    conn: &Connection,
-    credential_hash: &[u8],
-    hostname: &str,
-    now: i64,
-) -> rusqlite::Result<Option<MachineAuth>> {
-    let found = conn
-        .query_row(
-            "SELECT m.public_id, m.owner_id FROM machines m JOIN users u ON u.id = m.owner_id
-              WHERE m.credential_hash = ?1 AND u.disabled = 0",
-            [credential_hash],
-            |row| Ok(MachineAuth { public_id: row.get(0)?, owner_id: row.get(1)? }),
-        )
-        .optional()?;
-    if let Some(machine) = &found {
-        conn.execute(
-            "UPDATE machines SET hostname = ?1, last_seen_at = ?2 WHERE public_id = ?3",
-            params![hostname, now, machine.public_id],
-        )?;
-    }
-    Ok(found)
+pub struct NewMachine<'a> {
+    pub code_hash: &'a [u8],
+    pub public_id: &'a str,
+    pub hostname: &'a str,
+    pub public_key: &'a [u8],
+    pub key_storage: &'a str,
+}
+
+/// Consumes an enrollment code and registers the machine under the code's
+/// owner, in one transaction, so a code can only ever enroll one machine.
+/// None if the code is no longer usable.
+pub fn enroll_machine(conn: &Connection, machine: &NewMachine<'_>, now: i64) -> rusqlite::Result<Option<MachineAuth>> {
+    let tx = conn.unchecked_transaction()?;
+    let Some(owner_id) = enrollment_code_owner(&tx, machine.code_hash, now)? else { return Ok(None) };
+    tx.execute("DELETE FROM enrollment_codes WHERE code_hash = ?1", [machine.code_hash])?;
+    let fingerprint = crate::auth::token_hash_bytes(machine.public_key);
+    tx.execute(
+        "INSERT INTO machines
+             (public_id, owner_id, name, hostname, key_fingerprint, public_key, key_storage, created_at, last_seen_at)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![machine.public_id, owner_id, machine.hostname, fingerprint, machine.public_key, machine.key_storage, now],
+    )?;
+    tx.commit()?;
+    Ok(Some(MachineAuth { public_id: machine.public_id.to_owned(), owner_id }))
+}
+
+/// The public key a machine must prove it holds. None if the machine is
+/// unknown, its owner is disabled, or it was enrolled before keys existed.
+pub fn machine_key(conn: &Connection, public_id: &str) -> rusqlite::Result<Option<MachineKey>> {
+    conn.query_row(
+        "SELECT m.owner_id, m.public_key FROM machines m JOIN users u ON u.id = m.owner_id
+          WHERE m.public_id = ?1 AND u.disabled = 0 AND m.public_key IS NOT NULL",
+        [public_id],
+        |row| Ok(MachineKey { owner_id: row.get(0)?, public_key: row.get(1)? }),
+    )
+    .optional()
+}
+
+/// Records a successful connection: current hostname, and seen now.
+pub fn record_connect(conn: &Connection, public_id: &str, hostname: &str, now: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE machines SET hostname = ?1, last_seen_at = ?2 WHERE public_id = ?3",
+        params![hostname, now, public_id],
+    )?;
+    Ok(())
 }
 
 pub fn touch_machine(conn: &Connection, public_id: &str, now: i64) -> rusqlite::Result<()> {
@@ -449,7 +468,8 @@ fn machine_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRow> {
         name: row.get(3)?,
         hostname: row.get(4)?,
         last_seen_at: row.get(5)?,
-        role: Role::from_sql(&row.get::<_, String>(6)?),
+        key_storage: row.get(6)?,
+        role: Role::from_sql(&row.get::<_, String>(7)?),
     })
 }
 
@@ -457,11 +477,11 @@ fn machine_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRow> {
 /// Shares of a disabled owner's machines are left out.
 pub fn accessible_machines(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<MachineRow>> {
     let mut statement = conn.prepare(
-        "SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, 'owner'
+        "SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, 'owner'
            FROM machines m JOIN users o ON o.id = m.owner_id
           WHERE m.owner_id = ?1
          UNION ALL
-         SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, s.role
+         SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, s.role
            FROM machine_shares s
            JOIN machines m ON m.id = s.machine_id
            JOIN users o ON o.id = m.owner_id

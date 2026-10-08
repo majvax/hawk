@@ -7,8 +7,11 @@ use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -16,7 +19,7 @@ use crate::AppState;
 use crate::auth::{self, CurrentUser};
 use crate::db::{self, MachineAuth};
 use crate::error::ApiError;
-use crate::protocol::{DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage};
+use crate::protocol::{DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, machine_auth_message};
 use crate::registry::{DashboardHandle, DeviceOutbound, Outbound, Registry};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,82 +27,170 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// About half a second of 60 fps video per viewer before frames are dropped.
 const VIEWER_FRAME_QUEUE: usize = 32;
 
-/// Endpoint machines (hawk-service) connect to. The first message must be a
-/// hello carrying the machine's credential or a one-time enrollment code;
-/// anything else is closed with 1008 before the machine is registered.
-/// After it, binary messages are video frames to fan out, and the relay
-/// sends capture commands down.
+/// Endpoint machines (hawk-service) connect to. A connection must open with
+/// a hello and then sign a fresh challenge with its machine key (see
+/// [`DeviceMessage`]); anything else is closed with 1008 before the machine
+/// is registered. After that, binary messages are video frames to fan out,
+/// and the relay sends capture commands down.
 pub async fn device_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| handle_device(socket, state))
 }
 
-enum HelloOutcome {
-    Authenticated(MachineAuth),
-    /// Enrolled just now; the credential must be sent back to the machine.
-    Enrolled(MachineAuth, String),
-    Rejected,
+/// Signing happens in the machine's TPM, which can take a moment.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An uncompressed P-256 point: 0x04 || X || Y.
+const P256_PUBLIC_KEY_LEN: usize = 65;
+
+type DeviceSink = futures_util::stream::SplitSink<WebSocket, Message>;
+type DeviceStream = futures_util::stream::SplitStream<WebSocket>;
+
+/// Who the device claims to be, and the key it must prove it holds.
+enum Claim {
+    Existing { public_id: String, owner_id: i64, public_key: Vec<u8> },
+    Enroll { code_hash: Vec<u8>, public_key: Vec<u8>, key_storage: String },
 }
 
-async fn authenticate_hello(state: &AppState, hello: DeviceMessage) -> Result<HelloOutcome, rusqlite::Error> {
-    let DeviceMessage::Hello { machine_id: hostname, credential, enroll_code } = hello;
+impl Claim {
+    fn public_key(&self) -> &[u8] {
+        match self {
+            Self::Existing { public_key, .. } | Self::Enroll { public_key, .. } => public_key,
+        }
+    }
+}
+
+/// Why a device connection is refused.
+enum Refusal {
+    Malformed,
+    Unknown,
+    Server(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for Refusal {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Server(error)
+    }
+}
+
+async fn resolve_claim(
+    state: &AppState,
+    machine: Option<String>,
+    enroll_code: Option<String>,
+    public_key: Option<String>,
+    key_storage: Option<String>,
+) -> Result<Claim, Refusal> {
+    if let Some(public_id) = machine {
+        let lookup = public_id.clone();
+        let key = state.db.call(move |conn| db::machine_key(conn, &lookup)).await?.ok_or(Refusal::Unknown)?;
+        return Ok(Claim::Existing { public_id, owner_id: key.owner_id, public_key: key.public_key });
+    }
+
+    let (Some(code), Some(public_key), Some(key_storage)) = (enroll_code, public_key, key_storage) else {
+        return Err(Refusal::Malformed);
+    };
+    let public_key = BASE64.decode(public_key).map_err(|_| Refusal::Malformed)?;
+    if public_key.len() != P256_PUBLIC_KEY_LEN || public_key[0] != 0x04 {
+        return Err(Refusal::Malformed);
+    }
+    if key_storage != "tpm" && key_storage != "software" {
+        return Err(Refusal::Malformed);
+    }
+    // Checked now so a bad code fails fast; consumed only after the proof.
+    let code_hash = auth::enrollment_code_hash(&code);
+    let (lookup, now) = (code_hash.clone(), auth::now());
+    state.db.call(move |conn| db::enrollment_code_owner(conn, &lookup, now)).await?.ok_or(Refusal::Unknown)?;
+    Ok(Claim::Enroll { code_hash, public_key, key_storage })
+}
+
+/// The next text message within `limit`, parsed. None on timeout, close,
+/// or anything that isn't a valid device message.
+async fn next_device_message(stream: &mut DeviceStream, limit: Duration) -> Option<DeviceMessage> {
+    match tokio::time::timeout(limit, stream.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str(&text).ok(),
+        _ => None,
+    }
+}
+
+async fn send_command(sink: &mut DeviceSink, command: &DeviceCommand) -> bool {
+    match serde_json::to_string(command) {
+        Ok(json) => sink.send(Message::Text(json.into())).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Runs hello -> challenge -> proof. Returns the authenticated machine, and
+/// whether this connection enrolled it.
+async fn authenticate_device(
+    state: &AppState,
+    sink: &mut DeviceSink,
+    stream: &mut DeviceStream,
+) -> Result<(MachineAuth, bool), Refusal> {
+    let Some(DeviceMessage::Hello { machine_id: hostname, machine, enroll_code, public_key, key_storage }) =
+        next_device_message(stream, HELLO_TIMEOUT).await
+    else {
+        return Err(Refusal::Malformed);
+    };
     let hostname: String = hostname.chars().take(255).collect();
+    let claim = resolve_claim(state, machine, enroll_code, public_key, key_storage).await?;
+
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).expect("OS random number generator unavailable");
+    if !send_command(sink, &DeviceCommand::Challenge { nonce: BASE64.encode(nonce) }).await {
+        return Err(Refusal::Malformed);
+    }
+    let Some(DeviceMessage::Proof { signature }) = next_device_message(stream, PROOF_TIMEOUT).await else {
+        return Err(Refusal::Malformed);
+    };
+    let signature = BASE64.decode(signature).map_err(|_| Refusal::Malformed)?;
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, claim.public_key())
+        .verify(&machine_auth_message(&nonce), &signature)
+        .map_err(|_| Refusal::Unknown)?;
+
     let now = auth::now();
-
-    if let Some(credential) = credential {
-        let hash = auth::token_hash(&credential);
-        let found = state.db.call(move |conn| db::authenticate_machine(conn, &hash, &hostname, now)).await?;
-        return Ok(found.map_or(HelloOutcome::Rejected, HelloOutcome::Authenticated));
+    match claim {
+        Claim::Existing { public_id, owner_id, .. } => {
+            let id = public_id.clone();
+            state.db.call(move |conn| db::record_connect(conn, &id, &hostname, now)).await?;
+            Ok((MachineAuth { public_id, owner_id }, false))
+        }
+        Claim::Enroll { code_hash, public_key, key_storage } => {
+            let public_id = uuid::Uuid::new_v4().to_string();
+            let enrolled = state
+                .db
+                .call(move |conn| {
+                    let machine = db::NewMachine {
+                        code_hash: &code_hash,
+                        public_id: &public_id,
+                        hostname: &hostname,
+                        public_key: &public_key,
+                        key_storage: &key_storage,
+                    };
+                    db::enroll_machine(conn, &machine, now)
+                })
+                .await?
+                // The code was used by another connection while this one signed.
+                .ok_or(Refusal::Unknown)?;
+            Ok((enrolled, true))
+        }
     }
-
-    if let Some(code) = enroll_code {
-        let code_hash = auth::enrollment_code_hash(&code);
-        let credential = auth::random_token();
-        let credential_hash = auth::token_hash(&credential);
-        let public_id = uuid::Uuid::new_v4().to_string();
-        let enrolled = state
-            .db
-            .call(move |conn| db::enroll_machine(conn, &code_hash, &public_id, &hostname, &credential_hash, now))
-            .await?;
-        return Ok(enrolled.map_or(HelloOutcome::Rejected, |machine| HelloOutcome::Enrolled(machine, credential)));
-    }
-
-    Ok(HelloOutcome::Rejected)
 }
 
 async fn handle_device(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
-    let hello = match tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await {
-        Err(_) => {
-            warn!("relay: device did not send hello in time, closing");
-            let _ = sink.send(close(1002, "expected hello")).await;
+    let (machine, enrolled) = match authenticate_device(&state, &mut sink, &mut stream).await {
+        Ok(result) => result,
+        Err(Refusal::Malformed) => {
+            warn!("relay: device sent a malformed or incomplete handshake, closing");
+            let _ = sink.send(close(1003, "invalid handshake")).await;
             return;
         }
-        Ok(None | Some(Err(_))) => return,
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<DeviceMessage>(&text) {
-            Ok(hello) => hello,
-            Err(_) => {
-                warn!("relay: received invalid hello message");
-                let _ = sink.send(close(1003, "invalid hello")).await;
-                return;
-            }
-        },
-        Ok(Some(Ok(_))) => {
-            warn!("relay: expected a text hello message, closing");
-            let _ = sink.send(close(1003, "invalid hello")).await;
-            return;
-        }
-    };
-
-    let (machine, credential) = match authenticate_hello(&state, hello).await {
-        Ok(HelloOutcome::Authenticated(machine)) => (machine, None),
-        Ok(HelloOutcome::Enrolled(machine, credential)) => (machine, Some(credential)),
-        Ok(HelloOutcome::Rejected) => {
-            warn!("relay: rejected a device with an unknown credential or enrollment code");
+        Err(Refusal::Unknown) => {
+            warn!("relay: rejected a device: unknown machine, bad enrollment code, or failed key proof");
             let _ = sink.send(close(1008, "unknown machine")).await;
             return;
         }
-        Err(error) => {
+        Err(Refusal::Server(error)) => {
             error!(%error, "relay: database error authenticating a device");
             let _ = sink.send(close(1011, "server error")).await;
             return;
@@ -107,11 +198,9 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     };
     let machine_id = machine.public_id.clone();
 
-    if let Some(credential) = credential {
+    if enrolled {
         info!(%machine_id, owner_id = machine.owner_id, "relay: machine enrolled");
-        let enrolled = DeviceCommand::Enrolled { machine_id: machine_id.clone(), credential };
-        let Ok(json) = serde_json::to_string(&enrolled) else { return };
-        if sink.send(Message::Text(json.into())).await.is_err() {
+        if !send_command(&mut sink, &DeviceCommand::Enrolled { machine_id: machine_id.clone() }).await {
             return;
         }
         // The new machine shows up on its owner's open dashboards.

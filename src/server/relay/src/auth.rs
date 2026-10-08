@@ -40,7 +40,11 @@ pub fn random_token() -> String {
 /// Tokens are stored only as their SHA-256, so a copy of the database can't
 /// be used to log in or redeem an invite.
 pub fn token_hash(token: &str) -> Vec<u8> {
-    Sha256::digest(token.as_bytes()).to_vec()
+    token_hash_bytes(token.as_bytes())
+}
+
+pub fn token_hash_bytes(bytes: &[u8]) -> Vec<u8> {
+    Sha256::digest(bytes).to_vec()
 }
 
 pub const ENROLLMENT_TTL: time::Duration = time::Duration::hours(1);

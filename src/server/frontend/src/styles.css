@@ -216,6 +216,15 @@ button.danger:hover {
   font-size: 12px;
 }
 
+td .badge {
+  margin-left: 8px;
+}
+
+.badge.warn {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 .code {
   font-family: ui-monospace, monospace;
   font-size: 16px;
