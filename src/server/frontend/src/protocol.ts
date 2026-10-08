@@ -1,4 +1,4 @@
-// Mirrors backend/src/protocol.ts. Kept as a plain duplicate rather than a
+// Mirrors relay/src/protocol.rs. Kept as a plain duplicate rather than a
 // shared package since the frontend only ever reads these shapes.
 
 export interface DeviceSnapshot {

@@ -3,7 +3,7 @@
 # Not for anything that crosses a real network — see README.md's TLS section.
 set -euo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/../../"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p certs
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \

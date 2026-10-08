@@ -8,3 +8,6 @@ bin/
 node_modules/
 dist/
 certs/
+
+# Rust relay (src/server/relay)
+target/
