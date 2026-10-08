@@ -67,6 +67,20 @@ const MIGRATIONS: &[&str] = &["
     ALTER TABLE machines RENAME COLUMN credential_hash TO key_fingerprint;
     ALTER TABLE machines ADD COLUMN public_key BLOB;   -- uncompressed P-256 point, 65 bytes
     ALTER TABLE machines ADD COLUMN key_storage TEXT;  -- 'tpm' or 'software', as reported by the machine
+", "
+    -- Where a session signed in from, so its owner can tell them apart.
+    -- NULL for sessions created before this migration.
+    ALTER TABLE sessions ADD COLUMN user_agent TEXT;
+    ALTER TABLE sessions ADD COLUMN ip TEXT;
+", "
+    -- Temporary shares. A share grants access only while
+    -- starts_at <= now < expires_at (NULL: no bound); the relay deletes it
+    -- once it expires. A single_view share is used up by one viewing.
+    ALTER TABLE machine_shares ADD COLUMN starts_at INTEGER;
+    ALTER TABLE machine_shares ADD COLUMN expires_at INTEGER;
+    ALTER TABLE machine_shares ADD COLUMN single_view INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX machine_shares_expires_at ON machine_shares (expires_at) WHERE expires_at IS NOT NULL;
+    CREATE INDEX machine_shares_starts_at ON machine_shares (starts_at) WHERE starts_at IS NOT NULL;
 "];
 
 #[derive(Clone)]
@@ -197,16 +211,24 @@ pub fn set_user_disabled(conn: &Connection, user_id: i64, disabled: bool) -> rus
     Ok(changed > 0)
 }
 
+/// Where a session was signed in from.
+pub struct SessionOrigin {
+    pub user_agent: Option<String>,
+    pub ip: String,
+}
+
 pub fn create_session(
     conn: &Connection,
     token_hash: &[u8],
     user_id: i64,
+    origin: &SessionOrigin,
     now: i64,
     expires_at: i64,
 ) -> rusqlite::Result<i64> {
     conn.execute(
-        "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-        params![token_hash, user_id, now, expires_at],
+        "INSERT INTO sessions (token_hash, user_id, user_agent, ip, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![token_hash, user_id, origin.user_agent, origin.ip, now, expires_at],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -226,6 +248,71 @@ pub fn find_session(conn: &Connection, token_hash: &[u8], now: i64) -> rusqlite:
 pub fn delete_session(conn: &Connection, session_id: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
     Ok(())
+}
+
+pub struct SessionRow {
+    pub id: i64,
+    pub user_agent: Option<String>,
+    pub ip: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// The user's unexpired sessions, newest first.
+pub fn list_sessions(conn: &Connection, user_id: i64, now: i64) -> rusqlite::Result<Vec<SessionRow>> {
+    let mut statement = conn.prepare(
+        "SELECT id, user_agent, ip, created_at, expires_at FROM sessions
+          WHERE user_id = ?1 AND expires_at > ?2 ORDER BY created_at DESC, id DESC",
+    )?;
+    statement
+        .query_map(params![user_id, now], |row| {
+            Ok(SessionRow {
+                id: row.get(0)?,
+                user_agent: row.get(1)?,
+                ip: row.get(2)?,
+                created_at: row.get(3)?,
+                expires_at: row.get(4)?,
+            })
+        })?
+        .collect()
+}
+
+/// Returns false if `user_id` has no such session.
+pub fn delete_user_session(conn: &Connection, user_id: i64, session_id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM sessions WHERE id = ?1 AND user_id = ?2", params![session_id, user_id])? > 0)
+}
+
+/// Ends every session the user has except `keep`.
+pub fn delete_other_sessions(conn: &Connection, user_id: i64, keep: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM sessions WHERE user_id = ?1 AND id <> ?2", params![user_id, keep])?;
+    Ok(())
+}
+
+pub fn password_hash(conn: &Connection, user_id: i64) -> rusqlite::Result<String> {
+    conn.query_row("SELECT password_hash FROM users WHERE id = ?1", [user_id], |row| row.get(0))
+}
+
+/// Replaces the password hash and ends every other session, in one
+/// transaction. Only replaces `old_hash`: returns false if the password
+/// changed since it was read, so a concurrent change isn't silently undone.
+pub fn change_password(
+    conn: &Connection,
+    user_id: i64,
+    old_hash: &str,
+    new_hash: &str,
+    keep_session: i64,
+) -> rusqlite::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute(
+        "UPDATE users SET password_hash = ?1 WHERE id = ?2 AND password_hash = ?3",
+        params![new_hash, user_id, old_hash],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    delete_other_sessions(&tx, user_id, keep_session)?;
+    tx.commit()?;
+    Ok(true)
 }
 
 pub fn create_invite(
@@ -361,6 +448,10 @@ pub struct MachineRow {
     /// "tpm" or "software"; None for a machine that must be re-enrolled.
     pub key_storage: Option<String>,
     pub role: Role,
+    /// When a temporary share ends; None for owners and open-ended shares.
+    pub share_expires_at: Option<i64>,
+    /// A share that one viewing uses up.
+    pub single_view: bool,
 }
 
 /// The machine behind an authenticated device connection.
@@ -379,7 +470,25 @@ pub struct MachineKey {
 pub struct ShareRow {
     pub user_id: i64,
     pub email: String,
+    pub terms: ShareTerms,
+}
+
+/// What a share grants, and for how long.
+#[derive(Debug, Clone, Copy)]
+pub struct ShareTerms {
     pub role: Role,
+    /// Access begins here; None: right away.
+    pub starts_at: Option<i64>,
+    /// Access ends here and the share is deleted; None: until revoked.
+    pub expires_at: Option<i64>,
+    /// Used up when the viewer's first viewing ends.
+    pub single_view: bool,
+}
+
+/// A share as a (machine, user) pair, for mirroring into the registry.
+pub struct ShareKey {
+    pub public_id: String,
+    pub user_id: i64,
 }
 
 pub fn create_enrollment_code(
@@ -470,30 +579,42 @@ fn machine_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRow> {
         last_seen_at: row.get(5)?,
         key_storage: row.get(6)?,
         role: Role::from_sql(&row.get::<_, String>(7)?),
+        share_expires_at: row.get(8)?,
+        single_view: row.get(9)?,
     })
 }
 
 /// Every machine the user owns or has been shared, with their role on it.
-/// Shares of a disabled owner's machines are left out.
-pub fn accessible_machines(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<MachineRow>> {
+/// Shares of a disabled owner's machines are left out, and so are shares
+/// outside their time window at `now`.
+pub fn accessible_machines(conn: &Connection, user_id: i64, now: i64) -> rusqlite::Result<Vec<MachineRow>> {
     let mut statement = conn.prepare(
-        "SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, 'owner'
+        "SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, 'owner',
+                NULL, 0
            FROM machines m JOIN users o ON o.id = m.owner_id
           WHERE m.owner_id = ?1
          UNION ALL
-         SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, s.role
+         SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, s.role,
+                s.expires_at, s.single_view
            FROM machine_shares s
            JOIN machines m ON m.id = s.machine_id
            JOIN users o ON o.id = m.owner_id
           WHERE s.user_id = ?1 AND o.disabled = 0
+            AND (s.starts_at IS NULL OR s.starts_at <= ?2)
+            AND (s.expires_at IS NULL OR s.expires_at > ?2)
          ORDER BY 4",
     )?;
-    statement.query_map([user_id], machine_from_row)?.collect()
+    statement.query_map(params![user_id, now], machine_from_row)?.collect()
 }
 
-/// One machine as `user_id` sees it, if they have any access to it.
-pub fn machine_for_user(conn: &Connection, public_id: &str, user_id: i64) -> rusqlite::Result<Option<MachineRow>> {
-    Ok(accessible_machines(conn, user_id)?.into_iter().find(|machine| machine.public_id == public_id))
+/// One machine as `user_id` sees it at `now`, if they have any access to it.
+pub fn machine_for_user(
+    conn: &Connection,
+    public_id: &str,
+    user_id: i64,
+    now: i64,
+) -> rusqlite::Result<Option<MachineRow>> {
+    Ok(accessible_machines(conn, user_id, now)?.into_iter().find(|machine| machine.public_id == public_id))
 }
 
 /// The machine's internal id, if `owner_id` owns it.
@@ -536,12 +657,22 @@ pub fn delete_machine(conn: &Connection, public_id: &str, owner_id: i64) -> rusq
 pub fn list_shares(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlite::Result<Option<Vec<ShareRow>>> {
     let Some(machine_id) = owned_machine_id(conn, public_id, owner_id)? else { return Ok(None) };
     let mut statement = conn.prepare(
-        "SELECT u.id, u.email, s.role FROM machine_shares s JOIN users u ON u.id = s.user_id
+        "SELECT u.id, u.email, s.role, s.starts_at, s.expires_at, s.single_view
+           FROM machine_shares s JOIN users u ON u.id = s.user_id
           WHERE s.machine_id = ?1 ORDER BY u.email",
     )?;
     let shares = statement
         .query_map([machine_id], |row| {
-            Ok(ShareRow { user_id: row.get(0)?, email: row.get(1)?, role: Role::from_sql(&row.get::<_, String>(2)?) })
+            Ok(ShareRow {
+                user_id: row.get(0)?,
+                email: row.get(1)?,
+                terms: ShareTerms {
+                    role: Role::from_sql(&row.get::<_, String>(2)?),
+                    starts_at: row.get(3)?,
+                    expires_at: row.get(4)?,
+                    single_view: row.get(5)?,
+                },
+            })
         })?
         .collect::<rusqlite::Result<_>>()?;
     Ok(Some(shares))
@@ -560,14 +691,14 @@ impl From<rusqlite::Error> for ShareError {
     }
 }
 
-/// Grants (or changes) the role of the account with `email` on an owned
-/// machine. Returns that account's user id.
+/// Shares an owned machine with the account with `email`, or replaces the
+/// terms of an existing share. Returns that account's user id.
 pub fn upsert_share(
     conn: &Connection,
     public_id: &str,
     owner_id: i64,
     email: &str,
-    role: Role,
+    terms: ShareTerms,
     now: i64,
 ) -> Result<i64, ShareError> {
     let machine_id = owned_machine_id(conn, public_id, owner_id)?.ok_or(ShareError::NotOwner)?;
@@ -576,11 +707,73 @@ pub fn upsert_share(
         return Err(ShareError::SelfShare);
     }
     conn.execute(
-        "INSERT INTO machine_shares (machine_id, user_id, role, created_at) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (machine_id, user_id) DO UPDATE SET role = excluded.role",
-        params![machine_id, user_id, role.share_str(), now],
+        "INSERT INTO machine_shares (machine_id, user_id, role, created_at, starts_at, expires_at, single_view)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (machine_id, user_id) DO UPDATE SET
+             role = excluded.role, starts_at = excluded.starts_at,
+             expires_at = excluded.expires_at, single_view = excluded.single_view",
+        params![
+            machine_id,
+            user_id,
+            terms.role.share_str(),
+            now,
+            terms.starts_at,
+            terms.expires_at,
+            terms.single_view
+        ],
     )?;
     Ok(user_id)
+}
+
+/// Deletes the user's share of the machine if it's a single-view one.
+/// Returns whether it did.
+pub fn delete_single_view_share(conn: &Connection, public_id: &str, user_id: i64) -> rusqlite::Result<bool> {
+    let deleted = conn.execute(
+        "DELETE FROM machine_shares
+          WHERE user_id = ?2 AND single_view = 1
+            AND machine_id = (SELECT id FROM machines WHERE public_id = ?1)",
+        params![public_id, user_id],
+    )?;
+    Ok(deleted > 0)
+}
+
+/// Deletes every share that has expired by `now` and returns them.
+pub fn take_expired_shares(conn: &Connection, now: i64) -> rusqlite::Result<Vec<ShareKey>> {
+    let tx = conn.unchecked_transaction()?;
+    let expired = tx
+        .prepare(
+            "SELECT m.public_id, s.user_id FROM machine_shares s JOIN machines m ON m.id = s.machine_id
+              WHERE s.expires_at <= ?1",
+        )?
+        .query_map([now], |row| Ok(ShareKey { public_id: row.get(0)?, user_id: row.get(1)? }))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    tx.execute("DELETE FROM machine_shares WHERE expires_at <= ?1", [now])?;
+    tx.commit()?;
+    Ok(expired)
+}
+
+/// Shares whose start time is in `(after, now]` and that haven't expired:
+/// the ones that began granting access since `after`.
+pub fn shares_started_between(conn: &Connection, after: i64, now: i64) -> rusqlite::Result<Vec<ShareKey>> {
+    conn.prepare(
+        "SELECT m.public_id, s.user_id FROM machine_shares s JOIN machines m ON m.id = s.machine_id
+          WHERE s.starts_at > ?1 AND s.starts_at <= ?2 AND (s.expires_at IS NULL OR s.expires_at > ?2)",
+    )?
+    .query_map(params![after, now], |row| Ok(ShareKey { public_id: row.get(0)?, user_id: row.get(1)? }))?
+    .collect()
+}
+
+/// The next time after `now` a share starts or expires, if any will.
+pub fn next_share_deadline(conn: &Connection, now: i64) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT MIN(t) FROM (
+             SELECT MIN(expires_at) AS t FROM machine_shares WHERE expires_at IS NOT NULL
+             UNION ALL
+             SELECT MIN(starts_at) FROM machine_shares WHERE starts_at > ?1
+         )",
+        [now],
+        |row| row.get(0),
+    )
 }
 
 /// Returns false if `owner_id` doesn't own the machine or it wasn't shared

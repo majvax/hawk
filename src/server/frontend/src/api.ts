@@ -71,6 +71,46 @@ export const getInvite = (token: string) => request<InviteInfo>("GET", `/api/inv
 export const signup = (token: string, email: string, password: string) =>
   request<User>("POST", "/api/signup", { token, email, password });
 
+export interface Session {
+  id: number;
+  userAgent: string | null; // null for sessions from before this was recorded
+  ip: string | null;
+  createdAt: number;
+  expiresAt: number;
+  current: boolean; // the session this dashboard is using
+}
+
+export const changePassword = (currentPassword: string, newPassword: string) =>
+  request<void>("POST", "/api/account/password", { currentPassword, newPassword });
+export const listSessions = () => request<Session[]>("GET", "/api/sessions");
+export const revokeSession = (id: number) => request<void>("DELETE", `/api/sessions/${id}`);
+export const revokeOtherSessions = () => request<void>("POST", "/api/sessions/revoke-others");
+
+// "Firefox on Windows" from a User-Agent string; good enough to tell
+// sessions apart, not a full parser.
+export function describeUserAgent(userAgent: string | null): string {
+  if (userAgent === null) return "Unknown browser";
+  const browsers: [RegExp, string][] = [
+    [/Edg\//, "Edge"],
+    [/OPR\/|Opera/, "Opera"],
+    [/Firefox\//, "Firefox"],
+    [/Chrome\/|CriOS\//, "Chrome"],
+    [/Safari\//, "Safari"],
+  ];
+  const systems: [RegExp, string][] = [
+    [/Windows/, "Windows"],
+    [/Android/, "Android"],
+    [/iPhone|iPad|iPod/, "iOS"],
+    [/Mac OS X|Macintosh/, "macOS"],
+    [/CrOS/, "ChromeOS"],
+    [/Linux/, "Linux"],
+  ];
+  const browser = browsers.find(([pattern]) => pattern.test(userAgent))?.[1];
+  const system = systems.find(([pattern]) => pattern.test(userAgent))?.[1];
+  if (browser === undefined && system === undefined) return userAgent.slice(0, 60);
+  return [browser ?? "Unknown browser", system].filter(Boolean).join(" on ");
+}
+
 export const listUsers = () => request<AdminUserRow[]>("GET", "/api/admin/users");
 export const setUserDisabled = (id: number, disabled: boolean) =>
   request<void>("POST", `/api/admin/users/${id}/disabled`, { disabled });
@@ -84,10 +124,18 @@ export interface EnrollmentCode {
   relayPin: string | null; // the relay's TLS key pin; null when serving without TLS
 }
 
-export interface Share {
+// When and how long a share grants access. All optional: an open-ended
+// share starts now and lasts until revoked.
+export interface ShareTerms {
+  role: "view" | "control";
+  startsAt: number | null; // unix seconds; null: right away
+  expiresAt: number | null; // unix seconds; null: until revoked
+  singleView: boolean; // used up once the viewer stops watching
+}
+
+export interface Share extends ShareTerms {
   userId: number;
   email: string;
-  role: "view" | "control";
 }
 
 const machinePath = (id: string) => `/api/machines/${encodeURIComponent(id)}`;
@@ -96,8 +144,8 @@ export const createEnrollmentCode = () => request<EnrollmentCode>("POST", "/api/
 export const renameMachine = (id: string, name: string) => request<void>("PATCH", machinePath(id), { name });
 export const removeMachine = (id: string) => request<void>("DELETE", machinePath(id));
 export const listShares = (id: string) => request<Share[]>("GET", `${machinePath(id)}/shares`);
-export const shareMachine = (id: string, email: string, role: Share["role"]) =>
-  request<void>("PUT", `${machinePath(id)}/shares`, { email, role });
+export const shareMachine = (id: string, email: string, terms: ShareTerms) =>
+  request<void>("PUT", `${machinePath(id)}/shares`, { email, ...terms });
 export const unshareMachine = (id: string, userId: number) =>
   request<void>("DELETE", `${machinePath(id)}/shares/${userId}`);
 
@@ -107,4 +155,22 @@ export function inviteUrl(token: string): string {
 
 export function formatTime(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleString();
+}
+
+// Short form for share windows: just the time today, the date otherwise.
+export function formatShortTime(unixSeconds: number): string {
+  const date = new Date(unixSeconds * 1000);
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (date.toDateString() === new Date().toDateString()) return time;
+  return `${date.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })} ${time}`;
+}
+
+// "until 14:30 · one viewing": a share's time limits, empty if it has none.
+export function describeShareTerms(terms: Pick<ShareTerms, "startsAt" | "expiresAt" | "singleView">): string {
+  const parts: string[] = [];
+  const now = Date.now() / 1000;
+  if (terms.startsAt !== null && terms.startsAt > now) parts.push(`from ${formatShortTime(terms.startsAt)}`);
+  if (terms.expiresAt !== null) parts.push(`until ${formatShortTime(terms.expiresAt)}`);
+  if (terms.singleView) parts.push("one viewing");
+  return parts.join(" · ");
 }

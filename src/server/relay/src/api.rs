@@ -1,11 +1,11 @@
-//! Account endpoints: session, login/logout, invite-based signup, and the
-//! admin's user and invite management.
+//! Account endpoints: session, login/logout, invite-based signup, your own
+//! password and sessions, and the admin's user and invite management.
 
 use std::net::SocketAddr;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum_extra::extract::cookie::CookieJar;
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,7 @@ pub struct Credentials {
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<Credentials>,
 ) -> Result<(CookieJar, Json<UserView>), ApiError> {
@@ -78,7 +79,7 @@ pub async fn login(
     }
     state.limiter.record_success(ip);
 
-    let jar = start_session(&state, jar, found.user.id).await?;
+    let jar = start_session(&state, jar, found.user.id, session_origin(peer, &headers)).await?;
     Ok((jar, Json(found.user.into())))
 }
 
@@ -120,6 +121,8 @@ pub struct SignupRequest {
 
 pub async fn signup(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<SignupRequest>,
 ) -> Result<(CookieJar, Json<UserView>), ApiError> {
@@ -143,17 +146,146 @@ pub async fn signup(
             SignupError::Db(error) => error.into(),
         })?;
 
-    let jar = start_session(&state, jar, user.id).await?;
+    let jar = start_session(&state, jar, user.id, session_origin(peer, &headers)).await?;
     Ok((jar, Json(user.into())))
 }
 
-async fn start_session(state: &AppState, jar: CookieJar, user_id: i64) -> Result<CookieJar, ApiError> {
+/// Longer User-Agents are cut; they're only shown to tell sessions apart.
+const MAX_USER_AGENT_LEN: usize = 512;
+
+/// The browser and IP a sign-in came from. The IP is the TCP peer: behind a
+/// reverse proxy, that's the proxy.
+fn session_origin(peer: SocketAddr, headers: &HeaderMap) -> db::SessionOrigin {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|agent| agent.chars().take(MAX_USER_AGENT_LEN).collect::<String>())
+        .filter(|agent| !agent.is_empty());
+    db::SessionOrigin { user_agent, ip: peer.ip().to_canonical().to_string() }
+}
+
+async fn start_session(
+    state: &AppState,
+    jar: CookieJar,
+    user_id: i64,
+    origin: db::SessionOrigin,
+) -> Result<CookieJar, ApiError> {
     let token = auth::random_token();
     let hash = auth::token_hash(&token);
     let now = auth::now();
     let expires_at = now + auth::SESSION_TTL.whole_seconds();
-    state.db.call(move |conn| db::create_session(conn, &hash, user_id, now, expires_at)).await?;
+    state.db.call(move |conn| db::create_session(conn, &hash, user_id, &origin, now, expires_at)).await?;
     Ok(jar.add(auth::session_cookie(token, state.secure_cookies)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangePassword {
+    current_password: String,
+    new_password: String,
+}
+
+/// Checks the current password, stores the new one's hash, and ends every
+/// other session the user has. The session making the change stays.
+pub async fn change_password(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    current: CurrentUser,
+    Json(body): Json<ChangePassword>,
+) -> Result<StatusCode, ApiError> {
+    // Wrong current passwords count as failed logins, so a stolen session
+    // can't be used to guess the password.
+    let ip = peer.ip();
+    if state.limiter.is_blocked(ip) {
+        return Err(ApiError::TooManyRequests);
+    }
+    auth::check_password_policy(&body.new_password)?;
+
+    let user_id = current.user.id;
+    let old_hash = state.db.call(move |conn| db::password_hash(conn, user_id)).await?;
+    let (current_password, new_password) = (body.current_password, body.new_password);
+    let stored = old_hash.clone();
+    let new_hash = tokio::task::spawn_blocking(move || {
+        if !auth::verify_password(&current_password, &stored) {
+            return Ok(None);
+        }
+        auth::hash_password(&new_password).map(Some)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    let Some(new_hash) = new_hash else {
+        state.limiter.record_failure(ip);
+        return Err(ApiError::bad_request("current password is incorrect"));
+    };
+    state.limiter.record_success(ip);
+
+    let keep = current.session_id;
+    let changed = state.db.call(move |conn| db::change_password(conn, user_id, &old_hash, &new_hash, keep)).await?;
+    if !changed {
+        return Err(ApiError::Conflict("your password was changed elsewhere; reload and try again".into()));
+    }
+    state.registry.close_other_sessions(user_id, keep);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionView {
+    id: i64,
+    user_agent: Option<String>,
+    ip: Option<String>,
+    created_at: i64,
+    expires_at: i64,
+    /// The session this request was made with.
+    current: bool,
+}
+
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    current: CurrentUser,
+) -> Result<Json<Vec<SessionView>>, ApiError> {
+    let user_id = current.user.id;
+    let now = auth::now();
+    let sessions = state.db.call(move |conn| db::list_sessions(conn, user_id, now)).await?;
+    Ok(Json(
+        sessions
+            .into_iter()
+            .map(|row| SessionView {
+                id: row.id,
+                user_agent: row.user_agent,
+                ip: row.ip,
+                created_at: row.created_at,
+                expires_at: row.expires_at,
+                current: row.id == current.session_id,
+            })
+            .collect(),
+    ))
+}
+
+/// Ends one of the user's other sessions. The current one ends with logout.
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Path(session_id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    if session_id == current.session_id {
+        return Err(ApiError::bad_request("use log out to end the current session"));
+    }
+    let user_id = current.user.id;
+    let deleted = state.db.call(move |conn| db::delete_user_session(conn, user_id, session_id)).await?;
+    if !deleted {
+        return Err(ApiError::NotFound);
+    }
+    state.registry.close_session(session_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Signs out everywhere else: ends every session but the current one.
+pub async fn revoke_other_sessions(State(state): State<AppState>, current: CurrentUser) -> Result<StatusCode, ApiError> {
+    let (user_id, keep) = (current.user.id, current.session_id);
+    state.db.call(move |conn| db::delete_other_sessions(conn, user_id, keep)).await?;
+    state.registry.close_other_sessions(user_id, keep);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]

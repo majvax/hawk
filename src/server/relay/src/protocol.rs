@@ -82,6 +82,11 @@ pub struct MachineView {
     /// Where the machine keeps its key, as it reports it: "tpm" or
     /// "software". None means it must be re-enrolled before it can connect.
     pub key_storage: Option<String>,
+    /// Unix seconds when this user's temporary share ends; None for the
+    /// owner and open-ended shares.
+    pub access_expires_at: Option<i64>,
+    /// This user's share is used up by one viewing.
+    pub single_view: bool,
     /// Who is watching right now. Only sent to the owner.
     pub viewers: Option<Vec<String>>,
 }

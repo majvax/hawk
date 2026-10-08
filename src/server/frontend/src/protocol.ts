@@ -14,6 +14,8 @@ export interface Machine {
   connectedAt: string | null; // RFC 3339, while online
   lastSeenAt: number | null; // unix seconds
   keyStorage: "tpm" | "software" | null; // null: must be re-enrolled
+  accessExpiresAt: number | null; // unix seconds; when a temporary share ends
+  singleView: boolean; // the share is used up by one viewing
   viewers: string[] | null; // who's watching; owner only
 }
 

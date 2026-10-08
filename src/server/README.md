@@ -53,6 +53,12 @@ Accounts are invite-only; there is no open sign-up.
   user's sessions, closes their open dashboards and disconnects the
   machines they own, immediately. Being admin does not grant access to
   other people's machines.
+- **Settings:** every user's Settings tab changes their password (the
+  current one is checked first; wrong guesses count toward the login
+  throttle) and lists their sessions with the browser and IP each signed in
+  from. A session can be revoked on its own, or all but the current one at
+  once. Changing the password also ends every other session. Revoking
+  closes that session's open dashboards immediately.
 - Passwords: argon2id, at least 10 characters. Session and invite tokens are
   32 random bytes; the database stores only their SHA-256.
 - Sessions: `hawk_session` cookie, `HttpOnly`, `SameSite=Strict`, `Secure`
@@ -104,6 +110,32 @@ dashboard only ever learns about machines its user can access, and every
 or removing a machine all apply to open dashboards immediately; a revoked
 viewer's stream stops at once.
 
+A share can also be temporary. These combine freely:
+
+- **Expiry:** for 30 minutes up to a week, or until a chosen date and
+  time. When it runs out the relay deletes the share and cuts off a live
+  viewer, the same as a manual revoke. **+1 h** extends it.
+- **Scheduled start:** the share grants nothing until its start time
+  (e.g. tomorrow 9:00 for 2 hours), then appears on the viewer's dashboard
+  live.
+- **One viewing:** the share is used up when the viewer stops watching, or
+  leaves for more than 60 seconds (long enough for the dashboard to
+  reconnect and resume after a network blip). A machine going offline mid-view
+  doesn't use it up.
+
+Sharing again with the same person replaces the share's terms. A timer in
+the relay wakes at the next start or expiry, so changes land within about a
+second. Starts and ends can be at most a year away.
+
+### Dashboard connection
+
+If the dashboard loses its link to the relay (relay restart, network loss)
+it retries on its own: after 1s, then 2s, 4s, ... up to 30s, with jitter.
+Coming back online retries straight away. Before each attempt it checks the
+session is still valid, and returns to the login page if it isn't. An open
+live view stays open and resumes once the link is back. If the machine is
+offline at that point, it resumes when the machine reconnects.
+
 ## TLS
 
 The relay serves `https`/`wss` whenever it finds a cert and key — by
@@ -146,4 +178,3 @@ Planned work on the server. Nothing below is implemented yet.
   `view` share.
 - **On-machine indicator.** Show something on the shared PC itself while
   anyone is watching it.
-- **Settings tab.** Change password, list your sessions.

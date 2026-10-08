@@ -271,3 +271,27 @@ pre {
 .dot-closed {
   background: crimson;
 }
+
+.dot-reconnecting {
+  background: orange;
+}
+
+.share-options {
+  margin-top: 8px;
+  gap: 16px;
+}
+
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+label.check input {
+  width: auto;
+}
+
+input.when {
+  width: auto;
+  color-scheme: dark;
+}

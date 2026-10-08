@@ -21,6 +21,7 @@ use base64::Engine;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
+use tokio::sync::{Notify, mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -40,6 +41,8 @@ pub struct AppState {
     /// SHA-256 of the TLS certificate's public key (SPKI), base64: what
     /// machines pin. None when serving without TLS.
     pub relay_pin: Option<String>,
+    /// Wakes the share clock when a share's start or expiry changes.
+    pub shares_changed: Arc<Notify>,
 }
 
 struct Config {
@@ -167,14 +170,18 @@ async fn main() -> Result<(), String> {
     let base_url = config.public_url.clone().unwrap_or_else(|| format!("{scheme}://{}", config.addr));
     bootstrap_admin(&db, &base_url).await?;
 
+    let (view_ended, view_ended_rx) = mpsc::unbounded_channel();
     let state = AppState {
-        registry: Arc::new(Registry::default()),
+        registry: Arc::new(Registry::new(view_ended)),
         db,
         limiter: Arc::new(LoginLimiter::default()),
         secure_cookies: tls.is_some(),
         relay_pin,
+        shares_changed: Arc::new(Notify::new()),
     };
     spawn_cleanup(state.clone());
+    machines::spawn_share_clock(state.clone());
+    machines::spawn_single_view_watch(state.clone(), view_ended_rx);
 
     let frontend = ServeDir::new(&config.frontend_dist)
         .fallback(ServeFile::new(config.frontend_dist.join("index.html")));
@@ -184,6 +191,10 @@ async fn main() -> Result<(), String> {
         .route("/api/logout", post(api::logout))
         .route("/api/signup", post(api::signup))
         .route("/api/invites/{token}", get(api::invite_info))
+        .route("/api/account/password", post(api::change_password))
+        .route("/api/sessions", get(api::list_sessions))
+        .route("/api/sessions/revoke-others", post(api::revoke_other_sessions))
+        .route("/api/sessions/{id}", delete(api::revoke_session))
         .route("/api/admin/users", get(api::list_users))
         .route("/api/admin/users/{id}/disabled", post(api::set_user_disabled))
         .route("/api/admin/invites", get(api::list_invites).post(api::create_invite))

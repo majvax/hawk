@@ -206,7 +206,7 @@ async fn handle_device(socket: WebSocket, state: AppState) {
         // The new machine shows up on its owner's open dashboards.
         let owner_id = machine.owner_id;
         let lookup = machine_id.clone();
-        match state.db.call(move |conn| db::machine_for_user(conn, &lookup, owner_id)).await {
+        match state.db.call(move |conn| db::machine_for_user(conn, &lookup, owner_id, auth::now())).await {
             Ok(Some(row)) => state.registry.grant(owner_id, &row),
             Ok(None) => {}
             Err(error) => error!(%error, "relay: loading a newly enrolled machine failed"),
@@ -270,7 +270,7 @@ pub async fn dashboard_socket(
         return ApiError::Forbidden.into_response();
     }
     let user_id = current.user.id;
-    let machines = match state.db.call(move |conn| db::accessible_machines(conn, user_id)).await {
+    let machines = match state.db.call(move |conn| db::accessible_machines(conn, user_id, auth::now())).await {
         Ok(machines) => machines,
         Err(error) => return ApiError::from(error).into_response(),
     };
@@ -339,7 +339,7 @@ async fn handle_dashboard(
         match serde_json::from_str::<DashboardCommand>(&text) {
             Ok(DashboardCommand::StartView { device_id }) => {
                 if !registry.start_view(dashboard_id, &device_id) {
-                    let _ = events.send(Outbound::Event(DashboardEvent::CaptureEnded { device_id }));
+                    let _ = events.send(Outbound::Event(Box::new(DashboardEvent::CaptureEnded { device_id })));
                 }
             }
             Ok(DashboardCommand::StopView { device_id }) => registry.stop_view(dashboard_id, &device_id),

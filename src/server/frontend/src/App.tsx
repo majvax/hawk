@@ -4,8 +4,9 @@ import { type User, getSession, logout } from "./api.js";
 import { AdminPage } from "./pages/Admin.js";
 import { LoginPage, SignupPage } from "./pages/Auth.js";
 import { MachinesPage } from "./pages/Machines.js";
+import { SettingsPage } from "./pages/Settings.js";
 
-type Tab = "machines" | "admin";
+type Tab = "machines" | "settings" | "admin";
 
 function inviteTokenFromPath(): string | null {
   const match = /^\/invite\/([A-Za-z0-9_-]+)$/.exec(window.location.pathname);
@@ -58,6 +59,9 @@ export function App(): JSX.Element {
           <button type="button" className={tab === "machines" ? "active" : ""} onClick={() => setTab("machines")}>
             Machines
           </button>
+          <button type="button" className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>
+            Settings
+          </button>
           {user.isAdmin && (
             <button type="button" className={tab === "admin" ? "active" : ""} onClick={() => setTab("admin")}>
               Admin
@@ -71,8 +75,9 @@ export function App(): JSX.Element {
       </header>
       {/* Machines stays mounted so switching tabs doesn't drop a live view. */}
       <div style={{ display: tab === "machines" ? "block" : "none" }}>
-        <MachinesPage onSocketClosed={recheckSession} />
+        <MachinesPage onSessionEnded={() => setUser(null)} />
       </div>
+      {tab === "settings" && <SettingsPage />}
       {tab === "admin" && user.isAdmin && <AdminPage me={user} />}
     </main>
   );

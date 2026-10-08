@@ -4,6 +4,7 @@ import {
   type EnrollmentCode,
   type Share,
   createEnrollmentCode,
+  describeShareTerms,
   formatTime,
   listShares,
   removeMachine,
@@ -25,8 +26,9 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "request failed";
 }
 
-export function MachinesPage({ onSocketClosed }: { onSocketClosed: () => void }): JSX.Element {
-  const { machines, status, viewingId, canvasRef, startView, stopView } = useDashboard(onSocketClosed);
+export function MachinesPage({ onSessionEnded }: { onSessionEnded: () => void }): JSX.Element {
+  const { machines, status, retryAt, viewingId, canvasRef, startView, stopView, reconnectNow } =
+    useDashboard(onSessionEnded);
   const [managingId, setManagingId] = useState<string | null>(null);
   const [enrollment, setEnrollment] = useState<EnrollmentCode | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -48,6 +50,15 @@ export function MachinesPage({ onSocketClosed }: { onSocketClosed: () => void })
       <div className="row">
         <p className="muted grow">
           <StatusDot status={status} /> relay link {status}
+          {status === "reconnecting" && retryAt !== null && (
+            <>
+              {" "}
+              — retrying in <Countdown until={retryAt} />{" "}
+              <button type="button" onClick={reconnectNow}>
+                Retry now
+              </button>
+            </>
+          )}
         </p>
         <button type="button" onClick={() => void addMachine()}>
           Add machine
@@ -102,7 +113,14 @@ export function MachinesPage({ onSocketClosed }: { onSocketClosed: () => void })
                       ? "never connected"
                       : `last seen ${formatTime(machine.lastSeenAt)}`}
                 </td>
-                <td>{machine.role === "owner" ? "owner" : `${ROLE_LABEL[machine.role]} · ${machine.ownerEmail}`}</td>
+                <td>
+                  {machine.role === "owner" ? "owner" : `${ROLE_LABEL[machine.role]} · ${machine.ownerEmail}`}
+                  {machine.role !== "owner" && (machine.accessExpiresAt !== null || machine.singleView) && (
+                    <span className="badge">
+                      {describeShareTerms({ startsAt: null, expiresAt: machine.accessExpiresAt, singleView: machine.singleView })}
+                    </span>
+                  )}
+                </td>
                 <td className="muted">{machine.viewers === null ? "" : machine.viewers.join(", ") || "nobody"}</td>
                 <td className="actions">
                   {viewingId === machine.id ? (
@@ -137,6 +155,15 @@ export function MachinesPage({ onSocketClosed }: { onSocketClosed: () => void })
           <h2>{viewing?.name ?? "Live view"}</h2>
           {viewing !== null && viewing.role === "view" && <span className="badge">view only</span>}
         </div>
+        {viewing !== null && status !== "open" && (
+          <p className="muted">Connection to the relay lost. The view resumes once it's back.</p>
+        )}
+        {viewing !== null && status === "open" && !viewing.online && (
+          <p className="muted">{viewing.name} is offline. The view resumes when it reconnects.</p>
+        )}
+        {viewing !== null && viewing.singleView && (
+          <p className="muted">One viewing only: once you stop watching, this machine is no longer shared with you.</p>
+        )}
         <canvas ref={canvasRef} className="screen" />
       </section>
     </div>
@@ -148,6 +175,11 @@ function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => vo
   const [shares, setShares] = useState<Share[]>([]);
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Share["role"]>("view");
+  const [duration, setDuration] = useState<Duration>("forever");
+  const [until, setUntil] = useState("");
+  const [startLater, setStartLater] = useState(false);
+  const [startAt, setStartAt] = useState("");
+  const [singleView, setSingleView] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async (): Promise<void> => {
@@ -160,6 +192,9 @@ function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => vo
 
   useEffect(() => {
     void refresh();
+    // Temporary shares start, expire and get used up on their own.
+    const timer = window.setInterval(() => void refresh(), 30_000);
+    return () => window.clearInterval(timer);
   }, [refresh]);
 
   const run = async (action: () => Promise<unknown>): Promise<boolean> => {
@@ -176,7 +211,22 @@ function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => vo
 
   const submitShare = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
-    if (await run(() => shareMachine(machine.id, email, role))) setEmail("");
+    const startsAt = startLater ? fromLocalInput(startAt) : null;
+    const begins = startsAt ?? Math.floor(Date.now() / 1000);
+    const expiresAt =
+      duration === "forever" ? null : duration === "until" ? fromLocalInput(until) : begins + DURATION_SECONDS[duration];
+    // An unreadable date must not quietly become "now" or "until revoked".
+    if ((startLater && startsAt === null) || (duration !== "forever" && expiresAt === null)) {
+      setError("enter a valid date and time");
+      return;
+    }
+    if (await run(() => shareMachine(machine.id, email, { role, startsAt, expiresAt, singleView }))) setEmail("");
+  };
+
+  // Pushes a temporary share's end back by an hour (from now if it's close).
+  const extend = (share: Share): Promise<boolean> => {
+    const from = Math.max(share.expiresAt ?? 0, Math.floor(Date.now() / 1000));
+    return run(() => shareMachine(machine.id, share.email, { ...share, expiresAt: from + 3600 }));
   };
 
   const submitRename = (event: FormEvent): void => {
@@ -220,12 +270,20 @@ function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => vo
             <tbody>
               {shares.map((share) => (
                 <tr key={share.userId}>
-                  <td>{share.email}</td>
+                  <td>
+                    {share.email}
+                    {share.startsAt !== null && share.startsAt > Date.now() / 1000 && (
+                      <span className="badge">not started</span>
+                    )}
+                  </td>
+                  <td className="muted">{describeShareTerms(share) || "until revoked"}</td>
                   <td>
                     <select
                       value={share.role}
                       onChange={(e) =>
-                        void run(() => shareMachine(machine.id, share.email, e.target.value as Share["role"]))
+                        void run(() =>
+                          shareMachine(machine.id, share.email, { ...share, role: e.target.value as Share["role"] }),
+                        )
                       }
                     >
                       <option value="view">view only</option>
@@ -233,6 +291,11 @@ function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => vo
                     </select>
                   </td>
                   <td className="actions">
+                    {share.expiresAt !== null && (
+                      <button type="button" onClick={() => void extend(share)}>
+                        +1 h
+                      </button>
+                    )}
                     <button type="button" onClick={() => void run(() => unshareMachine(machine.id, share.userId))}>
                       Revoke
                     </button>
@@ -254,10 +317,49 @@ function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => vo
             <option value="view">view only</option>
             <option value="control">can control</option>
           </select>
+          <select value={duration} onChange={(e) => setDuration(e.target.value as Duration)} aria-label="For how long">
+            {DURATIONS.map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+          {duration === "until" && (
+            <input
+              type="datetime-local"
+              className="when"
+              aria-label="Share until"
+              value={until}
+              onChange={(e) => setUntil(e.target.value)}
+              required
+            />
+          )}
           <button type="submit">Share</button>
         </form>
+        <div className="row share-options">
+          <label className="check">
+            <input type="checkbox" checked={startLater} onChange={(e) => setStartLater(e.target.checked)} />
+            Start later
+          </label>
+          {startLater && (
+            <input
+              type="datetime-local"
+              className="when"
+              aria-label="Share starts at"
+              value={startAt}
+              onChange={(e) => setStartAt(e.target.value)}
+              required
+            />
+          )}
+          <label className="check">
+            <input type="checkbox" checked={singleView} onChange={(e) => setSingleView(e.target.checked)} />
+            One viewing only
+          </label>
+        </div>
         <p className="muted">
-          They need an account on this server first. "View only" can watch the screen but never send input.
+          They need an account on this server first. "View only" can watch the screen but never send input. A
+          temporary share is revoked automatically when it runs out, cutting off a live view; "one viewing only"
+          ends the share once they stop watching. Sharing again with the same person replaces the terms.
         </p>
       </div>
 
@@ -268,6 +370,34 @@ function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => vo
       </div>
     </section>
   );
+}
+
+type Duration = "forever" | "30m" | "1h" | "2h" | "8h" | "1d" | "1w" | "until";
+
+const DURATIONS: [Duration, string][] = [
+  ["forever", "until revoked"],
+  ["30m", "for 30 minutes"],
+  ["1h", "for 1 hour"],
+  ["2h", "for 2 hours"],
+  ["8h", "for 8 hours"],
+  ["1d", "for 1 day"],
+  ["1w", "for 1 week"],
+  ["until", "until…"],
+];
+
+const DURATION_SECONDS: Record<Exclude<Duration, "forever" | "until">, number> = {
+  "30m": 30 * 60,
+  "1h": 60 * 60,
+  "2h": 2 * 60 * 60,
+  "8h": 8 * 60 * 60,
+  "1d": 24 * 60 * 60,
+  "1w": 7 * 24 * 60 * 60,
+};
+
+// A <input type="datetime-local"> value (local time) as unix seconds.
+function fromLocalInput(value: string): number | null {
+  const millis = new Date(value).getTime();
+  return Number.isNaN(millis) ? null : Math.floor(millis / 1000);
 }
 
 // Where the machine keeps the key it authenticates with, as it reports it.
@@ -288,6 +418,16 @@ function KeyBadge({ storage }: { storage: Machine["keyStorage"] }): JSX.Element 
       software key
     </span>
   );
+}
+
+// Seconds left until `until` (ms since epoch), ticking.
+function Countdown({ until }: { until: number }): JSX.Element {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, []);
+  return <>{Math.max(0, Math.ceil((until - now) / 1000))}s</>;
 }
 
 function StatusDot({ status }: { status: ConnectionStatus }): JSX.Element {

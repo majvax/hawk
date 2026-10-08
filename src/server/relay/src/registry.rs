@@ -19,7 +19,7 @@ pub type DashboardId = u64;
 
 /// What the relay pushes to a dashboard's socket task besides frames.
 pub enum Outbound {
-    Event(DashboardEvent),
+    Event(Box<DashboardEvent>),
     /// The session behind this dashboard ended (logout, account disabled):
     /// close the socket.
     Close,
@@ -31,6 +31,15 @@ pub enum DeviceOutbound {
     /// Disconnect the device (machine removed, owner disabled, replaced by a
     /// newer connection with the same credential).
     Close(u16, &'static str),
+}
+
+/// A viewer of a single-view share stopped watching. `immediate` when they
+/// pressed stop; otherwise their dashboard went away, and the share is only
+/// used up if they don't come back to it (see machines::spawn_single_view_watch).
+pub struct ViewEnded {
+    pub user_id: i64,
+    pub machine_id: String,
+    pub immediate: bool,
 }
 
 /// How a dashboard's socket task is reached, and who is behind it. Events
@@ -46,7 +55,7 @@ pub struct DashboardHandle {
 
 impl DashboardHandle {
     fn send(&self, event: DashboardEvent) {
-        let _ = self.events.send(Outbound::Event(event));
+        let _ = self.events.send(Outbound::Event(Box::new(event)));
     }
 }
 
@@ -83,6 +92,9 @@ impl Device {
 struct Inner {
     devices: HashMap<String, Device>,
     dashboards: HashMap<DashboardId, Dashboard>,
+    /// Where single-view endings are reported; unset in a registry that
+    /// nothing listens to.
+    view_ended: Option<mpsc::UnboundedSender<ViewEnded>>,
 }
 
 impl Inner {
@@ -98,6 +110,8 @@ impl Inner {
             connected_at: device.map(|device| device.connected_at.format(&Rfc3339).unwrap_or_default()),
             last_seen_at: row.last_seen_at,
             key_storage: row.key_storage.clone(),
+            access_expires_at: row.share_expires_at,
+            single_view: row.single_view,
             viewers: (row.role == Role::Owner).then(|| {
                 let mut emails: Vec<String> = device
                     .map(|device| device.viewers.values().map(|viewer| viewer.email.clone()).collect())
@@ -149,10 +163,18 @@ impl Inner {
 
     fn remove_dashboard(&mut self, id: DashboardId) -> Option<Dashboard> {
         let dashboard = self.dashboards.remove(&id)?;
-        for machine_id in dashboard.access.keys() {
-            self.detach(id, machine_id);
+        for (machine_id, row) in &dashboard.access {
+            if self.detach(id, machine_id) && row.single_view {
+                self.report_view_ended(dashboard.handle.user_id, machine_id, false);
+            }
         }
         Some(dashboard)
+    }
+
+    fn report_view_ended(&self, user_id: i64, machine_id: &str, immediate: bool) {
+        if let Some(view_ended) = &self.view_ended {
+            let _ = view_ended.send(ViewEnded { user_id, machine_id: machine_id.to_owned(), immediate });
+        }
     }
 
     fn close_dashboards_where(&mut self, predicate: impl Fn(&DashboardHandle) -> bool) {
@@ -184,6 +206,11 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// A registry that reports single-view endings to `view_ended`.
+    pub fn new(view_ended: mpsc::UnboundedSender<ViewEnded>) -> Self {
+        Self { inner: Mutex::new(Inner { view_ended: Some(view_ended), ..Inner::default() }), next_id: AtomicU64::new(0) }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A panic while holding the lock leaves plain maps behind, which are
         // still consistent enough to keep serving.
@@ -276,6 +303,12 @@ impl Registry {
         self.lock().close_dashboards_where(|handle| handle.session_id == session_id);
     }
 
+    /// Closes the user's dashboards opened with any session but `keep`
+    /// (signed out everywhere else, or the password changed).
+    pub fn close_other_sessions(&self, user_id: i64, keep: i64) {
+        self.lock().close_dashboards_where(|handle| handle.user_id == user_id && handle.session_id != keep);
+    }
+
     /// Account disabled: closes the user's dashboards and disconnects the
     /// machines they own.
     pub fn close_user(&self, user_id: i64) {
@@ -320,7 +353,21 @@ impl Registry {
     }
 
     pub fn stop_view(&self, dashboard_id: DashboardId, machine_id: &str) {
-        self.lock().detach(dashboard_id, machine_id);
+        let mut inner = self.lock();
+        let Some(dashboard) = inner.dashboards.get(&dashboard_id) else { return };
+        let user_id = dashboard.handle.user_id;
+        let single_view = dashboard.access.get(machine_id).is_some_and(|row| row.single_view);
+        if inner.detach(dashboard_id, machine_id) && single_view {
+            inner.report_view_ended(user_id, machine_id, true);
+        }
+    }
+
+    /// Whether any open dashboard of `user_id` is watching the machine.
+    pub fn is_watching(&self, user_id: i64, machine_id: &str) -> bool {
+        let inner = self.lock();
+        inner.devices.get(machine_id).is_some_and(|device| {
+            device.viewers.keys().any(|id| inner.dashboards.get(id).is_some_and(|d| d.handle.user_id == user_id))
+        })
     }
 
     // ---- access changes (mirrors of committed database changes) -----------
