@@ -1,73 +1,79 @@
-import type { JSX } from "react";
+import { type JSX, useCallback, useEffect, useState } from "react";
 
-import { type ConnectionStatus, useDashboard } from "./useDashboard.js";
+import { type User, getSession, logout } from "./api.js";
+import { AdminPage } from "./pages/Admin.js";
+import { LoginPage, SignupPage } from "./pages/Auth.js";
+import { MachinesPage } from "./pages/Machines.js";
+
+type Tab = "machines" | "admin";
+
+function inviteTokenFromPath(): string | null {
+  const match = /^\/invite\/([A-Za-z0-9_-]+)$/.exec(window.location.pathname);
+  return match?.[1] ?? null;
+}
 
 export function App(): JSX.Element {
-  const { devices, status, viewingId, canvasRef, startView, stopView } = useDashboard();
+  // undefined: still checking; null: logged out.
+  const [user, setUser] = useState<User | null | undefined>(undefined);
+  const [inviteToken, setInviteToken] = useState(inviteTokenFromPath);
+  const [tab, setTab] = useState<Tab>("machines");
+
+  const recheckSession = useCallback((): void => {
+    getSession().then(setUser, () => setUser(null));
+  }, []);
+
+  useEffect(recheckSession, [recheckSession]);
+
+  const enter = (next: User): void => {
+    // Leave /invite/<token> so a reload doesn't show the signup page again.
+    if (inviteToken !== null) {
+      window.history.replaceState(null, "", "/");
+      setInviteToken(null);
+    }
+    setTab("machines");
+    setUser(next);
+  };
+
+  if (inviteToken !== null && user !== undefined) {
+    return (
+      <main className="centered">
+        <SignupPage token={inviteToken} onSignup={enter} />
+      </main>
+    );
+  }
+  if (user === undefined) return <main className="centered muted">Loading…</main>;
+  if (user === null) {
+    return (
+      <main className="centered">
+        <LoginPage onLogin={enter} />
+      </main>
+    );
+  }
 
   return (
     <main>
-      <h1>Hawk Dashboard</h1>
-      <p>
-        Dashboard link: <StatusDot status={status} /> {status}
-      </p>
-
-      {devices.length === 0 ? (
-        <p>No devices connected.</p>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Machine</th>
-              <th>Connected since</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {devices.map((device) => (
-              <tr key={device.id}>
-                <td>{device.machineId}</td>
-                <td>{new Date(device.connectedAt).toLocaleString()}</td>
-                <td>
-                  {viewingId === device.id ? (
-                    <button type="button" onClick={stopView}>
-                      Stop
-                    </button>
-                  ) : (
-                    <button type="button" onClick={() => startView(device.id)}>
-                      View
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      <section style={{ marginTop: 16, display: viewingId === null ? "none" : "block" }}>
-        <h2>Live view</h2>
-        <canvas
-          ref={canvasRef}
-          style={{ maxWidth: "100%", background: "#000", border: "1px solid #444" }}
-        />
-      </section>
+      <header>
+        <strong>Hawk</strong>
+        <nav>
+          <button type="button" className={tab === "machines" ? "active" : ""} onClick={() => setTab("machines")}>
+            Machines
+          </button>
+          {user.isAdmin && (
+            <button type="button" className={tab === "admin" ? "active" : ""} onClick={() => setTab("admin")}>
+              Admin
+            </button>
+          )}
+        </nav>
+        <span className="muted">{user.email}</span>
+        <button type="button" onClick={() => void logout().finally(() => setUser(null))}>
+          Log out
+        </button>
+      </header>
+      {/* Machines stays mounted so switching tabs doesn't drop a live view. */}
+      <div style={{ display: tab === "machines" ? "block" : "none" }}>
+        <MachinesPage onSocketClosed={recheckSession} />
+      </div>
+      {tab === "admin" && user.isAdmin && <AdminPage me={user} />}
     </main>
-  );
-}
-
-function StatusDot({ status }: { status: ConnectionStatus }): JSX.Element {
-  const color = status === "open" ? "limegreen" : status === "connecting" ? "orange" : "crimson";
-  return (
-    <span
-      aria-hidden
-      style={{
-        display: "inline-block",
-        width: 10,
-        height: 10,
-        borderRadius: "50%",
-        background: color,
-      }}
-    />
   );
 }

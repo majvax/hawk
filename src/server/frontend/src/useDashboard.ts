@@ -24,7 +24,13 @@ export interface Dashboard {
   stopView: () => void;
 }
 
-export function useDashboard(): Dashboard {
+// `onClosed` runs whenever the dashboard socket closes, e.g. because the
+// session was logged out elsewhere or the account was disabled; the caller
+// re-checks the session to decide what to show.
+export function useDashboard(onClosed: () => void): Dashboard {
+  const onClosedRef = useRef(onClosed);
+  onClosedRef.current = onClosed;
+
   const [devices, setDevices] = useState<DeviceSnapshot[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [viewingId, setViewingId] = useState<string | null>(null);
@@ -107,7 +113,11 @@ export function useDashboard(): Dashboard {
     socketRef.current = socket;
 
     socket.addEventListener("open", () => setStatus("open"));
-    socket.addEventListener("close", () => setStatus("closed"));
+    let closedByUs = false; // our own teardown isn't a lost session
+    socket.addEventListener("close", () => {
+      setStatus("closed");
+      if (!closedByUs) onClosedRef.current();
+    });
 
     socket.addEventListener("message", (event: MessageEvent) => {
       if (event.data instanceof ArrayBuffer) {
@@ -143,6 +153,7 @@ export function useDashboard(): Dashboard {
 
     return () => {
       teardownDecoder();
+      closedByUs = true;
       socket.close();
     };
   }, [handleFrame, teardownDecoder]);

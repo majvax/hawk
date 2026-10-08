@@ -1,0 +1,194 @@
+/* Dark, sharp-edged: no rounded corners anywhere (see README roadmap). */
+:root {
+  color-scheme: dark;
+  --bg: #0e1013;
+  --panel: #161a1f;
+  --line: #2a3038;
+  --text: #e3e7ec;
+  --muted: #8a94a0;
+  --accent: #3d8bfd;
+  --danger: #f06a6a;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+}
+
+* {
+  box-sizing: border-box;
+  border-radius: 0 !important;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+main {
+  padding: 16px 24px;
+}
+
+main.centered {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding-bottom: 12px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+header nav {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+}
+
+h1,
+h2 {
+  margin: 0 0 12px;
+  font-weight: 600;
+}
+
+h1 {
+  font-size: 20px;
+}
+
+h2 {
+  font-size: 15px;
+}
+
+button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 7px 8px;
+  font: inherit;
+  width: 100%;
+}
+
+input:focus {
+  outline: 1px solid var(--accent);
+}
+
+label {
+  display: grid;
+  gap: 4px;
+}
+
+a {
+  color: var(--accent);
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.card {
+  display: grid;
+  gap: 12px;
+  width: min(380px, 100%);
+  padding: 24px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+
+.stack {
+  display: grid;
+  gap: 24px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.row h2 {
+  margin: 0;
+  flex: 1;
+}
+
+.notice {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--accent);
+}
+
+.notice p {
+  margin-top: 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.error {
+  color: var(--danger);
+  margin: 0;
+}
+
+.screen {
+  max-width: 100%;
+  background: #000;
+  border: 1px solid var(--line);
+}
+
+.dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 4px;
+}
+
+.dot-open {
+  background: limegreen;
+}
+
+.dot-connecting {
+  background: orange;
+}
+
+.dot-closed {
+  background: crimson;
+}

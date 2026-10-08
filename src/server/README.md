@@ -34,8 +34,36 @@ bun run start   # serves the built frontend and runs the relay on :8080
 
 Configuration is by environment variable: `HOST` (default `127.0.0.1`),
 `PORT` (default `8080`), `FRONTEND_DIST`, `TLS_CERT_PATH`, `TLS_KEY_PATH`,
-and `HAWK_SERVER_ROOT` (the directory the default paths are relative to;
+`HAWK_DB_PATH` (default `data/hawk.db`), `PUBLIC_URL` (the address people
+reach the dashboard at, used in links the relay logs), and
+`HAWK_SERVER_ROOT` (the directory the default paths are relative to;
 defaults to this directory). `RUST_LOG` controls log verbosity.
+
+## Accounts
+
+Accounts are invite-only; there is no open sign-up.
+
+- **First run:** with no accounts in the database, the relay logs a one-time
+  link (`.../invite/<token>`) that creates the **admin** account. Only
+  someone who can read the server's output can claim it. Restarting before
+  it's used replaces the link.
+- **Inviting:** the admin creates single-use invite links (valid 7 days) in
+  the dashboard's Admin tab, and can revoke unused ones.
+- **Admin:** lists users and can disable/enable them. Disabling ends the
+  user's sessions and closes their open dashboards immediately. Being admin
+  does not grant access to other people's machines (once machines have
+  owners; see the roadmap).
+- Passwords: argon2id, at least 10 characters. Session and invite tokens are
+  32 random bytes; the database stores only their SHA-256.
+- Sessions: `hawk_session` cookie, `HttpOnly`, `SameSite=Strict`, `Secure`
+  under TLS, valid 30 days. Every `/api/*` route except login, signup and
+  invite lookup requires one, as does the `/v1/dashboard` socket, which also
+  rejects a cross-origin `Origin`.
+- Failed logins are throttled per client IP (10 per 15 minutes). Behind a
+  reverse proxy all clients share the proxy's IP, so this is a coarse brake.
+
+Until machines have owners, connected devices are visible to the **admin
+only**; other accounts can log in but see no machines.
 
 ## TLS
 
@@ -58,22 +86,6 @@ for an actual domain pointed at this server.
 
 Planned work on the server, in rough order. Nothing below is implemented yet.
 
-### Accounts (invite-only)
-
-One person hosts the relay; everyone else joins by invitation. There is no
-open sign-up.
-
-- The first account is created on first run and is the instance **admin**.
-  Every other account comes from an invite link (single-use, expiring),
-  created by the admin or by a machine owner sharing a machine.
-- Passwords are stored hashed with argon2id, never in plain text.
-- Sessions use an `HttpOnly`, `Secure`, `SameSite=Strict` cookie. Every
-  `/api/*` route and the `/v1/dashboard` socket require one.
-- Users, sessions, machines, shares and invites are kept in a local SQLite
-  file, so they survive a restart. Live connection state stays in memory.
-- The admin manages accounts (invite, disable, delete) but does not get
-  access to other people's machines by being admin.
-
 ### Machines and enrollment
 
 Every machine has exactly one owner, and its own credential.
@@ -88,7 +100,8 @@ Every machine has exactly one owner, and its own credential.
 
 ### Sharing and permissions
 
-An owner can share a machine with another account, with one of two roles:
+An owner can share a machine with another account (inviting them first if
+they have none), with one of two roles:
 
 - **view** — can watch the screen. Nothing it sends can act on the machine.
 - **control** — can watch and send input.

@@ -15,13 +15,31 @@ use crate::protocol::{DashboardEvent, DeviceCommand, DeviceSnapshot, is_keyframe
 
 pub type DashboardId = u64;
 
-/// How a dashboard's socket task is reached. Events are rare and must not be
-/// lost, so their queue is unbounded; frames are bounded so a slow viewer
-/// can't make the relay buffer video without limit.
+/// What the relay pushes to a dashboard's socket task besides frames.
+pub enum Outbound {
+    Event(DashboardEvent),
+    /// The session behind this dashboard ended (logout, account disabled):
+    /// close the socket.
+    Close,
+}
+
+/// How a dashboard's socket task is reached, and who is behind it. Events
+/// are rare and must not be lost, so their queue is unbounded; frames are
+/// bounded so a slow viewer can't make the relay buffer video without limit.
 #[derive(Clone)]
 pub struct DashboardHandle {
-    pub events: mpsc::UnboundedSender<DashboardEvent>,
+    pub events: mpsc::UnboundedSender<Outbound>,
     pub frames: mpsc::Sender<Bytes>,
+    pub user_id: i64,
+    pub session_id: i64,
+    /// Until machines have owners, only the admin may see or view devices.
+    pub sees_devices: bool,
+}
+
+impl DashboardHandle {
+    fn send(&self, event: DashboardEvent) {
+        let _ = self.events.send(Outbound::Event(event));
+    }
 }
 
 struct Viewer {
@@ -55,9 +73,29 @@ struct Inner {
 }
 
 impl Inner {
+    /// Device connect/disconnect events, to the dashboards allowed to see devices.
     fn broadcast(&self, event: &DashboardEvent) {
-        for dashboard in self.dashboards.values() {
-            let _ = dashboard.events.send(event.clone());
+        for dashboard in self.dashboards.values().filter(|dashboard| dashboard.sees_devices) {
+            dashboard.send(event.clone());
+        }
+    }
+
+    fn remove_dashboard(&mut self, id: DashboardId) -> Option<DashboardHandle> {
+        let handle = self.dashboards.remove(&id)?;
+        for device in self.devices.values_mut() {
+            detach(device, id);
+        }
+        Some(handle)
+    }
+
+    /// Detaches and closes every dashboard matching `predicate`.
+    fn close_where(&mut self, predicate: impl Fn(&DashboardHandle) -> bool) {
+        let ids: Vec<DashboardId> =
+            self.dashboards.iter().filter(|(_, handle)| predicate(handle)).map(|(id, _)| *id).collect();
+        for id in ids {
+            if let Some(handle) = self.remove_dashboard(id) {
+                let _ = handle.events.send(Outbound::Close);
+            }
         }
     }
 }
@@ -95,7 +133,7 @@ impl Registry {
         // Let anyone watching tear down their decoder; the frames stop here.
         for dashboard_id in device.viewers.keys() {
             if let Some(dashboard) = inner.dashboards.get(dashboard_id) {
-                let _ = dashboard.events.send(DashboardEvent::CaptureEnded { device_id: id.to_owned() });
+                dashboard.send(DashboardEvent::CaptureEnded { device_id: id.to_owned() });
             }
         }
         inner.broadcast(&DashboardEvent::DeviceDisconnected { id: id.to_owned() });
@@ -106,26 +144,42 @@ impl Registry {
     pub fn add_dashboard(&self, handle: DashboardHandle) -> DashboardId {
         let id = self.next_dashboard_id.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.lock();
-        let devices = inner.devices.iter().map(|(device_id, device)| device.snapshot(device_id)).collect();
-        let _ = handle.events.send(DashboardEvent::Snapshot { devices });
+        let devices = if handle.sees_devices {
+            inner.devices.iter().map(|(device_id, device)| device.snapshot(device_id)).collect()
+        } else {
+            Vec::new()
+        };
+        handle.send(DashboardEvent::Snapshot { devices });
         inner.dashboards.insert(id, handle);
         id
     }
 
     /// Drops a dashboard and detaches it from every device it was watching.
     pub fn remove_dashboard(&self, id: DashboardId) {
-        let mut inner = self.lock();
-        inner.dashboards.remove(&id);
-        for device in inner.devices.values_mut() {
-            detach(device, id);
-        }
+        self.lock().remove_dashboard(id);
+    }
+
+    /// Closes the dashboards opened with this session (on logout).
+    pub fn close_session(&self, session_id: i64) {
+        self.lock().close_where(|handle| handle.session_id == session_id);
+    }
+
+    /// Closes every dashboard of this user (account disabled).
+    pub fn close_user(&self, user_id: i64) {
+        self.lock().close_where(|handle| handle.user_id == user_id);
     }
 
     /// The first viewer makes the device start capturing; later viewers just
-    /// attach to the stream. Returns false if the device isn't connected.
+    /// attach to the stream. Returns false if the device isn't connected or
+    /// this dashboard may not view it.
     pub fn start_view(&self, dashboard: DashboardId, device_id: &str) -> bool {
         let mut inner = self.lock();
-        let Some(frames) = inner.dashboards.get(&dashboard).map(|handle| handle.frames.clone()) else {
+        let Some(frames) = inner
+            .dashboards
+            .get(&dashboard)
+            .filter(|handle| handle.sees_devices)
+            .map(|handle| handle.frames.clone())
+        else {
             return false;
         };
         let Some(device) = inner.devices.get_mut(device_id) else { return false };

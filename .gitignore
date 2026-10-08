@@ -11,3 +11,4 @@ certs/
 
 # Rust relay (src/server/relay)
 target/
+data/

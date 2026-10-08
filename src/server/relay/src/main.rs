@@ -1,6 +1,10 @@
 //! Hawk relay: devices (hawk-service) and dashboards connect here, and the
 //! relay routes capture commands down and video frames back up.
 
+mod api;
+mod auth;
+mod db;
+mod error;
 mod protocol;
 mod registry;
 mod routes;
@@ -8,22 +12,38 @@ mod routes;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::auth::LoginLimiter;
+use crate::db::Db;
 use crate::registry::Registry;
+
+/// Shared by every handler.
+#[derive(Clone)]
+pub struct AppState {
+    pub registry: Arc<Registry>,
+    pub db: Db,
+    pub limiter: Arc<LoginLimiter>,
+    /// Session cookies get the Secure flag whenever we serve TLS.
+    pub secure_cookies: bool,
+}
 
 struct Config {
     addr: SocketAddr,
     frontend_dist: PathBuf,
     tls_cert: PathBuf,
     tls_key: PathBuf,
+    db_path: PathBuf,
+    /// The URL people reach the dashboard at, for links printed to the log.
+    public_url: Option<String>,
 }
 
 impl Config {
@@ -42,8 +62,50 @@ impl Config {
             frontend_dist: path_or("FRONTEND_DIST", root.join("frontend/dist")),
             tls_cert: path_or("TLS_CERT_PATH", root.join("certs/dev-cert.pem")),
             tls_key: path_or("TLS_KEY_PATH", root.join("certs/dev-key.pem")),
+            db_path: path_or("HAWK_DB_PATH", root.join("data/hawk.db")),
+            public_url: std::env::var("PUBLIC_URL").ok().map(|url| url.trim_end_matches('/').to_owned()),
         })
     }
+}
+
+/// With no accounts yet, prints a one-time admin invite to the log. Only
+/// someone who can read the server's output can claim the instance, so
+/// there's no window where a stranger could register first.
+async fn bootstrap_admin(db: &Db, base_url: &str) -> Result<(), String> {
+    let token = auth::random_token();
+    let hash = auth::token_hash(&token);
+    let now = auth::now();
+    let expires_at = now + auth::INVITE_TTL.whole_seconds();
+    let created = db
+        .call(move |conn| {
+            if db::user_count(conn)? > 0 {
+                return Ok(false);
+            }
+            db::delete_pending_admin_invites(conn)?;
+            db::create_invite(conn, &hash, None, true, now, expires_at)?;
+            Ok(true)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if created {
+        warn!("no accounts yet. Create the admin account at: {base_url}/invite/{token}");
+    }
+    Ok(())
+}
+
+/// Hourly: drop expired sessions and invites, and stale login throttles.
+fn spawn_cleanup(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            let now = auth::now();
+            if let Err(error) = state.db.call(move |conn| db::purge_expired(conn, now)).await {
+                error!(%error, "purging expired sessions failed");
+            }
+            state.limiter.prune();
+        }
+    });
 }
 
 /// Loads the cert/key into a rustls config, or None when either file is
@@ -75,25 +137,46 @@ async fn main() -> Result<(), String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let config = Config::from_env()?;
-    let registry = Arc::new(Registry::default());
+    let tls = load_tls(&config)?;
+    let db = Db::open(&config.db_path)?;
+    info!("database at {}", config.db_path.display());
+
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let base_url = config.public_url.clone().unwrap_or_else(|| format!("{scheme}://{}", config.addr));
+    bootstrap_admin(&db, &base_url).await?;
+
+    let state = AppState {
+        registry: Arc::new(Registry::default()),
+        db,
+        limiter: Arc::new(LoginLimiter::default()),
+        secure_cookies: tls.is_some(),
+    };
+    spawn_cleanup(state.clone());
 
     let frontend = ServeDir::new(&config.frontend_dist)
         .fallback(ServeFile::new(config.frontend_dist.join("index.html")));
     let app = Router::new()
+        .route("/api/session", get(api::session))
+        .route("/api/login", post(api::login))
+        .route("/api/logout", post(api::logout))
+        .route("/api/signup", post(api::signup))
+        .route("/api/invites/{token}", get(api::invite_info))
+        .route("/api/admin/users", get(api::list_users))
+        .route("/api/admin/users/{id}/disabled", post(api::set_user_disabled))
+        .route("/api/admin/invites", get(api::list_invites).post(api::create_invite))
+        .route("/api/admin/invites/{id}", delete(api::delete_invite))
         .route("/api/devices", get(routes::devices))
         .route("/v1/ws", get(routes::device_socket))
         .route("/v1/dashboard", get(routes::dashboard_socket))
         .fallback_service(frontend)
-        .with_state(registry);
+        .with_state(state)
+        .into_make_service_with_connect_info::<SocketAddr>();
 
-    match load_tls(&config)? {
+    match tls {
         Some(tls) => {
             info!("relay listening at https://{}", config.addr);
             let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
-            axum_server::bind_rustls(config.addr, tls)
-                .serve(app.into_make_service())
-                .await
-                .map_err(|error| error.to_string())
+            axum_server::bind_rustls(config.addr, tls).serve(app).await.map_err(|error| error.to_string())
         }
         None => {
             warn!(

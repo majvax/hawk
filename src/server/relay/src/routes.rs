@@ -6,28 +6,34 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::response::Response;
+use axum::http::{HeaderMap, header};
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::AppState;
+use crate::auth::{AdminUser, CurrentUser};
+use crate::error::ApiError;
 use crate::protocol::{DashboardCommand, DashboardEvent, DeviceMessage, DeviceSnapshot};
-use crate::registry::{DashboardHandle, Registry};
+use crate::registry::{DashboardHandle, Outbound, Registry};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// About half a second of 60 fps video per viewer before frames are dropped.
 const VIEWER_FRAME_QUEUE: usize = 32;
 
-pub async fn devices(State(registry): State<Arc<Registry>>) -> Json<Vec<DeviceSnapshot>> {
-    Json(registry.snapshot())
+/// Admin only until machines have owners.
+pub async fn devices(State(state): State<AppState>, _admin: AdminUser) -> Json<Vec<DeviceSnapshot>> {
+    Json(state.registry.snapshot())
 }
 
 /// Endpoint devices (hawk-service) connect to. The first message must be a
 /// hello; after it, binary messages are video frames to fan out and the
 /// relay sends capture commands down.
-pub async fn device_socket(ws: WebSocketUpgrade, State(registry): State<Arc<Registry>>) -> Response {
+pub async fn device_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    let registry = state.registry;
     ws.on_upgrade(move |socket| handle_device(socket, registry))
 }
 
@@ -85,25 +91,59 @@ async fn handle_device(socket: WebSocket, registry: Arc<Registry>) {
 /// The dashboard's view into the relay: a snapshot on connect, live
 /// connect/disconnect events, and start_view/stop_view to receive a device's
 /// video frames as binary messages.
-pub async fn dashboard_socket(ws: WebSocketUpgrade, State(registry): State<Arc<Registry>>) -> Response {
-    ws.on_upgrade(move |socket| handle_dashboard(socket, registry))
+/// Requires a session. A browser always sends Origin on a WebSocket
+/// handshake; refusing a foreign one keeps another site from opening this
+/// socket with the user's cookie.
+pub async fn dashboard_socket(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    current: CurrentUser,
+    headers: HeaderMap,
+) -> Response {
+    if !same_origin(&headers) {
+        warn!(user = %current.user.email, "dashboard: rejected cross-origin socket");
+        return ApiError::Forbidden.into_response();
+    }
+    let registry = state.registry;
+    ws.on_upgrade(move |socket| handle_dashboard(socket, registry, current))
 }
 
-async fn handle_dashboard(socket: WebSocket, registry: Arc<Registry>) {
+/// True when there's no Origin (not a browser) or it names the host the
+/// request was sent to.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else { return true };
+    let host = headers.get(header::HOST).and_then(|host| host.to_str().ok());
+    let origin_host = origin.to_str().ok().and_then(|origin| origin.split_once("://")).map(|(_, rest)| rest);
+    matches!((origin_host, host), (Some(origin_host), Some(host)) if origin_host.eq_ignore_ascii_case(host))
+}
+
+async fn handle_dashboard(socket: WebSocket, registry: Arc<Registry>, current: CurrentUser) {
     let (mut sink, mut stream) = socket.split();
 
-    let (events, mut event_rx) = mpsc::unbounded_channel::<DashboardEvent>();
+    let (events, mut event_rx) = mpsc::unbounded_channel::<Outbound>();
     let (frames, mut frame_rx) = mpsc::channel::<Bytes>(VIEWER_FRAME_QUEUE);
-    let dashboard_id = registry.add_dashboard(DashboardHandle { events: events.clone(), frames });
+    let dashboard_id = registry.add_dashboard(DashboardHandle {
+        events: events.clone(),
+        frames,
+        user_id: current.user.id,
+        session_id: current.session_id,
+        sees_devices: current.user.is_admin,
+    });
 
     let writer = tokio::spawn(async move {
         loop {
             let message = tokio::select! {
                 // Events first, so capture_ended never trails stale frames.
                 biased;
-                Some(event) = event_rx.recv() => match serde_json::to_string(&event) {
-                    Ok(json) => Message::Text(json.into()),
-                    Err(_) => continue,
+                Some(outbound) = event_rx.recv() => match outbound {
+                    Outbound::Event(event) => match serde_json::to_string(&event) {
+                        Ok(json) => Message::Text(json.into()),
+                        Err(_) => continue,
+                    },
+                    Outbound::Close => {
+                        let _ = sink.send(close(1008, "session ended")).await;
+                        break;
+                    }
                 },
                 Some(frame) = frame_rx.recv() => Message::Binary(frame),
                 else => break,
@@ -123,7 +163,7 @@ async fn handle_dashboard(socket: WebSocket, registry: Arc<Registry>) {
         match serde_json::from_str::<DashboardCommand>(&text) {
             Ok(DashboardCommand::StartView { device_id }) => {
                 if !registry.start_view(dashboard_id, &device_id) {
-                    let _ = events.send(DashboardEvent::CaptureEnded { device_id });
+                    let _ = events.send(Outbound::Event(DashboardEvent::CaptureEnded { device_id }));
                 }
             }
             Ok(DashboardCommand::StopView { device_id }) => registry.stop_view(dashboard_id, &device_id),
