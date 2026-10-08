@@ -1,20 +1,45 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Embedded into hawk-capture.exe through capture.rc.
+
+  asInvoker with uiAccess=false: hawk-service launches this as LocalSystem
+  (launch_capture in service/capture_host.cpp), which runs at System
+  integrity — above High — so injected input already reaches elevated
+  windows without uiAccess, and access to the secure desktop comes from
+  being SYSTEM, not from uiAccess. A uiAccess=true manifest would instead
+  make the SYSTEM launch fail unless the exe were signed and under Program
+  Files, so it stays off.
+-->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
       version="1.0.0.0"
       processorArchitecture="*"
-      name="hawk-captures"
+      name="hawk-capture"
       type="win32"/>
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
         <requestedExecutionLevel
-            level="requireAdministrator"
-            uiAccess="true"/>
+            level="asInvoker"
+            uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>
+
+  <!--
+    Per-monitor DPI aware (v2), so DXGI's desktop coordinates, GetSystemMetrics
+    and SetCursorPos all work in physical pixels: otherwise Windows scales them
+    on a scaled display and injected input lands off the pixel the viewer
+    pointed at (see capture/input.cpp). dpiAware is the fallback for Windows
+    versions that don't read dpiAwareness.
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
 
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>

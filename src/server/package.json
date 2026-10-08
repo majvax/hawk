@@ -8,6 +8,7 @@
   "scripts": {
     "certs": "bash scripts/generate-dev-cert.sh",
     "dev:relay": "cargo run --manifest-path relay/Cargo.toml",
+    "dev:relay:lan": "HOST=0.0.0.0 cargo run --manifest-path relay/Cargo.toml",
     "dev:frontend": "bun run --cwd frontend dev",
     "build": "bun run --cwd frontend build && cargo build --release --manifest-path relay/Cargo.toml",
     "start": "cargo run --release --manifest-path relay/Cargo.toml"

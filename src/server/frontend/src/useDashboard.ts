@@ -4,6 +4,7 @@ import { getSession } from "./api.js";
 import {
   type DashboardCommand,
   type DashboardEvent,
+  type InputEvent,
   type Machine,
   parseVideoFrame,
 } from "./protocol.js";
@@ -43,6 +44,10 @@ export interface Dashboard {
   canvasRef: RefObject<HTMLCanvasElement>;
   startView: (deviceId: string) => void;
   stopView: () => void;
+  // Sends one input event to the machine being watched. The relay drops it
+  // unless this user may control that machine, so a view-only viewer can
+  // call this all it likes and nothing happens.
+  sendInput: (event: InputEvent) => void;
   // Skip the rest of the backoff and try now.
   reconnectNow: () => void;
 }
@@ -291,6 +296,17 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
     [requestStream, send, teardownDecoder],
   );
 
+  const sendInput = useCallback(
+    (event: InputEvent): void => {
+      // Only while frames are actually flowing: input to a machine this
+      // socket isn't watching goes nowhere.
+      const deviceId = streamingRef.current;
+      if (deviceId === null) return;
+      send({ type: "input", deviceId, event });
+    },
+    [send],
+  );
+
   const stopView = useCallback((): void => {
     if (viewingRef.current === null) return;
     if (streamingRef.current !== null) send({ type: "stop_view", deviceId: streamingRef.current });
@@ -299,5 +315,5 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
 
   const reconnectNow = useCallback((): void => reconnectNowRef.current(), []);
 
-  return { machines, status, retryAt, viewingId, canvasRef, startView, stopView, reconnectNow };
+  return { machines, status, retryAt, viewingId, canvasRef, startView, stopView, sendInput, reconnectNow };
 }

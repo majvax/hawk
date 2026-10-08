@@ -51,7 +51,10 @@ enroll it again with a new code; the old key is deleted from the TPM.
 
 Once enrolled, the service waits for a `start_capture` command. It launches `hawk-capture.exe` into the logged-on
 user's session on demand, so a user must be signed in at the console for
-capture to start.
+capture to start. That same helper replays the viewer's mouse and keyboard
+with `SendInput`; the service passes the events to it over a private named
+pipe and never injects anything itself (Session 0 has no desktop to type
+into).
 
 Logs: `C:\ProgramData\HawkService\hawk-service.log`.
 

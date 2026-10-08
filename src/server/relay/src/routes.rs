@@ -1,7 +1,7 @@
 //! WebSocket endpoints for devices and dashboards.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::AppState;
 use crate::auth::{self, CurrentUser};
@@ -330,6 +330,10 @@ async fn handle_dashboard(
         }
     });
 
+    let mut input_budget = InputBudget::new();
+    // A dashboard can send invalid commands as fast as it moves a mouse, so
+    // only the first one per connection is worth a warning.
+    let mut warned_invalid = false;
     while let Some(Ok(message)) = stream.next().await {
         let text = match message {
             Message::Text(text) => text,
@@ -343,12 +347,53 @@ async fn handle_dashboard(
                 }
             }
             Ok(DashboardCommand::StopView { device_id }) => registry.stop_view(dashboard_id, &device_id),
-            Err(error) => warn!(%error, "dashboard: received invalid command"),
+            Ok(DashboardCommand::Input { device_id, event }) => {
+                // Dropped quietly: a view-only or flooding dashboard gets
+                // nothing through, and no reply it could time against.
+                if let Some(event) = event.sanitized()
+                    && input_budget.take()
+                {
+                    registry.input(dashboard_id, &device_id, event);
+                }
+            }
+            Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
+                warn!(%error, "dashboard: received invalid command (further ones are logged at debug)")
+            }
+            Err(error) => debug!(%error, "dashboard: received invalid command"),
         }
     }
 
     registry.remove_dashboard(dashboard_id);
     writer.abort();
+}
+
+/// Token bucket on one dashboard's input events. A person moving a mouse
+/// sends at most one move per display frame plus the odd key, far below
+/// this; anything above it is dropped.
+struct InputBudget {
+    tokens: f64,
+    refilled: Instant,
+}
+
+impl InputBudget {
+    const PER_SECOND: f64 = 500.0;
+    const BURST: f64 = 1000.0;
+
+    fn new() -> Self {
+        Self { tokens: Self::BURST, refilled: Instant::now() }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.refilled).as_secs_f64() * Self::PER_SECOND;
+        self.tokens = (self.tokens + refill).min(Self::BURST);
+        self.refilled = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
 }
 
 fn close(code: u16, reason: &'static str) -> Message {

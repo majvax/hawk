@@ -1,6 +1,8 @@
 #include "common/capture_pipe.hpp"
+#include "desktop.hpp"
 #include "duplication.hpp"
 #include "encoder.hpp"
+#include "input.hpp"
 
 #include <objbase.h>
 #include <timeapi.h>
@@ -123,10 +125,10 @@ private:
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
 };
 
-// hawk-service launches us with `--pipe <name>`.
-[[nodiscard]] std::optional<std::string> pipe_name_from_args(std::span<char* const> args) {
+// hawk-service launches us with `--pipe <name> --input-pipe <name>`.
+[[nodiscard]] std::optional<std::string> option_value(std::span<char* const> args, std::string_view option) {
     for (std::size_t i = 1; i + 1 < args.size(); ++i) {
-        if (std::string_view(args[i]) == "--pipe") {
+        if (std::string_view(args[i]) == option) {
             return std::string(args[i + 1]);
         }
     }
@@ -157,12 +159,16 @@ void init_logging(bool launched_by_service) {
 
 // Standalone helper: must run as an ordinary process inside the interactive
 // user's own session, not the service (Session 0 has no desktop to see).
-// Captures the desktop and encodes it to H.264 on the GPU. Launched by
-// hawk-service with `--pipe <name>`, it streams the packets back over that
-// pipe and exits once the service closes it. Run on its own, without
-// `--pipe`, it only logs packet stats.
+// Captures the desktop and encodes it to H.264 on the GPU, and replays the
+// viewer's mouse and keyboard into the session. Launched by hawk-service
+// with `--pipe <name> --input-pipe <name>`, it streams the packets back over
+// the first pipe, takes input events off the second, and exits once the
+// service closes them. Run on its own, without `--pipe`, it only logs packet
+// stats.
 int main(int argc, char* argv[]) {
-    const auto pipe_name = pipe_name_from_args(std::span(argv, static_cast<std::size_t>(argc)));
+    const auto args = std::span(argv, static_cast<std::size_t>(argc));
+    const auto pipe_name = option_value(args, "--pipe");
+    const auto input_pipe_name = option_value(args, "--input-pipe");
     init_logging(pipe_name.has_value());
 
     PacketPipe pipe;
@@ -178,13 +184,32 @@ int main(int argc, char* argv[]) {
 
     const TimerResolutionScope timer_resolution;
 
+    // Capture whichever desktop currently holds input. Running as SYSTEM
+    // (hawk-service launches us so), this reaches the secure desktop too, so
+    // the UAC prompt and lock screen are captured rather than freezing the
+    // stream. The thread is re-attached on every desktop switch below.
+    HDESK capture_desktop = nullptr;
+    if (!capture::follow_input_desktop(capture_desktop)) {
+        spdlog::warn("capture: couldn't attach to the input desktop; the secure desktop won't be captured");
+    }
+
     capture::DesktopDuplicator duplicator;
     if (auto opened = duplicator.open(); !opened.has_value()) {
         spdlog::error("capture: failed to open desktop duplication: {}", capture::to_string(opened.error()));
+        capture::close_desktop(capture_desktop);
         return EXIT_FAILURE;
     }
 
     spdlog::info("capture: desktop duplication started");
+
+    // Input is best-effort: a viewer who can't control the machine (or a
+    // standalone run with no `--input-pipe`) just means no input channel,
+    // never a failed capture. It's closed before the duplicator so nothing
+    // is left held down if the capture loop gives up below.
+    capture::InputChannel input;
+    if (input_pipe_name.has_value() && !input.open(*input_pipe_name, duplicator.bounds())) {
+        spdlog::warn("capture: continuing without input");
+    }
 
     capture::H264Encoder encoder;
     bool                 encoder_ready = false;
@@ -215,6 +240,17 @@ int main(int argc, char* argv[]) {
     auto                          next_tick = std::chrono::steady_clock::now();
     std::optional<capture::Frame> last_frame;
 
+    // DXGI drops the duplication whenever the desktop switches — most often
+    // to the secure desktop for a UAC prompt, also the lock screen — and on
+    // a display mode change. None of those are fatal: that desktop simply
+    // can't be captured from this session, so the stream holds on the last
+    // frame (re-encoded every tick below, so it stays alive) until the
+    // normal desktop returns and reacquire() takes. Attempts are throttled
+    // so a long-lived prompt doesn't spin on COM calls.
+    bool       duplication_lost = false;
+    auto       next_reacquire = std::chrono::steady_clock::now();
+    const auto reacquire_interval = std::chrono::milliseconds(250);
+
     for (;;) {
         std::this_thread::sleep_until(next_tick);
 
@@ -222,6 +258,36 @@ int main(int argc, char* argv[]) {
         if (frame.has_value()) {
             last_frame = *frame;
             ++captured_count;
+            if (duplication_lost) {
+                spdlog::info("capture: desktop duplication recovered");
+                duplication_lost = false;
+            }
+        } else if (frame.error().code == capture::CaptureError::Code::access_lost) {
+            if (!duplication_lost) {
+                spdlog::info("capture: desktop switched away (e.g. a UAC prompt); holding the last frame");
+                duplication_lost = true;
+                next_reacquire = std::chrono::steady_clock::now();
+            }
+            if (std::chrono::steady_clock::now() >= next_reacquire) {
+                // The switch is usually *why* we lost the duplication, so move
+                // to whatever desktop now holds input before rebuilding it;
+                // that's how the secure desktop gets captured.
+                static_cast<void>(capture::follow_input_desktop(capture_desktop));
+                if (auto reacquired = duplicator.reacquire(); reacquired.has_value()) {
+                    // 'recovered' is logged above once a real frame arrives.
+                } else if (reacquired.error().code == capture::CaptureError::Code::access_lost) {
+                    // The display mode changed while the duplication was
+                    // down; the encoder is sized to the old resolution, so
+                    // exit and let hawk-service relaunch us to re-open at the
+                    // new one.
+                    spdlog::info("capture: {}; restarting", capture::to_string(reacquired.error()));
+                    return EXIT_SUCCESS;
+                } else {
+                    // Still the secure desktop (DuplicateOutput is denied
+                    // while it's up); try again shortly.
+                    next_reacquire = std::chrono::steady_clock::now() + reacquire_interval;
+                }
+            }
         } else if (frame.error().code != capture::CaptureError::Code::timeout) {
             spdlog::error("capture: {}", capture::to_string(frame.error()));
             return EXIT_FAILURE;

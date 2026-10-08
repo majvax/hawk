@@ -14,6 +14,7 @@ import {
 } from "../api.js";
 import type { Machine, Role } from "../protocol.js";
 import { type ConnectionStatus, useDashboard } from "../useDashboard.js";
+import { useRemoteInput } from "../useRemoteInput.js";
 
 const ROLE_LABEL: Record<Role, string> = { owner: "owner", control: "can control", view: "view only" };
 
@@ -27,7 +28,7 @@ function errorMessage(error: unknown): string {
 }
 
 export function MachinesPage({ onSessionEnded }: { onSessionEnded: () => void }): JSX.Element {
-  const { machines, status, retryAt, viewingId, canvasRef, startView, stopView, reconnectNow } =
+  const { machines, status, retryAt, viewingId, canvasRef, startView, stopView, sendInput, reconnectNow } =
     useDashboard(onSessionEnded);
   const [managingId, setManagingId] = useState<string | null>(null);
   const [enrollment, setEnrollment] = useState<EnrollmentCode | null>(null);
@@ -35,6 +36,11 @@ export function MachinesPage({ onSessionEnded }: { onSessionEnded: () => void })
 
   const viewing = machines.find((machine) => machine.id === viewingId) ?? null;
   const managing = machines.find((machine) => machine.id === managingId && machine.role === "owner") ?? null;
+
+  // Nothing to send input to unless the stream is actually up, and the
+  // relay would drop it from a view-only share anyway.
+  const canControl = viewing !== null && viewing.role !== "view" && viewing.online && status === "open";
+  const input = useRemoteInput(canvasRef, canControl, sendInput);
 
   const addMachine = async (): Promise<void> => {
     setError(null);
@@ -164,7 +170,30 @@ export function MachinesPage({ onSessionEnded }: { onSessionEnded: () => void })
         {viewing !== null && viewing.singleView && (
           <p className="muted">One viewing only: once you stop watching, this machine is no longer shared with you.</p>
         )}
-        <canvas ref={canvasRef} className="screen" />
+        {canControl && (
+          <p className="muted">
+            {input.active ? (
+              <>
+                Your mouse and keyboard are going to {viewing?.name}. The screen doesn't show the machine's own
+                pointer — yours is in the same place.{" "}
+                <button type="button" onClick={input.release}>
+                  Stop controlling
+                </button>{" "}
+                Shortcuts the browser keeps for itself (Ctrl+W, Alt+Tab), and Ctrl+Alt+Del, stay on your own
+                computer.
+              </>
+            ) : (
+              "Click the screen to control it with your mouse and keyboard."
+            )}
+          </p>
+        )}
+        <canvas
+          ref={canvasRef}
+          className={["screen", canControl && "controllable", input.active && "controlling"].filter(Boolean).join(" ")}
+          // Focusable only when it can be controlled: focusing it is what
+          // starts sending input, and Tab shouldn't land on a dead screen.
+          tabIndex={canControl ? 0 : -1}
+        />
       </section>
     </div>
   );

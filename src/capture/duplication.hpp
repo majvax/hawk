@@ -32,6 +32,17 @@ struct CaptureError {
 [[nodiscard]] std::string_view to_string(CaptureError::Code code) noexcept;
 [[nodiscard]] std::string      to_string(const CaptureError& error);
 
+// The captured monitor's rectangle on the virtual desktop, in pixels, as
+// DXGI reports it (DXGI_OUTPUT_DESC::DesktopCoordinates). Frames cover
+// exactly this rectangle, so it's what turns a position within a frame back
+// into a position on the desktop — see capture/input.cpp.
+struct DesktopBounds {
+    std::int32_t left = 0;
+    std::int32_t top = 0;
+    std::int32_t right = 0;
+    std::int32_t bottom = 0;
+};
+
 // A captured frame, resident entirely on the GPU: BGRA8, D3D11_USAGE_DEFAULT,
 // bound as a render target (what D3D11 video-processor input views require)
 // so it can feed straight into a video processor for color conversion (e.g.
@@ -69,12 +80,29 @@ public:
     // capture_frame() again.
     [[nodiscard]] std::expected<Frame, CaptureError> capture_frame(std::uint32_t timeout_ms = default_frame_timeout_ms);
 
+    // Rebuilds the duplication after capture_frame() returns
+    // CaptureError::Code::access_lost — which DXGI raises on a desktop
+    // switch (the UAC prompt and lock screen run on the secure desktop,
+    // which this can't read) and on a mode change. The D3D device and the
+    // frame texture are preserved, so an encoder bound to device() stays
+    // valid across the call. Fails while the secure desktop is still up;
+    // callers retry until it succeeds. Only valid after a successful open().
+    [[nodiscard]] std::expected<void, CaptureError> reacquire();
+
+    // Where on the virtual desktop the captured monitor sits. Only
+    // meaningful after a successful open().
+    [[nodiscard]] DesktopBounds bounds() const noexcept;
+
     // Shared with H264Encoder so encoding happens on the same D3D11 device
     // the capture texture lives on — required for the zero-copy GPU path.
     // Only valid after a successful open().
     [[nodiscard]] ID3D11Device* device() const noexcept;
 
 private:
+    // (Re)binds the duplication interface for `output_index` on the existing
+    // device. Shared by open() and reacquire().
+    [[nodiscard]] std::expected<void, CaptureError> acquire_duplication(std::uint32_t output_index);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

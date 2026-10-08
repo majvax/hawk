@@ -25,9 +25,28 @@ export type DashboardEvent =
   | { type: "machine_removed"; id: string }
   | { type: "capture_ended"; deviceId: string };
 
+export type MouseButton = "left" | "right" | "middle";
+
+// One input event on its way to a machine. Positions are a fraction of the
+// captured screen, 0..=1 from its top-left corner, so neither side needs the
+// other's resolution. Keys are named by `KeyboardEvent.code` — the physical
+// key, which the machine then reads through its own keyboard layout.
+export type InputEvent =
+  | { kind: "mouse_move"; x: number; y: number }
+  | { kind: "mouse_button"; button: MouseButton; down: boolean }
+  // In WHEEL_DELTA units (120 per notch); positive is up / right.
+  | { kind: "wheel"; dx: number; dy: number }
+  | { kind: "key"; code: string; down: boolean };
+
+// What Windows counts as one notch of the wheel.
+export const WHEEL_DELTA = 120;
+
+// Only acted on while watching the machine with a control (or owner) role;
+// the relay drops anything else without a word.
 export type DashboardCommand =
   | { type: "start_view"; deviceId: string }
-  | { type: "stop_view"; deviceId: string };
+  | { type: "stop_view"; deviceId: string }
+  | { type: "input"; deviceId: string; event: InputEvent };
 
 // Binary video frame layout produced by src/service/main.cpp (BuildVideoFrame):
 //   [0]     u8  kind (VIDEO_FRAME_KIND = H.264 Annex B)

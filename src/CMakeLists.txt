@@ -6,6 +6,9 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     )
 endif()
 
+# For hawk-capture's manifest (capture/capture.rc).
+enable_language(RC)
+
 add_executable(hawk-service
     service/main.cpp
     service/capture_host.cpp
@@ -43,14 +46,24 @@ target_link_options(hawk-service PRIVATE -municode)
 target_set_warning(hawk-service OFF)
 
 # Standalone per-session helper: captures the desktop via DXGI Desktop
-# Duplication. Must run as an ordinary process in the interactive user's own
-# session — a Session 0 service has no desktop to see at all, so this is
-# deliberately a separate executable from hawk-service rather than a thread
-# inside it.
+# Duplication and replays the viewer's input with SendInput. Must run as an
+# ordinary process in the interactive user's own session — a Session 0
+# service has no desktop to see and no desktop to type into at all, so this
+# is deliberately a separate executable from hawk-service rather than a
+# thread inside it.
 add_executable(hawk-capture
     capture/main.cpp
     capture/duplication.cpp
     capture/encoder.cpp
+    capture/input.cpp
+    capture/desktop.cpp
+    capture/capture.rc  # embeds capture.manifest (DPI awareness, asInvoker)
+)
+
+# windres doesn't report the files an .rc pulls in, so without this an edit
+# to the manifest alone never reaches the exe.
+set_source_files_properties(capture/capture.rc PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/capture/capture.manifest"
 )
 
 target_include_directories(hawk-capture PRIVATE
@@ -60,6 +73,7 @@ target_include_directories(hawk-capture PRIVATE
 target_link_libraries(hawk-capture PRIVATE
     fmt::fmt
     spdlog::spdlog
+    user32
     d3d11
     dxgi
     dxguid

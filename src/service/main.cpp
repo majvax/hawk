@@ -27,6 +27,7 @@
 #include <variant>
 #include <vector>
 
+namespace ipc = hawk::ipc;
 namespace net = hawk::net;
 namespace svc = hawk::service;
 
@@ -72,11 +73,22 @@ struct ProofMessage {
 
 // A message from the relay. Unknown fields are ignored, so commands can grow
 // parameters without breaking this parser. `nonce` is only set on
-// "challenge", `machine_id` only on "enrolled".
+// "challenge", `machine_id` only on "enrolled", and the rest only on
+// "input", whose shape is flat: {"type":"input","kind":"key",...}. See
+// InputEvent in relay/src/protocol.rs; the relay has already clamped the
+// positions and deltas and rejected unusable ones.
 struct RelayCommand {
-    std::string type;
-    std::string nonce;
-    std::string machine_id;
+    std::string  type;
+    std::string  nonce;
+    std::string  machine_id;
+    std::string  kind;          // input: "mouse_move", "mouse_button", "wheel", "key"
+    double       x = 0.0;       // input/mouse_move: fraction of the screen, 0..=1
+    double       y = 0.0;
+    std::string  button;        // input/mouse_button: "left", "right", "middle"
+    bool         down = false;  // input/mouse_button, input/key
+    std::int32_t dx = 0;        // input/wheel: WHEEL_DELTA units, positive is up / right
+    std::int32_t dy = 0;
+    std::string  code;          // input/key: a KeyboardEvent.code, e.g. "ShiftLeft"
 };
 
 // Binary frame carrying one H.264 access unit to the relay:
@@ -107,7 +119,9 @@ struct glz::meta<ProofMessage> {
 template <>
 struct glz::meta<RelayCommand> {
     using T                     = RelayCommand;
-    static constexpr auto value = object("type", &T::type, "nonce", &T::nonce, "machine_id", &T::machine_id);
+    static constexpr auto value = object("type", &T::type, "nonce", &T::nonce, "machine_id", &T::machine_id, "kind",
+                                         &T::kind, "x", &T::x, "y", &T::y, "button", &T::button, "down", &T::down,
+                                         "dx", &T::dx, "dy", &T::dy, "code", &T::code);
 };
 
 namespace {
@@ -317,6 +331,74 @@ void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture) {
     }
 }
 
+[[nodiscard]] std::optional<ipc::InputButton> ParseMouseButton(std::string_view name) {
+    if (name == "left") {
+        return ipc::InputButton::left;
+    }
+    if (name == "right") {
+        return ipc::InputButton::right;
+    }
+    if (name == "middle") {
+        return ipc::InputButton::middle;
+    }
+    return std::nullopt;
+}
+
+// Translates one relay "input" command into a packet for hawk-capture.
+// Returns nullopt for anything this build doesn't understand — an older
+// service against a newer relay — rather than guessing at it.
+[[nodiscard]] std::optional<ipc::InputPacket> BuildInputPacket(const RelayCommand& command) {
+    ipc::InputPacket packet{};
+    if (command.kind == "mouse_move") {
+        packet.kind = static_cast<std::uint8_t>(ipc::InputKind::mouse_move);
+        packet.x = command.x;
+        packet.y = command.y;
+    } else if (command.kind == "mouse_button") {
+        const auto button = ParseMouseButton(command.button);
+        if (!button.has_value()) {
+            return std::nullopt;
+        }
+        packet.kind = static_cast<std::uint8_t>(ipc::InputKind::mouse_button);
+        packet.button = static_cast<std::uint8_t>(*button);
+        packet.down = command.down ? 1 : 0;
+    } else if (command.kind == "wheel") {
+        packet.kind = static_cast<std::uint8_t>(ipc::InputKind::wheel);
+        packet.wheel_dx = command.dx;
+        packet.wheel_dy = command.dy;
+    } else if (command.kind == "key") {
+        // The packet holds the name and its terminator. A longer name is no
+        // key on any keyboard, so there's nothing to truncate it to.
+        if (command.code.empty() || command.code.size() >= packet.code.size()) {
+            return std::nullopt;
+        }
+        packet.kind = static_cast<std::uint8_t>(ipc::InputKind::key);
+        packet.down = command.down ? 1 : 0;
+        std::ranges::copy(command.code, packet.code.begin());
+    } else {
+        return std::nullopt;
+    }
+    return packet;
+}
+
+// Hands one input event to hawk-capture, which replays it in the user's
+// session. The relay only sends these on behalf of a viewer who is watching
+// with a control role, and has already clamped the values.
+void ForwardInput(const RelayCommand& command, svc::CaptureHost& capture) {
+    if (!capture.is_running()) {
+        return;  // nobody is watching, so nobody is controlling either
+    }
+    const auto packet = BuildInputPacket(command);
+    if (!packet.has_value()) {
+        // Debug, not info: a newer relay sending a kind this build doesn't
+        // know would send it as often as a mouse moves.
+        spdlog::debug("relay: ignoring an input event this build doesn't understand (kind \"{}\")", command.kind);
+        return;
+    }
+    // Whether it landed is CaptureHost's business to log: one lost input
+    // event is never worth more than a line in the log.
+    static_cast<void>(capture.send_input(*packet));
+}
+
 // The relay accepted this connection's enrollment: make the new key and
 // machine id this PC's identity, and retire what it had before.
 void CompleteEnrollment(Session& session, const std::string& machine_id) {
@@ -357,6 +439,15 @@ void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc
         StartCapture(client, capture);
     } else if (command.type == "stop_capture") {
         capture.stop();
+    } else if (command.type == "input") {
+        ForwardInput(command, capture);
+    } else if (command.type == "release_input") {
+        // The viewer who was controlling stopped, or lost the right to:
+        // hawk-capture lets go of every key and button it pressed for them.
+        if (capture.is_running()) {
+            static_cast<void>(
+                capture.send_input(ipc::InputPacket{.kind = static_cast<std::uint8_t>(ipc::InputKind::release_all)}));
+        }
     } else {
         spdlog::info("relay: ignoring unknown command \"{}\"", command.type);
     }

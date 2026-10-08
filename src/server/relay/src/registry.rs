@@ -13,7 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 
 use crate::db::{MachineRow, Role};
-use crate::protocol::{DashboardEvent, DeviceCommand, MachineView, is_keyframe};
+use crate::protocol::{DashboardEvent, DeviceCommand, InputEvent, MachineView, is_keyframe};
 
 pub type DashboardId = u64;
 
@@ -71,6 +71,9 @@ struct Viewer {
     // Set for a new viewer and whenever its queue overflowed: a dropped
     // frame breaks every delta after it, so skip ahead to the next keyframe.
     awaiting_keyframe: bool,
+    /// This viewer has sent input, so it may have keys or buttons held down
+    /// on the machine that must be released when it stops controlling.
+    sent_input: bool,
 }
 
 struct Device {
@@ -136,8 +139,9 @@ impl Inner {
     /// capture on the device. Returns whether it was watching.
     fn detach(&mut self, dashboard: DashboardId, machine_id: &str) -> bool {
         let Some(device) = self.devices.get_mut(machine_id) else { return false };
-        if device.viewers.remove(&dashboard).is_none() {
-            return false;
+        let Some(viewer) = device.viewers.remove(&dashboard) else { return false };
+        if viewer.sent_input {
+            device.send(DeviceCommand::ReleaseInput);
         }
         if device.viewers.is_empty() {
             device.send(DeviceCommand::StopCapture);
@@ -341,6 +345,7 @@ impl Registry {
             frames: dashboard.handle.frames.clone(),
             email: dashboard.handle.email.clone(),
             awaiting_keyframe: true,
+            sent_input: false,
         };
         let Some(device) = inner.devices.get_mut(machine_id) else { return false };
         let was_idle = device.viewers.is_empty();
@@ -349,6 +354,26 @@ impl Registry {
             device.send(DeviceCommand::StartCapture);
         }
         inner.publish(machine_id);
+        true
+    }
+
+    /// Forwards input to the machine if this dashboard may control it: its
+    /// user has a control (or owner) role, and it's watching the machine
+    /// right now. Returns whether it was forwarded.
+    pub fn input(&self, dashboard_id: DashboardId, machine_id: &str, event: InputEvent) -> bool {
+        let mut inner = self.lock();
+        let may_control = inner
+            .dashboards
+            .get(&dashboard_id)
+            .and_then(|dashboard| dashboard.access.get(machine_id))
+            .is_some_and(|row| row.role >= Role::Control);
+        if !may_control {
+            return false;
+        }
+        let Some(device) = inner.devices.get_mut(machine_id) else { return false };
+        let Some(viewer) = device.viewers.get_mut(&dashboard_id) else { return false };
+        viewer.sent_input = true;
+        device.send(DeviceCommand::Input { event });
         true
     }
 
@@ -382,9 +407,23 @@ impl Registry {
             .filter(|(_, dashboard)| dashboard.handle.user_id == user_id)
             .map(|(id, _)| *id)
             .collect();
-        for id in ids {
-            if let Some(dashboard) = inner.dashboards.get_mut(&id) {
+        for id in &ids {
+            if let Some(dashboard) = inner.dashboards.get_mut(id) {
                 dashboard.access.insert(row.public_id.clone(), row.clone());
+            }
+        }
+        // Down to view only: whatever their input was holding is let go.
+        if row.role < Role::Control
+            && let Some(device) = inner.devices.get_mut(&row.public_id)
+        {
+            let mut released = false;
+            for id in &ids {
+                if let Some(viewer) = device.viewers.get_mut(id) {
+                    released |= std::mem::take(&mut viewer.sent_input);
+                }
+            }
+            if released {
+                device.send(DeviceCommand::ReleaseInput);
             }
         }
         inner.publish(&row.public_id);
@@ -430,5 +469,109 @@ impl Registry {
         for id in ids {
             inner.revoke_dashboard(id, machine_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{InputEvent, MouseButton};
+
+    const MACHINE: &str = "machine-1";
+
+    fn row(role: Role) -> MachineRow {
+        MachineRow {
+            public_id: MACHINE.to_owned(),
+            owner_id: 1,
+            owner_email: "owner@example.com".to_owned(),
+            name: "desk".to_owned(),
+            hostname: "desk".to_owned(),
+            last_seen_at: None,
+            key_storage: Some("tpm".to_owned()),
+            role,
+            share_expires_at: None,
+            single_view: false,
+        }
+    }
+
+    fn handle(user_id: i64) -> DashboardHandle {
+        let (events, _) = mpsc::unbounded_channel();
+        let (frames, _) = mpsc::channel(1);
+        DashboardHandle { events, frames, user_id, session_id: user_id, email: format!("user{user_id}@example.com") }
+    }
+
+    /// A registry with the machine connected and one dashboard of `role`
+    /// watching it, plus the receiving end of the device's commands (its
+    /// start_capture already taken off).
+    fn watching(role: Role) -> (Registry, DashboardId, mpsc::UnboundedReceiver<DeviceOutbound>) {
+        let registry = Registry::default();
+        let user_id = if role == Role::Owner { 1 } else { 2 };
+        let dashboard = registry.add_dashboard(handle(user_id), vec![row(role)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, outbound);
+        assert!(registry.start_view(dashboard, MACHINE));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StartCapture))));
+        (registry, dashboard, device_rx)
+    }
+
+    fn click() -> InputEvent {
+        InputEvent::MouseButton { button: MouseButton::Left, down: true }
+    }
+
+    #[test]
+    fn control_input_reaches_the_machine() {
+        let (registry, dashboard, mut device_rx) = watching(Role::Control);
+        assert!(registry.input(dashboard, MACHINE, click()));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::Input { .. }))));
+    }
+
+    #[test]
+    fn view_only_input_is_dropped() {
+        let (registry, dashboard, mut device_rx) = watching(Role::View);
+        assert!(!registry.input(dashboard, MACHINE, click()));
+        assert!(device_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn input_needs_an_open_view() {
+        let (registry, dashboard, mut device_rx) = watching(Role::Control);
+        registry.stop_view(dashboard, MACHINE);
+        assert!(!registry.input(dashboard, MACHINE, click()));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StopCapture))));
+    }
+
+    /// Whatever a viewer's input is holding down is let go when they stop
+    /// watching, before the machine is told to stop capturing.
+    #[test]
+    fn leaving_releases_input() {
+        let (registry, dashboard, mut device_rx) = watching(Role::Control);
+        assert!(registry.input(dashboard, MACHINE, click()));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::Input { .. }))));
+
+        registry.remove_dashboard(dashboard);
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StopCapture))));
+    }
+
+    /// Nothing to release from a viewer who never sent any input.
+    #[test]
+    fn leaving_without_input_releases_nothing() {
+        let (registry, dashboard, mut device_rx) = watching(Role::Control);
+        registry.remove_dashboard(dashboard);
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StopCapture))));
+    }
+
+    /// Dropped to view only mid-session: the keys their input was holding
+    /// are released at once, and nothing more gets through.
+    #[test]
+    fn losing_control_releases_input() {
+        let (registry, dashboard, mut device_rx) = watching(Role::Control);
+        assert!(registry.input(dashboard, MACHINE, click()));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::Input { .. }))));
+
+        registry.grant(2, &row(Role::View));
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
+        assert!(!registry.input(dashboard, MACHINE, click()));
+        assert!(device_rx.try_recv().is_err());
     }
 }

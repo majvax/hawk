@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/input_pipe.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -45,8 +47,8 @@ struct CapturePacket {
 //
 // Like WebSocketClient, no Windows type crosses this interface.
 //
-// Thread-safety: start() and stop() must be called from the same thread.
-// The PacketHandler runs on an internal reader thread.
+// Thread-safety: start(), stop() and send_input() must all be called from
+// the same thread. The PacketHandler runs on an internal reader thread.
 class CaptureHost {
 public:
     using PacketHandler = std::function<void(const CapturePacket&)>;
@@ -60,6 +62,14 @@ public:
     CaptureHost& operator=(CaptureHost&&) = delete;
 
     [[nodiscard]] std::expected<void, CaptureHostError> start(PacketHandler on_packet);
+
+    // Sends one input event to hawk-capture, which replays it into the
+    // session with SendInput. Returns false when capture isn't running, or
+    // the control pipe is gone (the reason is logged); input is best-effort,
+    // so callers have nothing to do about that but carry on. Blocks for at
+    // most a couple of seconds, and only once per run: a pipe that fails is
+    // closed until capture restarts.
+    [[nodiscard]] bool send_input(const ipc::InputPacket& packet);
 
     // Stops the reader thread and hawk-capture. Once it returns, the
     // PacketHandler is never called again. Safe to call when not running.

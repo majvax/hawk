@@ -25,6 +25,26 @@ bun run dev:relay      # terminal 1 — relay on :8080 (https/wss)
 bun run dev:frontend   # terminal 2 — dashboard on :5173, proxies to :8080
 ```
 
+### Reaching it from another computer on the LAN
+
+```sh
+bun run certs -- 192.168.1.150 my-pc   # add this PC's LAN address(es) to the cert
+bun run dev:relay:lan                  # relay on 0.0.0.0:8080 instead of 127.0.0.1
+```
+
+`bun run certs` reuses the existing key, so the pin enrolled machines check
+stays valid. Windows Firewall also has to let port 8080 in; from an elevated
+PowerShell, limited to the local subnet on Private networks:
+
+```powershell
+New-NetFirewallRule -DisplayName "Hawk relay (LAN)" -Direction Inbound -Protocol TCP -LocalPort 8080 `
+  -Action Allow -Profile Private -RemoteAddress LocalSubnet
+```
+
+The other computer then browses to `https://192.168.1.150:8080`. The cert
+is self-signed, so its browser warns until `certs/dev-cert.pem` is imported
+into that computer's trusted roots.
+
 ## Production build
 
 ```sh
@@ -101,7 +121,7 @@ An owner can share a machine with another existing account (the admin
 invites them first if they have none), with one of two roles:
 
 - **view** - can watch the screen.
-- **control** - can watch and, once input exists, send it.
+- **control** - can watch and use the machine's mouse and keyboard.
 
 The owner always has full access and sees, live, who is watching each of
 their machines. Access is enforced by the relay, not the dashboard: a
@@ -126,6 +146,32 @@ A share can also be temporary. These combine freely:
 Sharing again with the same person replaces the share's terms. A timer in
 the relay wakes at the next start or expiry, so changes land within about a
 second. Starts and ends can be at most a year away.
+
+### Input
+
+A viewer with the **control** role, and the owner, can use the machine as
+well as watch it: clicking the live screen hands it your mouse and keyboard,
+and clicking away (or **Stop controlling**) takes them back.
+
+- The dashboard sends pointer positions as a fraction of the screen, button
+  presses, wheel notches and physical keys (`KeyboardEvent.code`). Pointer
+  moves are coalesced to one per repaint.
+- The relay checks the sender's role on **every** input message, not just at
+  `start_view`: input from a `view` share, or from a dashboard that isn't
+  watching that machine at that moment, is dropped without an answer. It
+  also clamps positions and wheel deltas, rejects unusable ones, and caps
+  each dashboard at 500 events a second.
+- When a viewer stops watching, or their share drops to `view` mid-session,
+  the relay tells the machine to release whatever that viewer's input was
+  holding down. The dashboard releases it too when the screen loses focus,
+  so nothing stays pressed on the machine with nobody pressing it.
+- The machine replays events with `SendInput`, as physical scancodes and
+  absolute desktop positions — see "Input Injection" in the top-level
+  README for what that reaches and what it can't (`Ctrl+Alt+Del` and the
+  UAC prompt, among others).
+- Desktop Duplication doesn't put the machine's own mouse cursor in the
+  captured frames, so while controlling, the viewer's own pointer stands in
+  for it; someone only watching sees no pointer at all.
 
 ### Dashboard connection
 
@@ -173,8 +219,8 @@ is not pinned` and retries every 30s.
 
 Planned work on the server. Nothing below is implemented yet.
 
-- **Input.** Mouse/keyboard from the dashboard to the machine. The relay
-  will check the sender's role on every input message and drop input from a
-  `view` share.
 - **On-machine indicator.** Show something on the shared PC itself while
   anyone is watching it.
+- **The machine's cursor in the stream.** Desktop Duplication reports the
+  mouse pointer separately from the frame; compositing it in would let a
+  watcher see it too.

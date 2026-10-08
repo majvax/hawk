@@ -253,6 +253,24 @@ pre {
   border: 1px solid var(--line);
 }
 
+/* Touches on a screen that can be controlled are the machine's: left to the
+   browser, a drag turns into a scroll and cancels the press mid-way. */
+.screen.controllable {
+  touch-action: none;
+}
+
+/* The screen is taking the viewer's mouse and keyboard. The pointer stays
+   visible on purpose: the captured frames don't contain the machine's own
+   cursor, so the viewer's stands in for it. */
+.screen.controlling {
+  border-color: var(--accent);
+  outline: 1px solid var(--accent);
+}
+
+.screen:focus {
+  outline: 1px solid var(--accent);
+}
+
 .dot {
   display: inline-block;
   width: 9px;
