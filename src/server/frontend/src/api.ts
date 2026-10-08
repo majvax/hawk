@@ -78,6 +78,28 @@ export const listInvites = () => request<PendingInvite[]>("GET", "/api/admin/inv
 export const createInvite = () => request<CreatedInvite>("POST", "/api/admin/invites");
 export const deleteInvite = (id: number) => request<void>("DELETE", `/api/admin/invites/${id}`);
 
+export interface EnrollmentCode {
+  code: string; // shown once; the server keeps only its hash
+  expiresAt: number;
+}
+
+export interface Share {
+  userId: number;
+  email: string;
+  role: "view" | "control";
+}
+
+const machinePath = (id: string) => `/api/machines/${encodeURIComponent(id)}`;
+
+export const createEnrollmentCode = () => request<EnrollmentCode>("POST", "/api/machines/enroll");
+export const renameMachine = (id: string, name: string) => request<void>("PATCH", machinePath(id), { name });
+export const removeMachine = (id: string) => request<void>("DELETE", machinePath(id));
+export const listShares = (id: string) => request<Share[]>("GET", `${machinePath(id)}/shares`);
+export const shareMachine = (id: string, email: string, role: Share["role"]) =>
+  request<void>("PUT", `${machinePath(id)}/shares`, { email, role });
+export const unshareMachine = (id: string, userId: number) =>
+  request<void>("DELETE", `${machinePath(id)}/shares/${userId}`);
+
 export function inviteUrl(token: string): string {
   return `${window.location.origin}/invite/${token}`;
 }

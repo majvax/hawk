@@ -1,16 +1,25 @@
 // Mirrors relay/src/protocol.rs. Kept as a plain duplicate rather than a
 // shared package since the frontend only ever reads these shapes.
 
-export interface DeviceSnapshot {
+export type Role = "view" | "control" | "owner";
+
+// A machine as the logged-in user sees it.
+export interface Machine {
   id: string;
-  machineId: string;
-  connectedAt: string;
+  name: string;
+  hostname: string;
+  ownerEmail: string;
+  role: Role;
+  online: boolean;
+  connectedAt: string | null; // RFC 3339, while online
+  lastSeenAt: number | null; // unix seconds
+  viewers: string[] | null; // who's watching; owner only
 }
 
 export type DashboardEvent =
-  | { type: "snapshot"; devices: DeviceSnapshot[] }
-  | { type: "device_connected"; device: DeviceSnapshot }
-  | { type: "device_disconnected"; id: string }
+  | { type: "snapshot"; machines: Machine[] }
+  | { type: "machine_updated"; machine: Machine }
+  | { type: "machine_removed"; id: string }
   | { type: "capture_ended"; deviceId: string };
 
 export type DashboardCommand =

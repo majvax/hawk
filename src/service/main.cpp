@@ -1,4 +1,5 @@
 #include "capture_host.hpp"
+#include "credential_store.hpp"
 #include "websocket/websocket.hpp"
 
 #include <windows.h>
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -35,17 +37,29 @@ namespace {
 // anything beyond localhost, use a cert from a real CA instead.
 constexpr std::string_view kRelayServerUrl = "wss://127.0.0.1:8080/v1/ws";
 constexpr std::chrono::seconds kReconnectDelay{5};
+// After the relay refuses this machine (unknown credential or code), or
+// while there's nothing to identify with, retry less eagerly.
+constexpr std::chrono::seconds kRejectedRetryDelay{30};
+// RFC 6455 "policy violation": the relay's answer to an unknown machine.
+constexpr std::uint16_t kPolicyViolationCode = 1008;
 constexpr std::wstring_view kServiceName = L"HawkService";
 
+// Exactly one of `credential` / `enroll_code` is set; unset members are left
+// out of the JSON.
 struct HelloMessage {
-    std::string type = "hello";
-    std::string machine_id;
+    std::string                type = "hello";
+    std::string                machine_id;  // the hostname, shown to the owner
+    std::optional<std::string> credential;
+    std::optional<std::string> enroll_code;
 };
 
-// A command from the relay. Only `type` is read; any other fields are
-// ignored, so commands can grow parameters without breaking this parser.
+// A message from the relay. Unknown fields are ignored, so commands can grow
+// parameters without breaking this parser. `machine_id` and `credential`
+// are only set on "enrolled".
 struct RelayCommand {
     std::string type;
+    std::string machine_id;
+    std::string credential;
 };
 
 // Binary frame carrying one H.264 access unit to the relay:
@@ -62,13 +76,15 @@ constexpr std::size_t kVideoFrameHeaderSize = 10;
 template <>
 struct glz::meta<HelloMessage> {
     using T                     = HelloMessage;
-    static constexpr auto value = object("type", &T::type, "machine_id", &T::machine_id);
+    static constexpr auto value = object("type", &T::type, "machine_id", &T::machine_id, "credential",
+                                         &T::credential, "enroll_code", &T::enroll_code);
 };
 
 template <>
 struct glz::meta<RelayCommand> {
     using T                     = RelayCommand;
-    static constexpr auto value = object("type", &T::type);
+    static constexpr auto value =
+        object("type", &T::type, "machine_id", &T::machine_id, "credential", &T::credential);
 };
 
 namespace {
@@ -107,12 +123,34 @@ void InitLogging() {
     }
 }
 
-[[nodiscard]] std::string BuildHelloMessage() {
+// How this machine identifies itself to the relay: a pending enrollment
+// code wins over a stored credential (that's how a machine is re-enrolled).
+// Nothing at all means it was never enrolled.
+struct Identity {
+    std::optional<std::string> credential;
+    std::optional<std::string> enroll_code;
+};
+
+[[nodiscard]] std::optional<Identity> LoadIdentity() {
+    if (auto code = svc::load_enroll_code(); code.has_value()) {
+        return Identity{.credential = std::nullopt, .enroll_code = std::move(code)};
+    }
+    if (auto credential = svc::load_credential(); credential.has_value()) {
+        return Identity{.credential = std::move(credential), .enroll_code = std::nullopt};
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::string BuildHelloMessage(Identity identity) {
     std::array<char, MAX_COMPUTERNAME_LENGTH + 1> name_buffer{};
     auto name_length = static_cast<DWORD>(name_buffer.size());
     GetComputerNameA(name_buffer.data(), &name_length);
 
-    HelloMessage hello{.machine_id = std::string(name_buffer.data(), name_length)};
+    HelloMessage hello{
+        .machine_id = std::string(name_buffer.data(), name_length),
+        .credential = std::move(identity.credential),
+        .enroll_code = std::move(identity.enroll_code),
+    };
     if (auto json = glz::write_json(hello); json.has_value()) {
         return *json;
     }
@@ -157,7 +195,17 @@ void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc
         return;
     }
 
-    if (command.type == "start_capture") {
+    if (command.type == "enrolled") {
+        // The code is spent either way; only the credential works from now on.
+        if (svc::save_credential(command.credential)) {
+            svc::delete_enroll_code();
+            spdlog::info("relay: enrolled as machine {}", command.machine_id);
+        } else {
+            spdlog::error("relay: enrolled as machine {}, but the credential couldn't be saved; "
+                          "remove the machine in the dashboard and enroll it again",
+                          command.machine_id);
+        }
+    } else if (command.type == "start_capture") {
         StartCapture(client, capture);
     } else if (command.type == "stop_capture") {
         capture.stop();
@@ -166,25 +214,33 @@ void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc
     }
 }
 
-// Handles one received message. Returns true if the connection should be
-// treated as over (no immediate reconnect attempt) rather than retried.
-[[nodiscard]] bool HandleRelayMessage(const net::WebSocketMessage& message, net::WebSocketClient& client,
-                                      svc::CaptureHost& capture) {
+// Handles one received message. Returns the close code once the relay has
+// closed the connection, nullopt while it stays open.
+[[nodiscard]] std::optional<std::uint16_t> HandleRelayMessage(const net::WebSocketMessage& message,
+                                                              net::WebSocketClient& client, svc::CaptureHost& capture) {
     return std::visit(
-        [&]<typename T>(const T& payload) -> bool {
+        [&]<typename T>(const T& payload) -> std::optional<std::uint16_t> {
             if constexpr (std::is_same_v<T, std::string>) {
                 HandleRelayCommand(payload, client, capture);
-                return false;
+                return std::nullopt;
             } else if constexpr (std::is_same_v<T, std::vector<std::byte>>) {
                 spdlog::info("relay: received binary message ({} bytes)", payload.size());
-                return false;
+                return std::nullopt;
             } else {
                 spdlog::info("relay: server closed the connection (code={}, reason=\"{}\")", payload.code,
                              payload.reason);
-                return true;
+                return payload.code;
             }
         },
         message);
+}
+
+// Sleeps for `duration`, waking early if the service is stopping.
+void SleepUnlessStopped(const std::stop_token& stop_token, std::chrono::seconds duration) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (!stop_token.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
 }
 
 void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClient*>& active_client) {
@@ -193,29 +249,42 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
     // thread sends through `client`.
     svc::CaptureHost capture;
 
+    bool warned_not_enrolled = false;
     while (!stop_token.stop_requested()) {
+        auto identity = LoadIdentity();
+        if (!identity.has_value()) {
+            if (!warned_not_enrolled) {
+                spdlog::warn("relay: this machine isn't enrolled. Create an enrollment code in the dashboard "
+                             "(Machines > Add machine) and reinstall with install-service.ps1 -EnrollCode <code>");
+                warned_not_enrolled = true;
+            }
+            SleepUnlessStopped(stop_token, kRejectedRetryDelay);
+            continue;
+        }
+        warned_not_enrolled = false;
+
         if (auto connected = client.connect(kRelayServerUrl); !connected.has_value()) {
             spdlog::error("relay: connect failed: {}", net::to_string(connected.error()));
-            std::this_thread::sleep_for(kReconnectDelay);
+            SleepUnlessStopped(stop_token, kReconnectDelay);
             continue;
         }
 
         spdlog::info("relay: connected to {}", kRelayServerUrl);
         active_client.store(&client);
 
-        if (auto sent = client.send_text(BuildHelloMessage()); !sent.has_value()) {
+        if (auto sent = client.send_text(BuildHelloMessage(std::move(*identity))); !sent.has_value()) {
             spdlog::warn("relay: failed to send hello message: {}", net::to_string(sent.error()));
         }
 
-        bool peer_closed = false;
+        std::optional<std::uint16_t> close_code;
         while (!stop_token.stop_requested()) {
             auto message = client.receive();
             if (!message.has_value()) {
                 spdlog::warn("relay: receive failed: {}", net::to_string(message.error()));
                 break;
             }
-            if (HandleRelayMessage(*message, client, capture)) {
-                peer_closed = true;
+            close_code = HandleRelayMessage(*message, client, capture);
+            if (close_code.has_value()) {
                 break;
             }
         }
@@ -226,8 +295,13 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         active_client.store(nullptr);
         client.close();
 
-        if (!stop_token.stop_requested() && !peer_closed) {
-            std::this_thread::sleep_for(kReconnectDelay);
+        if (close_code == kPolicyViolationCode) {
+            spdlog::warn("relay: the relay refused this machine (removed, owner disabled, or an invalid "
+                         "enrollment code); retrying in {}s",
+                         kRejectedRetryDelay.count());
+            SleepUnlessStopped(stop_token, kRejectedRetryDelay);
+        } else if (!close_code.has_value()) {
+            SleepUnlessStopped(stop_token, kReconnectDelay);
         }
     }
 

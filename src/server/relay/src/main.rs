@@ -5,6 +5,7 @@ mod api;
 mod auth;
 mod db;
 mod error;
+mod machines;
 mod protocol;
 mod registry;
 mod routes;
@@ -165,7 +166,10 @@ async fn main() -> Result<(), String> {
         .route("/api/admin/users/{id}/disabled", post(api::set_user_disabled))
         .route("/api/admin/invites", get(api::list_invites).post(api::create_invite))
         .route("/api/admin/invites/{id}", delete(api::delete_invite))
-        .route("/api/devices", get(routes::devices))
+        .route("/api/machines/enroll", post(machines::create_enrollment_code))
+        .route("/api/machines/{id}", delete(machines::remove).patch(machines::rename))
+        .route("/api/machines/{id}/shares", get(machines::list_shares).put(machines::share))
+        .route("/api/machines/{id}/shares/{user_id}", delete(machines::unshare))
         .route("/v1/ws", get(routes::device_socket))
         .route("/v1/dashboard", get(routes::dashboard_socket))
         .fallback_service(frontend)

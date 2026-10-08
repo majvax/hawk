@@ -50,9 +50,9 @@ Accounts are invite-only; there is no open sign-up.
 - **Inviting:** the admin creates single-use invite links (valid 7 days) in
   the dashboard's Admin tab, and can revoke unused ones.
 - **Admin:** lists users and can disable/enable them. Disabling ends the
-  user's sessions and closes their open dashboards immediately. Being admin
-  does not grant access to other people's machines (once machines have
-  owners; see the roadmap).
+  user's sessions, closes their open dashboards and disconnects the
+  machines they own, immediately. Being admin does not grant access to
+  other people's machines.
 - Passwords: argon2id, at least 10 characters. Session and invite tokens are
   32 random bytes; the database stores only their SHA-256.
 - Sessions: `hawk_session` cookie, `HttpOnly`, `SameSite=Strict`, `Secure`
@@ -62,8 +62,39 @@ Accounts are invite-only; there is no open sign-up.
 - Failed logins are throttled per client IP (10 per 15 minutes). Behind a
   reverse proxy all clients share the proxy's IP, so this is a coarse brake.
 
-Until machines have owners, connected devices are visible to the **admin
-only**; other accounts can log in but see no machines.
+## Machines
+
+Every machine has exactly one owner and its own credential.
+
+- **Enrolling:** in the dashboard, **Machines > Add machine** issues a
+  one-time enrollment code (like `7K3QD-WX2MP`, valid 1 hour). Install the
+  service on the PC with `install-service.ps1 -EnrollCode <code>` (see
+  `scripts/README.md`). On its first connect the service trades the code for
+  a long-lived per-machine credential; the relay stores only its hash.
+- **Connecting:** the service's hello carries that credential. An unknown,
+  missing or removed credential, a spent or expired code, or a disabled
+  owner closes the socket with `1008` (policy violation) before the machine
+  is registered.
+- **Removing** a machine (owner only) invalidates its credential,
+  disconnects it, and takes it away from everyone it was shared with. To
+  bring it back, or move it to another account, enroll it again.
+- Live connections are keyed by machine, so the dashboard also lists your
+  machines while they're offline, with when they were last seen.
+
+### Sharing
+
+An owner can share a machine with another existing account (the admin
+invites them first if they have none), with one of two roles:
+
+- **view** - can watch the screen.
+- **control** - can watch and, once input exists, send it.
+
+The owner always has full access and sees, live, who is watching each of
+their machines. Access is enforced by the relay, not the dashboard: a
+dashboard only ever learns about machines its user can access, and every
+`start_view` is checked. Granting, changing or revoking a share, renaming
+or removing a machine all apply to open dashboards immediately; a revoked
+viewer's stream stops at once.
 
 ## TLS
 
@@ -84,49 +115,11 @@ for an actual domain pointed at this server.
 
 ## Roadmap
 
-Planned work on the server, in rough order. Nothing below is implemented yet.
+Planned work on the server. Nothing below is implemented yet.
 
-### Machines and enrollment
-
-Every machine has exactly one owner, and its own credential.
-
-- The owner enrolls a PC from the dashboard, which issues a one-time
-  enrollment code. hawk-service exchanges it for a long-lived per-machine
-  credential (random, only its hash stored server-side).
-- The service sends that credential in its hello. An unknown, missing or
-  revoked credential closes the socket with code `1008` (policy violation)
-  before the device is ever added to the registry.
-- Removing a machine revokes its credential and disconnects it.
-
-### Sharing and permissions
-
-An owner can share a machine with another account (inviting them first if
-they have none), with one of two roles:
-
-- **view** — can watch the screen. Nothing it sends can act on the machine.
-- **control** — can watch and send input.
-
-The owner always has full access. Permissions are enforced by the relay, not
-the dashboard: it checks the role on every `start_view` and on every input
-message, and drops input from a `view` share. Revoking a share disconnects
-that user's live view immediately.
-
-### Multiple viewers
-
-Several dashboards can watch one machine at once (already supported by the
-registry). With accounts, the relay knows who each viewer is, so:
-
-- the owner can see who is currently watching each machine;
-- the machine itself shows an indicator while anyone is viewing it.
-
-### Dashboard: tabs and layout
-
-The single table becomes a small tabbed app with a sharp-edged, dark,
-professional look — no rounded corners anywhere (`border-radius: 0`).
-
-- **Machines** — machines you own and machines shared with you, each row
-  showing online/offline status, hostname, last-seen time and your role.
-- **Sharing** — per owned machine: who has access, with which role; invite
-  or revoke.
-- **Settings** — account email, password, enrolled machines, logout. The
-  admin also sees account management here.
+- **Input.** Mouse/keyboard from the dashboard to the machine. The relay
+  will check the sender's role on every input message and drop input from a
+  `view` share.
+- **On-machine indicator.** Show something on the shared PC itself while
+  anyone is watching it.
+- **Settings tab.** Change password, list your sessions.

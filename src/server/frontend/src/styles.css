@@ -163,6 +163,76 @@ th {
   color: var(--muted);
 }
 
+.grow {
+  flex: 1;
+  margin: 0;
+}
+
+.align-end {
+  align-self: flex-end;
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.panel {
+  padding: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  gap: 16px;
+}
+
+.share-form {
+  margin-top: 8px;
+}
+
+.share-form input {
+  max-width: 320px;
+}
+
+select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 6px 8px;
+  font: inherit;
+}
+
+button.danger {
+  color: var(--danger);
+}
+
+button.danger:hover {
+  border-color: var(--danger);
+}
+
+.badge {
+  padding: 2px 8px;
+  border: 1px solid var(--muted);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.code {
+  font-family: ui-monospace, monospace;
+  font-size: 16px;
+  letter-spacing: 1px;
+  color: var(--text);
+}
+
+pre {
+  margin: 8px 0;
+  padding: 8px;
+  overflow-x: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
 .error {
   color: var(--danger);
   margin: 0;

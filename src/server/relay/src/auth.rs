@@ -43,6 +43,36 @@ pub fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
+pub const ENROLLMENT_TTL: time::Duration = time::Duration::hours(1);
+
+/// Crockford base32: no I, L, O or U, so a code read aloud or typed by hand
+/// survives.
+const ENROLLMENT_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A one-time code for enrolling a machine, like `7K3QD-WX2MP`: 50 random
+/// bits, short enough to type into the PC being enrolled. Single-use and
+/// short-lived, so it doesn't need a full token's length.
+pub fn enrollment_code() -> String {
+    let mut bytes = [0u8; 10];
+    getrandom::fill(&mut bytes).expect("OS random number generator unavailable");
+    let symbols: String = bytes.iter().map(|byte| ENROLLMENT_ALPHABET[usize::from(byte & 0x1f)] as char).collect();
+    format!("{}-{}", &symbols[..5], &symbols[5..])
+}
+
+/// Hash of the code's canonical form, so `7k3qd wx2mp` matches `7K3QD-WX2MP`.
+pub fn enrollment_code_hash(code: &str) -> Vec<u8> {
+    let canonical: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            other => other,
+        })
+        .collect();
+    token_hash(&canonical)
+}
+
 /// argon2id with the crate's default parameters and a random salt. CPU
 /// heavy: call from the blocking pool.
 pub fn hash_password(password: &str) -> Result<String, ApiError> {

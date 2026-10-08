@@ -12,14 +12,24 @@ Windows machine you are capturing, not the relay host.
 
 ## Typical flow
 
+In the dashboard, open **Machines → Add machine** to get a one-time
+enrollment code (valid for an hour), then on the PC:
+
 ```powershell
 # from the repo root, after building into bin\
-powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1 -EnrollCode 7K3QD-WX2MP
 ```
 
-The service then connects to the relay (`wss://127.0.0.1:8080/v1/ws` by
-default — see `kRelayServerUrl` in `src/service/main.cpp`) and waits for a
-`start_capture` command. It launches `hawk-capture.exe` into the logged-on
+The service connects to the relay (`wss://127.0.0.1:8080/v1/ws` by
+default — see `kRelayServerUrl` in `src/service/main.cpp`), trades the code
+for this machine's own credential, and from then on appears under your
+account. The credential is kept in `C:\ProgramData\HawkService\credential.bin`,
+encrypted with DPAPI for the SYSTEM account only; the code file is deleted
+once used. Reinstalling an enrolled machine doesn't need `-EnrollCode`; to
+move a machine to another account, remove it in the dashboard and enroll it
+again with a new code.
+
+Once enrolled, the service waits for a `start_capture` command. It launches `hawk-capture.exe` into the logged-on
 user's session on demand, so a user must be signed in at the console for
 capture to start.
 

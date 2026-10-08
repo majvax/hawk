@@ -3,7 +3,7 @@ import { type RefObject, useCallback, useEffect, useRef, useState } from "react"
 import {
   type DashboardCommand,
   type DashboardEvent,
-  type DeviceSnapshot,
+  type Machine,
   parseVideoFrame,
 } from "./protocol.js";
 
@@ -14,8 +14,12 @@ export type ConnectionStatus = "connecting" | "open" | "closed";
 // SPS/PPS inline on keyframes, so no description is needed out of band.
 const DECODER_CODEC = "avc1.4D402A";
 
+function sortByName(machines: Machine[]): Machine[] {
+  return [...machines].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 export interface Dashboard {
-  devices: DeviceSnapshot[];
+  machines: Machine[];
   status: ConnectionStatus;
   viewingId: string | null;
   // Attach to the <canvas> that frames are drawn into.
@@ -31,7 +35,7 @@ export function useDashboard(onClosed: () => void): Dashboard {
   const onClosedRef = useRef(onClosed);
   onClosedRef.current = onClosed;
 
-  const [devices, setDevices] = useState<DeviceSnapshot[]>([]);
+  const [machines, setMachines] = useState<Machine[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [viewingId, setViewingId] = useState<string | null>(null);
 
@@ -128,13 +132,15 @@ export function useDashboard(onClosed: () => void): Dashboard {
       const payload = JSON.parse(event.data as string) as DashboardEvent;
       switch (payload.type) {
         case "snapshot":
-          setDevices(payload.devices);
+          setMachines(sortByName(payload.machines));
           break;
-        case "device_connected":
-          setDevices((prev) => [...prev, payload.device]);
+        case "machine_updated":
+          setMachines((prev) =>
+            sortByName([...prev.filter((machine) => machine.id !== payload.machine.id), payload.machine]),
+          );
           break;
-        case "device_disconnected":
-          setDevices((prev) => prev.filter((device) => device.id !== payload.id));
+        case "machine_removed":
+          setMachines((prev) => prev.filter((machine) => machine.id !== payload.id));
           if (viewingRef.current === payload.id) {
             viewingRef.current = null;
             setViewingId(null);
@@ -180,5 +186,5 @@ export function useDashboard(onClosed: () => void): Dashboard {
     teardownDecoder();
   }, [send, teardownDecoder]);
 
-  return { devices, status, viewingId, canvasRef, startView, stopView };
+  return { machines, status, viewingId, canvasRef, startView, stopView };
 }

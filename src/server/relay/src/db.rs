@@ -34,6 +34,31 @@ const MIGRATIONS: &[&str] = &["
         used_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
         used_at      INTEGER
     );
+", "
+    CREATE TABLE machines (
+        id              INTEGER PRIMARY KEY,
+        public_id       TEXT    NOT NULL UNIQUE,   -- what dashboards and the API use
+        owner_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name            TEXT    NOT NULL,          -- set by the owner; defaults to hostname
+        hostname        TEXT    NOT NULL,          -- as last reported by the machine
+        credential_hash BLOB    NOT NULL UNIQUE,   -- SHA-256 of the machine's credential
+        created_at      INTEGER NOT NULL,
+        last_seen_at    INTEGER
+    );
+    CREATE TABLE enrollment_codes (
+        id         INTEGER PRIMARY KEY,
+        code_hash  BLOB    NOT NULL UNIQUE,
+        owner_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    CREATE TABLE machine_shares (
+        machine_id INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role       TEXT    NOT NULL CHECK (role IN ('view', 'control')),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (machine_id, user_id)
+    );
 "];
 
 #[derive(Clone)]
@@ -278,5 +303,271 @@ pub fn redeem_invite(
 pub fn purge_expired(conn: &Connection, now: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?;
     conn.execute("DELETE FROM invites WHERE used_by IS NULL AND expires_at <= ?1", [now])?;
+    conn.execute("DELETE FROM enrollment_codes WHERE expires_at <= ?1", [now])?;
     Ok(())
+}
+
+pub fn find_user_id_by_email(conn: &Connection, email: &str) -> rusqlite::Result<Option<i64>> {
+    conn.query_row("SELECT id FROM users WHERE email = ?1", [email], |row| row.get(0)).optional()
+}
+
+// ---- machines -------------------------------------------------------------
+
+/// What a user may do with a machine. Ordered: each role includes the ones
+/// before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    View,
+    Control,
+    Owner,
+}
+
+impl Role {
+    fn from_sql(text: &str) -> Self {
+        match text {
+            "owner" => Self::Owner,
+            "control" => Self::Control,
+            _ => Self::View,
+        }
+    }
+
+    /// The value stored in machine_shares.role (never "owner").
+    fn share_str(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Control | Self::Owner => "control",
+        }
+    }
+}
+
+/// A machine as one particular user sees it.
+#[derive(Debug, Clone)]
+pub struct MachineRow {
+    pub public_id: String,
+    pub owner_id: i64,
+    pub owner_email: String,
+    pub name: String,
+    pub hostname: String,
+    pub last_seen_at: Option<i64>,
+    pub role: Role,
+}
+
+/// The machine behind an authenticated device connection.
+#[derive(Debug, Clone)]
+pub struct MachineAuth {
+    pub public_id: String,
+    pub owner_id: i64,
+}
+
+pub struct ShareRow {
+    pub user_id: i64,
+    pub email: String,
+    pub role: Role,
+}
+
+pub fn create_enrollment_code(
+    conn: &Connection,
+    code_hash: &[u8],
+    owner_id: i64,
+    now: i64,
+    expires_at: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO enrollment_codes (code_hash, owner_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        params![code_hash, owner_id, now, expires_at],
+    )?;
+    Ok(())
+}
+
+/// Consumes an enrollment code and registers the machine under the code's
+/// owner, in one transaction. None if the code is unknown, used, expired, or
+/// its owner is disabled.
+pub fn enroll_machine(
+    conn: &Connection,
+    code_hash: &[u8],
+    public_id: &str,
+    hostname: &str,
+    credential_hash: &[u8],
+    now: i64,
+) -> rusqlite::Result<Option<MachineAuth>> {
+    let tx = conn.unchecked_transaction()?;
+    let code = tx
+        .query_row(
+            "SELECT c.id, c.owner_id FROM enrollment_codes c JOIN users u ON u.id = c.owner_id
+              WHERE c.code_hash = ?1 AND c.expires_at > ?2 AND u.disabled = 0",
+            params![code_hash, now],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((code_id, owner_id)) = code else { return Ok(None) };
+    tx.execute("DELETE FROM enrollment_codes WHERE id = ?1", [code_id])?;
+    tx.execute(
+        "INSERT INTO machines (public_id, owner_id, name, hostname, credential_hash, created_at, last_seen_at)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?5)",
+        params![public_id, owner_id, hostname, credential_hash, now],
+    )?;
+    tx.commit()?;
+    Ok(Some(MachineAuth { public_id: public_id.to_owned(), owner_id }))
+}
+
+/// Looks a device up by its credential (its owner must not be disabled) and
+/// records its current hostname and that it was seen now.
+pub fn authenticate_machine(
+    conn: &Connection,
+    credential_hash: &[u8],
+    hostname: &str,
+    now: i64,
+) -> rusqlite::Result<Option<MachineAuth>> {
+    let found = conn
+        .query_row(
+            "SELECT m.public_id, m.owner_id FROM machines m JOIN users u ON u.id = m.owner_id
+              WHERE m.credential_hash = ?1 AND u.disabled = 0",
+            [credential_hash],
+            |row| Ok(MachineAuth { public_id: row.get(0)?, owner_id: row.get(1)? }),
+        )
+        .optional()?;
+    if let Some(machine) = &found {
+        conn.execute(
+            "UPDATE machines SET hostname = ?1, last_seen_at = ?2 WHERE public_id = ?3",
+            params![hostname, now, machine.public_id],
+        )?;
+    }
+    Ok(found)
+}
+
+pub fn touch_machine(conn: &Connection, public_id: &str, now: i64) -> rusqlite::Result<()> {
+    conn.execute("UPDATE machines SET last_seen_at = ?1 WHERE public_id = ?2", params![now, public_id])?;
+    Ok(())
+}
+
+fn machine_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRow> {
+    Ok(MachineRow {
+        public_id: row.get(0)?,
+        owner_id: row.get(1)?,
+        owner_email: row.get(2)?,
+        name: row.get(3)?,
+        hostname: row.get(4)?,
+        last_seen_at: row.get(5)?,
+        role: Role::from_sql(&row.get::<_, String>(6)?),
+    })
+}
+
+/// Every machine the user owns or has been shared, with their role on it.
+/// Shares of a disabled owner's machines are left out.
+pub fn accessible_machines(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<MachineRow>> {
+    let mut statement = conn.prepare(
+        "SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, 'owner'
+           FROM machines m JOIN users o ON o.id = m.owner_id
+          WHERE m.owner_id = ?1
+         UNION ALL
+         SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, s.role
+           FROM machine_shares s
+           JOIN machines m ON m.id = s.machine_id
+           JOIN users o ON o.id = m.owner_id
+          WHERE s.user_id = ?1 AND o.disabled = 0
+         ORDER BY 4",
+    )?;
+    statement.query_map([user_id], machine_from_row)?.collect()
+}
+
+/// One machine as `user_id` sees it, if they have any access to it.
+pub fn machine_for_user(conn: &Connection, public_id: &str, user_id: i64) -> rusqlite::Result<Option<MachineRow>> {
+    Ok(accessible_machines(conn, user_id)?.into_iter().find(|machine| machine.public_id == public_id))
+}
+
+/// The machine's internal id, if `owner_id` owns it.
+fn owned_machine_id(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM machines WHERE public_id = ?1 AND owner_id = ?2",
+        params![public_id, owner_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Users the machine is shared with (internal machine id).
+fn shared_user_ids(conn: &Connection, machine_id: i64) -> rusqlite::Result<Vec<i64>> {
+    conn.prepare("SELECT user_id FROM machine_shares WHERE machine_id = ?1")?
+        .query_map([machine_id], |row| row.get(0))?
+        .collect()
+}
+
+/// Renames an owned machine. Returns the users it's shared with (who need
+/// the update too), or None if `owner_id` doesn't own it.
+pub fn rename_machine(
+    conn: &Connection,
+    public_id: &str,
+    owner_id: i64,
+    name: &str,
+) -> rusqlite::Result<Option<Vec<i64>>> {
+    let Some(machine_id) = owned_machine_id(conn, public_id, owner_id)? else { return Ok(None) };
+    conn.execute("UPDATE machines SET name = ?1 WHERE id = ?2", params![name, machine_id])?;
+    shared_user_ids(conn, machine_id).map(Some)
+}
+
+/// Deletes an owned machine (its shares go by cascade). Returns false if
+/// `owner_id` doesn't own it.
+pub fn delete_machine(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM machines WHERE public_id = ?1 AND owner_id = ?2", params![public_id, owner_id])? > 0)
+}
+
+/// Who an owned machine is shared with; None if `owner_id` doesn't own it.
+pub fn list_shares(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlite::Result<Option<Vec<ShareRow>>> {
+    let Some(machine_id) = owned_machine_id(conn, public_id, owner_id)? else { return Ok(None) };
+    let mut statement = conn.prepare(
+        "SELECT u.id, u.email, s.role FROM machine_shares s JOIN users u ON u.id = s.user_id
+          WHERE s.machine_id = ?1 ORDER BY u.email",
+    )?;
+    let shares = statement
+        .query_map([machine_id], |row| {
+            Ok(ShareRow { user_id: row.get(0)?, email: row.get(1)?, role: Role::from_sql(&row.get::<_, String>(2)?) })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(shares))
+}
+
+pub enum ShareError {
+    NotOwner,
+    NoSuchUser,
+    SelfShare,
+    Db(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for ShareError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+/// Grants (or changes) the role of the account with `email` on an owned
+/// machine. Returns that account's user id.
+pub fn upsert_share(
+    conn: &Connection,
+    public_id: &str,
+    owner_id: i64,
+    email: &str,
+    role: Role,
+    now: i64,
+) -> Result<i64, ShareError> {
+    let machine_id = owned_machine_id(conn, public_id, owner_id)?.ok_or(ShareError::NotOwner)?;
+    let user_id = find_user_id_by_email(conn, email)?.ok_or(ShareError::NoSuchUser)?;
+    if user_id == owner_id {
+        return Err(ShareError::SelfShare);
+    }
+    conn.execute(
+        "INSERT INTO machine_shares (machine_id, user_id, role, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (machine_id, user_id) DO UPDATE SET role = excluded.role",
+        params![machine_id, user_id, role.share_str(), now],
+    )?;
+    Ok(user_id)
+}
+
+/// Returns false if `owner_id` doesn't own the machine or it wasn't shared
+/// with `user_id`.
+pub fn delete_share(conn: &Connection, public_id: &str, owner_id: i64, user_id: i64) -> rusqlite::Result<bool> {
+    let Some(machine_id) = owned_machine_id(conn, public_id, owner_id)? else { return Ok(false) };
+    let deleted =
+        conn.execute("DELETE FROM machine_shares WHERE machine_id = ?1 AND user_id = ?2", params![machine_id, user_id])?;
+    Ok(deleted > 0)
 }

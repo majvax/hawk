@@ -16,10 +16,17 @@
 .PARAMETER BinPath
     Path to hawk-service.exe. Defaults to ..\bin\hawk-service.exe relative to
     this script.
+
+.PARAMETER EnrollCode
+    One-time enrollment code from the dashboard (Machines > Add machine),
+    e.g. 7K3QD-WX2MP. Needed the first time, or to re-enroll a machine that
+    was removed. The service uses it once to get this machine's credential,
+    then deletes it. Omit it when reinstalling an already enrolled machine.
 #>
 [CmdletBinding()]
 param(
-    [string]$BinPath = (Join-Path $PSScriptRoot "..\bin\hawk-service.exe")
+    [string]$BinPath = (Join-Path $PSScriptRoot "..\bin\hawk-service.exe"),
+    [string]$EnrollCode
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +54,13 @@ sc.exe create $ServiceName binPath= "`"$BinPath`"" start= auto obj= LocalSystem 
 if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed with exit code $LASTEXITCODE" }
 
 sc.exe description $ServiceName "Hawk remote desktop background service." | Out-Null
+
+if ($EnrollCode) {
+    $DataDir = Join-Path $env:ProgramData "HawkService"
+    New-Item -ItemType Directory -Force $DataDir | Out-Null
+    Set-Content -Path (Join-Path $DataDir "enroll-code.txt") -Value $EnrollCode.Trim() -NoNewline -Encoding ascii
+    Write-Host "Enrollment code saved; the service will enroll this machine on its next connect."
+}
 
 Write-Host "Starting service '$ServiceName'"
 sc.exe start $ServiceName | Out-Null
