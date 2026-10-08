@@ -43,8 +43,10 @@ export interface RemoteInput {
 // (the relay also tells it to let go when a viewer stops watching).
 //
 // What the browser keeps for itself can't be forwarded: Ctrl+W, Ctrl+N,
-// Alt+Tab and the like reach the viewer's own machine, and Ctrl+Alt+Del is
-// the secure attention sequence, which nothing but Windows itself can send.
+// Alt+Tab and the like reach the viewer's own machine (unless the viewer
+// has a keyboard lock, which the dashboard takes in full screen), and
+// Ctrl+Alt+Del is the secure attention sequence, which nothing but Windows
+// itself can send.
 export function useRemoteInput(
   canvasRef: RefObject<HTMLCanvasElement>,
   enabled: boolean,

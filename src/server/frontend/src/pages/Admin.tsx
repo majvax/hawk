@@ -13,10 +13,11 @@ import {
   listUsers,
   setUserDisabled,
 } from "../api.js";
+import { Alert, CodeBlock, ConfirmButton, Dot, Metric, Tag, errorMessage } from "../ui.js";
 
 export function AdminPage({ me }: { me: User }): JSX.Element {
-  const [users, setUsers] = useState<AdminUserRow[]>([]);
-  const [invites, setInvites] = useState<PendingInvite[]>([]);
+  const [users, setUsers] = useState<AdminUserRow[] | null>(null);
+  const [invites, setInvites] = useState<PendingInvite[] | null>(null);
   const [created, setCreated] = useState<CreatedInvite | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -26,7 +27,7 @@ export function AdminPage({ me }: { me: User }): JSX.Element {
       setUsers(nextUsers);
       setInvites(nextInvites);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "failed to load");
+      setError(errorMessage(caught, "failed to load"));
     }
   }, []);
 
@@ -39,95 +40,157 @@ export function AdminPage({ me }: { me: User }): JSX.Element {
     try {
       await action();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "request failed");
+      setError(errorMessage(caught));
     }
     await refresh();
   };
 
-  return (
-    <div className="stack">
-      {error !== null && <p className="error">{error}</p>}
+  const active = users?.filter((user) => !user.disabled).length ?? 0;
+  const admins = users?.filter((user) => user.isAdmin).length ?? 0;
 
-      <section>
-        <div className="row">
-          <h2>Invites</h2>
-          <button type="button" onClick={run(async () => setCreated(await createInvite()))}>
-            New invite link
-          </button>
+  return (
+    <div className="page">
+      <div className="page-head">
+        <h1>Admin</h1>
+      </div>
+      <div className="strip" style={{ marginBottom: 4 }}>
+        <Metric label="Users">{users?.length ?? "—"}</Metric>
+        <Metric label="Active">{users === null ? "—" : active}</Metric>
+        <Metric label="Disabled" dim={users === null || users.length === active}>
+          {users === null ? "—" : users.length - active}
+        </Metric>
+        <Metric label="Admins">{users === null ? "—" : admins}</Metric>
+        <Metric label="Pending invites" dim={invites === null || invites.length === 0}>
+          {invites?.length ?? "—"}
+        </Metric>
+      </div>
+      {error !== null && (
+        <div style={{ paddingTop: 16 }}>
+          <Alert>{error}</Alert>
         </div>
-        {created !== null && (
-          <div className="notice">
-            <p>Send this link to the person you're inviting. It works once and expires {formatTime(created.expiresAt)}.
-            It won't be shown again.</p>
-            <div className="row">
-              <input readOnly value={inviteUrl(created.token)} onFocus={(e) => e.target.select()} />
-              <button type="button" onClick={() => void navigator.clipboard.writeText(inviteUrl(created.token))}>
-                Copy
-              </button>
-              <button type="button" onClick={() => setCreated(null)}>
-                Done
-              </button>
-            </div>
+      )}
+
+      <section className="section" style={{ marginTop: 16 }}>
+        <div className="section-aside">
+          <h2>Invites</h2>
+          <p>Accounts are by invitation only. Each link creates one account, once.</p>
+        </div>
+        <div className="section-main">
+          <div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={run(async () => setCreated(await createInvite()))}
+            >
+              New invite link
+            </button>
           </div>
-        )}
-        {invites.length === 0 ? (
-          <p className="muted">No pending invites.</p>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Created</th>
-                <th>Expires</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {invites.map((invite) => (
-                <tr key={invite.id}>
-                  <td>{formatTime(invite.createdAt)}</td>
-                  <td>{formatTime(invite.expiresAt)}</td>
-                  <td>
-                    <button type="button" onClick={run(() => deleteInvite(invite.id))}>
-                      Revoke
-                    </button>
-                  </td>
+          {created !== null && (
+            <div className="enroll" style={{ margin: 0 }}>
+              <div className="block-head">
+                <span className="prose" style={{ flex: 1, maxWidth: "none" }}>
+                  Send this link to the person you're inviting. It works once and expires at{" "}
+                  <span className="num">{formatTime(created.expiresAt)}</span>. It won't be shown again.
+                </span>
+                <button type="button" className="btn btn-sm" onClick={() => setCreated(null)}>
+                  Done
+                </button>
+              </div>
+              <CodeBlock value={inviteUrl(created.token)} />
+            </div>
+          )}
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Created</th>
+                  <th>Expires</th>
+                  <th />
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+              </thead>
+              <tbody>
+                {invites !== null && invites.length === 0 && (
+                  <tr>
+                    <td colSpan={3} className="muted">
+                      No pending invites.
+                    </td>
+                  </tr>
+                )}
+                {invites?.map((invite) => (
+                  <tr key={invite.id}>
+                    <td className="num">{formatTime(invite.createdAt)}</td>
+                    <td className="num muted">{formatTime(invite.expiresAt)}</td>
+                    <td className="actions">
+                      <ConfirmButton small confirmLabel="Confirm" onConfirm={() => void run(() => deleteInvite(invite.id))()}>
+                        Revoke
+                      </ConfirmButton>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
-      <section>
-        <h2>Users</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Email</th>
-              <th>Role</th>
-              <th>Joined</th>
-              <th>Status</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {users.map((user) => (
-              <tr key={user.id}>
-                <td>{user.email}</td>
-                <td>{user.isAdmin ? "admin" : "user"}</td>
-                <td>{formatTime(user.createdAt)}</td>
-                <td>{user.disabled ? "disabled" : "active"}</td>
-                <td>
-                  {user.id !== me.id && (
-                    <button type="button" onClick={run(() => setUserDisabled(user.id, !user.disabled))}>
-                      {user.disabled ? "Enable" : "Disable"}
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <section className="section">
+        <div className="section-aside">
+          <h2>Users</h2>
+          <p>
+            Disabling an account signs it out everywhere, closes its open dashboards and cuts off any live view.
+          </p>
+        </div>
+        <div className="section-main">
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Email</th>
+                  <th>Role</th>
+                  <th>Joined</th>
+                  <th>Status</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {users?.map((user) => (
+                  <tr key={user.id}>
+                    <td>
+                      <span className="cell">
+                        <span className="truncate">{user.email}</span>
+                        {user.id === me.id && <Tag>You</Tag>}
+                      </span>
+                    </td>
+                    <td className={user.isAdmin ? undefined : "muted"}>{user.isAdmin ? "Admin" : "User"}</td>
+                    <td className="num muted">{formatTime(user.createdAt)}</td>
+                    <td>
+                      <span className="cell">
+                        <Dot tone={user.disabled ? "err" : "ok"} />
+                        {user.disabled ? "Disabled" : "Active"}
+                      </span>
+                    </td>
+                    <td className="actions">
+                      {user.id !== me.id &&
+                        (user.disabled ? (
+                          <button type="button" className="btn btn-sm" onClick={run(() => setUserDisabled(user.id, false))}>
+                            Enable
+                          </button>
+                        ) : (
+                          <ConfirmButton
+                            small
+                            confirmLabel="Confirm"
+                            onConfirm={() => void run(() => setUserDisabled(user.id, true))()}
+                          >
+                            Disable
+                          </ConfirmButton>
+                        ))}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </section>
     </div>
   );

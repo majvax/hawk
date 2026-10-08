@@ -153,8 +153,29 @@ export function inviteUrl(token: string): string {
   return `${window.location.origin}/invite/${token}`;
 }
 
+const pad = (value: number): string => String(value).padStart(2, "0");
+
+// "2026-10-08 14:32", local time: fixed width, so columns of them line up.
 export function formatTime(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toLocaleString();
+  const date = new Date(unixSeconds * 1000);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// "4m ago", "3h ago", "12d ago".
+export function formatAgo(unixSeconds: number, now = Date.now()): string {
+  const seconds = Math.max(0, Math.floor(now / 1000 - unixSeconds));
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86_400)}d ago`;
+}
+
+// "02:14:07", or "3d 02:14:07" past a day.
+export function formatElapsed(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const days = Math.floor(total / 86_400);
+  const clock = `${pad(Math.floor((total % 86_400) / 3600))}:${pad(Math.floor((total % 3600) / 60))}:${pad(total % 60)}`;
+  return days > 0 ? `${days}d ${clock}` : clock;
 }
 
 // Short form for share windows: just the time today, the date otherwise.

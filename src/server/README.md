@@ -73,7 +73,8 @@ Accounts are invite-only; there is no open sign-up.
   user's sessions, closes their open dashboards and disconnects the
   machines they own, immediately. Being admin does not grant access to
   other people's machines.
-- **Settings:** every user's Settings tab changes their password (the
+- **Settings:** every user's Settings tab picks the dashboard's accent
+  color (kept in that browser), changes their password (the
   current one is checked first; wrong guesses count toward the login
   throttle) and lists their sessions with the browser and IP each signed in
   from. A session can be revoked on its own, or all but the current one at
@@ -151,7 +152,10 @@ second. Starts and ends can be at most a year away.
 
 A viewer with the **control** role, and the owner, can use the machine as
 well as watch it: clicking the live screen hands it your mouse and keyboard,
-and clicking away (or **Stop controlling**) takes them back.
+and clicking away (or **Release**) takes them back. **Full screen** also
+asks the browser for a keyboard lock where it supports one (Chromium), so
+shortcuts it would otherwise keep (`Alt+Tab`, `Ctrl+W`, `Esc`) go to the
+machine too; holding `Esc` leaves full screen.
 
 - The dashboard sends pointer positions as a fraction of the screen, button
   presses, wheel notches and physical keys (`KeyboardEvent.code`). Pointer

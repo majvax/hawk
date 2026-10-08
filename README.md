@@ -69,7 +69,7 @@ Mouse and keyboard from the browser are replayed inside the interactive session 
 * **Physical keys, not characters:** keys travel as the browser's `KeyboardEvent.code` (the key's position) and are injected as PS/2 set-1 **scancodes** (`KEYEVENTF_SCANCODE`). The machine then applies its own keyboard layout, exactly as it would to a keyboard plugged into it, and games that read scancodes see what they expect.
 * **Resolution-independent pointer:** positions travel as a fraction of the captured monitor and are injected as absolute virtual-desktop coordinates (`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`), so neither side needs the other's resolution and a mode change can't put the pointer somewhere else.
 * **Nothing stays pressed:** the relay tells the machine to let go when a viewer stops watching or loses the right to control it, the browser releases what it is holding when the screen loses focus, and the helper releases everything it pressed when the pipe closes or it exits.
-* **What can't be forwarded:** `Ctrl+Alt+Del` is the secure attention sequence, which only Windows itself can generate; and shortcuts the browser keeps for itself (`Ctrl+W`, `Alt+Tab`) never leave the viewer's own machine.
+* **What can't be forwarded:** `Ctrl+Alt+Del` is the secure attention sequence, which only Windows itself can generate; and shortcuts the browser keeps for itself (`Ctrl+W`, `Alt+Tab`) stay on the viewer's own machine, unless the viewer is in full screen on a Chromium browser, where the dashboard takes a keyboard lock and forwards them too.
 
 ### 4. Outbound-Only Networking
 Instead of opening firewall ports or port-forwarding a home router, both the browser and the target PC initiate outbound WebSocket connections to the self-hosted relay server. The relay handles session handshakes and pairs the two connections.
@@ -108,6 +108,3 @@ TODO
 - [x] Web browser client (Canvas/WebGL stream player + input listener)
 - [x] Secure-desktop (UAC / lock screen) capture and control: hawk-capture runs as SYSTEM in-session and follows the input desktop
 - [ ] self-signed certificate automation
-- [ ] The machine's own mouse cursor in the stream: Desktop Duplication reports
-      it separately from the frame, so a watcher sees no pointer and the one
-      controlling has only their own to go by

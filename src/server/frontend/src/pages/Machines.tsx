@@ -1,46 +1,70 @@
-import { type FormEvent, type JSX, useCallback, useEffect, useState } from "react";
+import { type JSX, type ReactNode, useEffect, useRef, useState } from "react";
 
 import {
   type EnrollmentCode,
-  type Share,
   createEnrollmentCode,
   describeShareTerms,
+  formatAgo,
+  formatElapsed,
   formatTime,
-  listShares,
-  removeMachine,
-  renameMachine,
-  shareMachine,
-  unshareMachine,
 } from "../api.js";
 import type { Machine, Role } from "../protocol.js";
-import { type ConnectionStatus, useDashboard } from "../useDashboard.js";
+import { Alert, CodeBlock, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
+import type { Dashboard } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
+import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
 
-const ROLE_LABEL: Record<Role, string> = { owner: "owner", control: "can control", view: "view only" };
+export const ROLE_LABEL: Record<Role, string> = { owner: "Owner", control: "Can control", view: "View only" };
+
+type DetailTab = "screen" | "sharing" | "machine";
+
+export function formatBitrate(kbps: number): string {
+  return kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mb/s` : `${kbps} kb/s`;
+}
 
 function installCommand(enrollment: EnrollmentCode): string {
   const pin = enrollment.relayPin === null ? "" : ` -RelayPin ${enrollment.relayPin}`;
   return `powershell -ExecutionPolicy Bypass -File scripts\\install-service.ps1 -EnrollCode ${enrollment.code}${pin}`;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "request failed";
+// "up 02:14:07" while online, "seen 4m ago" otherwise.
+function presence(machine: Machine, now: number): string {
+  if (machine.online) {
+    if (machine.connectedAt === null) return "Online";
+    return `up ${formatElapsed((now - Date.parse(machine.connectedAt)) / 1000)}`;
+  }
+  return machine.lastSeenAt === null ? "Never connected" : `seen ${formatAgo(machine.lastSeenAt, now)}`;
 }
 
-export function MachinesPage({ onSessionEnded }: { onSessionEnded: () => void }): JSX.Element {
-  const { machines, status, retryAt, viewingId, canvasRef, startView, stopView, sendInput, reconnectNow } =
-    useDashboard(onSessionEnded);
-  const [managingId, setManagingId] = useState<string | null>(null);
+// The time limits on a share this user was given, if any.
+function accessTerms(machine: Machine): string {
+  if (machine.role === "owner") return "";
+  return describeShareTerms({ startsAt: null, expiresAt: machine.accessExpiresAt, singleView: machine.singleView });
+}
+
+export function MachinesPage({ dashboard, visible }: { dashboard: Dashboard; visible: boolean }): JSX.Element {
+  const { machines, status, viewingId, startView, stopView } = dashboard;
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tab, setTab] = useState<DetailTab>("screen");
   const [enrollment, setEnrollment] = useState<EnrollmentCode | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const now = useNow();
 
+  const selected = machines.find((machine) => machine.id === selectedId) ?? null;
   const viewing = machines.find((machine) => machine.id === viewingId) ?? null;
-  const managing = machines.find((machine) => machine.id === managingId && machine.role === "owner") ?? null;
+  // Only an owner gets the sharing and machine tabs.
+  const detailTab = selected?.role === "owner" ? tab : "screen";
 
-  // Nothing to send input to unless the stream is actually up, and the
-  // relay would drop it from a view-only share anyway.
-  const canControl = viewing !== null && viewing.role !== "view" && viewing.online && status === "open";
-  const input = useRemoteInput(canvasRef, canControl, sendInput);
+  const select = (id: string | null): void => {
+    if (id !== selectedId) setTab("screen");
+    setSelectedId(id);
+  };
+
+  const connect = (machine: Machine): void => {
+    select(machine.id);
+    setTab("screen");
+    startView(machine.id);
+  };
 
   const addMachine = async (): Promise<void> => {
     setError(null);
@@ -51,414 +75,643 @@ export function MachinesPage({ onSessionEnded }: { onSessionEnded: () => void })
     }
   };
 
-  return (
-    <div className="stack">
-      <div className="row">
-        <p className="muted grow">
-          <StatusDot status={status} /> relay link {status}
-          {status === "reconnecting" && retryAt !== null && (
-            <>
-              {" "}
-              — retrying in <Countdown until={retryAt} />{" "}
-              <button type="button" onClick={reconnectNow}>
-                Retry now
-              </button>
-            </>
-          )}
-        </p>
-        <button type="button" onClick={() => void addMachine()}>
-          Add machine
-        </button>
-      </div>
-      {error !== null && <p className="error">{error}</p>}
+  const online = machines.filter((machine) => machine.online).length;
 
-      {enrollment !== null && (
-        <div className="notice">
-          <p>
-            Enrollment code: <code className="code">{enrollment.code}</code> — single use, expires{" "}
-            {formatTime(enrollment.expiresAt)}. On the PC, from an elevated PowerShell in the Hawk folder:
-          </p>
-          <pre>{installCommand(enrollment)}</pre>
-          <p className="muted">
-            The machine shows up here once it connects. This code won't be shown again.
-            {enrollment.relayPin !== null &&
-              " -RelayPin makes the machine accept only this relay's TLS key, even from a certificate it would otherwise trust."}
-          </p>
-          <button type="button" onClick={() => setEnrollment(null)}>
-            Done
+  return (
+    <div className="console">
+      <aside className="rail" aria-label="Machines">
+        <div className="rail-head">
+          <span className="label">Machines</span>
+          <span className="num faint">
+            {online}/{machines.length}
+          </span>
+          <button type="button" className="btn btn-sm" onClick={() => void addMachine()}>
+            Add
           </button>
         </div>
-      )}
-
-      {machines.length === 0 ? (
-        <p className="muted">No machines yet. Add one, or ask someone to share theirs with you.</p>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Machine</th>
-              <th>Status</th>
-              <th>Access</th>
-              <th>Watching</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {machines.map((machine) => (
-              <tr key={machine.id}>
-                <td>
-                  {machine.name}
-                  {machine.name !== machine.hostname && <span className="muted"> ({machine.hostname})</span>}
-                  {machine.role === "owner" && <KeyBadge storage={machine.keyStorage} />}
-                </td>
-                <td>
-                  <span className={`dot ${machine.online ? "dot-open" : "dot-closed"}`} aria-hidden />
-                  {machine.online
-                    ? "online"
-                    : machine.lastSeenAt === null
-                      ? "never connected"
-                      : `last seen ${formatTime(machine.lastSeenAt)}`}
-                </td>
-                <td>
-                  {machine.role === "owner" ? "owner" : `${ROLE_LABEL[machine.role]} · ${machine.ownerEmail}`}
-                  {machine.role !== "owner" && (machine.accessExpiresAt !== null || machine.singleView) && (
-                    <span className="badge">
-                      {describeShareTerms({ startsAt: null, expiresAt: machine.accessExpiresAt, singleView: machine.singleView })}
-                    </span>
-                  )}
-                </td>
-                <td className="muted">{machine.viewers === null ? "" : machine.viewers.join(", ") || "nobody"}</td>
-                <td className="actions">
-                  {viewingId === machine.id ? (
-                    <button type="button" onClick={stopView}>
-                      Stop
-                    </button>
-                  ) : (
-                    <button type="button" disabled={!machine.online} onClick={() => startView(machine.id)}>
-                      View
-                    </button>
-                  )}
-                  {machine.role === "owner" && (
-                    <button
-                      type="button"
-                      className={managingId === machine.id ? "active" : ""}
-                      onClick={() => setManagingId(managingId === machine.id ? null : machine.id)}
-                    >
-                      Manage
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      {managing !== null && <ManagePanel key={managing.id} machine={managing} onClose={() => setManagingId(null)} />}
-
-      <section style={{ display: viewing === null ? "none" : "block" }}>
-        <div className="row">
-          <h2>{viewing?.name ?? "Live view"}</h2>
-          {viewing !== null && viewing.role === "view" && <span className="badge">view only</span>}
+        <div className="rail-list">
+          <button
+            type="button"
+            className="rail-item"
+            aria-current={selected === null}
+            onClick={() => select(null)}
+          >
+            <span className="dot tone-neutral" aria-hidden />
+            <span className="rail-name">Overview</span>
+            <span />
+            <span className="rail-meta">
+              <span>
+                {machines.length} {machines.length === 1 ? "machine" : "machines"}, {online} online
+              </span>
+            </span>
+          </button>
+          {machines.map((machine) => (
+            <RailItem
+              key={machine.id}
+              machine={machine}
+              selected={machine.id === selectedId}
+              live={machine.id === viewingId}
+              onSelect={() => select(machine.id)}
+            />
+          ))}
         </div>
-        {viewing !== null && status !== "open" && (
-          <p className="muted">Connection to the relay lost. The view resumes once it's back.</p>
+        <div className="rail-foot">Machines shared with you appear here too.</div>
+      </aside>
+
+      <section className="pane" aria-label={selected?.name ?? "Overview"}>
+        {error !== null && (
+          <div style={{ padding: "14px 14px 0" }}>
+            <Alert>{error}</Alert>
+          </div>
         )}
-        {viewing !== null && status === "open" && !viewing.online && (
-          <p className="muted">{viewing.name} is offline. The view resumes when it reconnects.</p>
-        )}
-        {viewing !== null && viewing.singleView && (
-          <p className="muted">One viewing only: once you stop watching, this machine is no longer shared with you.</p>
-        )}
-        {canControl && (
-          <p className="muted">
-            {input.active ? (
-              <>
-                Your mouse and keyboard are going to {viewing?.name}. The screen doesn't show the machine's own
-                pointer — yours is in the same place.{" "}
-                <button type="button" onClick={input.release}>
-                  Stop controlling
-                </button>{" "}
-                Shortcuts the browser keeps for itself (Ctrl+W, Alt+Tab), and Ctrl+Alt+Del, stay on your own
-                computer.
-              </>
-            ) : (
-              "Click the screen to control it with your mouse and keyboard."
+        {enrollment !== null && <Enrollment enrollment={enrollment} onDone={() => setEnrollment(null)} />}
+
+        {selected === null ? (
+          <Overview
+            machines={machines}
+            viewingId={viewingId}
+            now={now}
+            onSelect={select}
+            onConnect={connect}
+            onAdd={() => void addMachine()}
+          />
+        ) : (
+          <>
+            <div className="pane-head">
+              <div className="pane-title">
+                <h1>
+                  <span className="truncate">{selected.name}</span>
+                  {selected.id === viewingId && (
+                    <Tag tone="accent" solid>
+                      Live
+                    </Tag>
+                  )}
+                </h1>
+                <span className="sub truncate">
+                  {selected.hostname}
+                  {selected.role !== "owner" && ` · shared by ${selected.ownerEmail}`}
+                </span>
+              </div>
+              <div className="pane-actions">
+                {selected.id === viewingId ? (
+                  <button type="button" className="btn" onClick={stopView}>
+                    Disconnect
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-accent"
+                    disabled={!selected.online}
+                    onClick={() => connect(selected)}
+                  >
+                    Connect
+                  </button>
+                )}
+              </div>
+            </div>
+            <MachineStrip machine={selected} now={now} />
+            {selected.role === "owner" && (
+              <div className="pane-tabs" role="tablist">
+                {(
+                  [
+                    ["screen", "Screen"],
+                    ["sharing", "Sharing"],
+                    ["machine", "Machine"],
+                  ] as const
+                ).map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={detailTab === id}
+                    onClick={() => setTab(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             )}
-          </p>
+            {detailTab === "sharing" && <SharingPanel key={selected.id} machine={selected} />}
+            {detailTab === "machine" && (
+              <MachineSettings key={selected.id} machine={selected} onRemoved={() => select(null)} />
+            )}
+          </>
         )}
-        <canvas
-          ref={canvasRef}
-          className={["screen", canControl && "controllable", input.active && "controlling"].filter(Boolean).join(" ")}
-          // Focusable only when it can be controlled: focusing it is what
-          // starts sending input, and Tab shouldn't land on a dead screen.
-          tabIndex={canControl ? 0 : -1}
+
+        {/* Always mounted: the canvas frames are drawn into lives here, and a
+            view keeps running while another machine or tab is on show. */}
+        <Viewer
+          dashboard={dashboard}
+          shown={visible && selected !== null && detailTab === "screen"}
+          selected={selected}
+          viewing={viewing}
+          status={status}
+          onConnect={connect}
         />
       </section>
     </div>
   );
 }
 
-function ManagePanel({ machine, onClose }: { machine: Machine; onClose: () => void }): JSX.Element {
-  const [name, setName] = useState(machine.name);
-  const [shares, setShares] = useState<Share[]>([]);
-  const [email, setEmail] = useState("");
-  const [role, setRole] = useState<Share["role"]>("view");
-  const [duration, setDuration] = useState<Duration>("forever");
-  const [until, setUntil] = useState("");
-  const [startLater, setStartLater] = useState(false);
-  const [startAt, setStartAt] = useState("");
-  const [singleView, setSingleView] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+function RailItem({
+  machine,
+  selected,
+  live,
+  onSelect,
+}: {
+  machine: Machine;
+  selected: boolean;
+  live: boolean;
+  onSelect: () => void;
+}): JSX.Element {
+  const watchers = machine.viewers?.length ?? 0;
+  return (
+    <button
+      type="button"
+      className={machine.online ? "rail-item" : "rail-item offline"}
+      aria-current={selected}
+      onClick={onSelect}
+    >
+      <Dot tone={machine.online ? "ok" : "idle"} title={machine.online ? "Online" : "Offline"} />
+      <span className="rail-name truncate">{machine.name}</span>
+      {live ? (
+        <Tag tone="accent">Live</Tag>
+      ) : machine.role === "owner" && machine.keyStorage === null ? (
+        <Tag tone="err">Re-enroll</Tag>
+      ) : watchers > 0 ? (
+        <Tag title={machine.viewers?.join(", ")}>{watchers} watching</Tag>
+      ) : (
+        <span />
+      )}
+      <span className="rail-meta">
+        <span>{machine.hostname}</span>
+        <span>{machine.role === "owner" ? "owner" : machine.role}</span>
+        {accessTerms(machine) !== "" && <span>{accessTerms(machine)}</span>}
+      </span>
+    </button>
+  );
+}
 
-  const refresh = useCallback(async (): Promise<void> => {
-    try {
-      setShares(await listShares(machine.id));
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
-  }, [machine.id]);
+function MachineStrip({ machine, now }: { machine: Machine; now: number }): JSX.Element {
+  const terms = accessTerms(machine);
+  return (
+    <div className="strip">
+      <Metric label="Status">
+        <Dot tone={machine.online ? "ok" : "idle"} />
+        {machine.online ? "Online" : "Offline"}
+      </Metric>
+      {machine.online ? (
+        <Metric label="Uptime">
+          {machine.connectedAt === null ? "—" : formatElapsed((now - Date.parse(machine.connectedAt)) / 1000)}
+        </Metric>
+      ) : (
+        <Metric label="Last seen" dim={machine.lastSeenAt === null}>
+          {machine.lastSeenAt === null ? "never" : formatTime(machine.lastSeenAt)}
+        </Metric>
+      )}
+      <Metric label="Access">{ROLE_LABEL[machine.role]}</Metric>
+      {terms !== "" && <Metric label="Share ends">{terms}</Metric>}
+      {machine.role === "owner" && (
+        <Metric label="Machine key">
+          <KeyStorage storage={machine.keyStorage} />
+        </Metric>
+      )}
+      {machine.viewers !== null && (
+        <Metric label="Watching" dim={machine.viewers.length === 0}>
+          <span className="truncate" title={machine.viewers.join(", ")}>
+            {machine.viewers.length === 0 ? "nobody" : machine.viewers.join(", ")}
+          </span>
+        </Metric>
+      )}
+    </div>
+  );
+}
 
-  useEffect(() => {
-    void refresh();
-    // Temporary shares start, expire and get used up on their own.
-    const timer = window.setInterval(() => void refresh(), 30_000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
-
-  const run = async (action: () => Promise<unknown>): Promise<boolean> => {
-    setError(null);
-    try {
-      await action();
-      await refresh();
-      return true;
-    } catch (caught) {
-      setError(errorMessage(caught));
-      return false;
-    }
-  };
-
-  const submitShare = async (event: FormEvent): Promise<void> => {
-    event.preventDefault();
-    const startsAt = startLater ? fromLocalInput(startAt) : null;
-    const begins = startsAt ?? Math.floor(Date.now() / 1000);
-    const expiresAt =
-      duration === "forever" ? null : duration === "until" ? fromLocalInput(until) : begins + DURATION_SECONDS[duration];
-    // An unreadable date must not quietly become "now" or "until revoked".
-    if ((startLater && startsAt === null) || (duration !== "forever" && expiresAt === null)) {
-      setError("enter a valid date and time");
-      return;
-    }
-    if (await run(() => shareMachine(machine.id, email, { role, startsAt, expiresAt, singleView }))) setEmail("");
-  };
-
-  // Pushes a temporary share's end back by an hour (from now if it's close).
-  const extend = (share: Share): Promise<boolean> => {
-    const from = Math.max(share.expiresAt ?? 0, Math.floor(Date.now() / 1000));
-    return run(() => shareMachine(machine.id, share.email, { ...share, expiresAt: from + 3600 }));
-  };
-
-  const submitRename = (event: FormEvent): void => {
-    event.preventDefault();
-    void run(() => renameMachine(machine.id, name));
-  };
-
-  const remove = (): void => {
-    const confirmed = window.confirm(
-      `Remove ${machine.name}? It will be disconnected, everyone it's shared with loses access, and it needs a new enrollment code to come back.`,
-    );
-    if (confirmed) void run(() => removeMachine(machine.id)).then((ok) => ok && onClose());
-  };
+function Overview({
+  machines,
+  viewingId,
+  now,
+  onSelect,
+  onConnect,
+  onAdd,
+}: {
+  machines: Machine[];
+  viewingId: string | null;
+  now: number;
+  onSelect: (id: string) => void;
+  onConnect: (machine: Machine) => void;
+  onAdd: () => void;
+}): JSX.Element {
+  const online = machines.filter((machine) => machine.online).length;
+  const owned = machines.filter((machine) => machine.role === "owner").length;
+  const watchers = machines.reduce((sum, machine) => sum + (machine.viewers?.length ?? 0), 0);
 
   return (
-    <section className="panel stack">
-      <div className="row">
-        <h2 className="grow">Manage {machine.name}</h2>
-        <button type="button" onClick={onClose}>
-          Close
+    <div className="overview">
+      <div className="overview-head">
+        <h1>Overview</h1>
+        <button type="button" className="btn" onClick={onAdd}>
+          Add machine
         </button>
       </div>
-      {error !== null && <p className="error">{error}</p>}
+      <div className="strip">
+        <Metric label="Online">
+          <Dot tone={online > 0 ? "ok" : "idle"} />
+          {online}
+        </Metric>
+        <Metric label="Offline" dim={machines.length - online === 0}>
+          {machines.length - online}
+        </Metric>
+        <Metric label="Yours">{owned}</Metric>
+        <Metric label="Shared with you" dim={machines.length - owned === 0}>
+          {machines.length - owned}
+        </Metric>
+        <Metric label="Watching yours" dim={watchers === 0}>
+          {watchers}
+        </Metric>
+      </div>
 
-      <form className="row" onSubmit={submitRename}>
-        <label className="grow">
-          Name
-          <input value={name} maxLength={64} onChange={(e) => setName(e.target.value)} required />
-        </label>
-        <button type="submit" className="align-end" disabled={name.trim() === machine.name}>
-          Rename
-        </button>
-      </form>
-
-      <div>
-        <h2>Shared with</h2>
-        {shares.length === 0 ? (
-          <p className="muted">Only you.</p>
-        ) : (
-          <table>
+      {machines.length === 0 ? (
+        <div className="pane-body">
+          <div className="block">
+            <h2>No machines yet</h2>
+            <p className="prose">
+              Add a Windows PC by enrolling it with a one-time code, or ask someone on this server to share one of
+              theirs with your account.
+            </p>
+            <div>
+              <button type="button" className="btn btn-primary" onClick={onAdd}>
+                Add machine
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Machine</th>
+                <th>Host</th>
+                <th>Status</th>
+                <th>Access</th>
+                <th>Watching</th>
+                <th />
+              </tr>
+            </thead>
             <tbody>
-              {shares.map((share) => (
-                <tr key={share.userId}>
+              {machines.map((machine) => (
+                <tr key={machine.id} className="clickable" onClick={() => onSelect(machine.id)}>
                   <td>
-                    {share.email}
-                    {share.startsAt !== null && share.startsAt > Date.now() / 1000 && (
-                      <span className="badge">not started</span>
-                    )}
+                    <span className="cell">
+                      <Dot tone={machine.online ? "ok" : "idle"} />
+                      <span className="truncate">{machine.name}</span>
+                      {machine.id === viewingId && <Tag tone="accent">Live</Tag>}
+                      {machine.role === "owner" && machine.keyStorage === null && <Tag tone="err">Re-enroll</Tag>}
+                    </span>
                   </td>
-                  <td className="muted">{describeShareTerms(share) || "until revoked"}</td>
+                  <td className="mono muted">{machine.hostname}</td>
+                  <td className={machine.online ? "num" : "num muted"}>{presence(machine, now)}</td>
                   <td>
-                    <select
-                      value={share.role}
-                      onChange={(e) =>
-                        void run(() =>
-                          shareMachine(machine.id, share.email, { ...share, role: e.target.value as Share["role"] }),
-                        )
-                      }
-                    >
-                      <option value="view">view only</option>
-                      <option value="control">can control</option>
-                    </select>
+                    <span className="cell">
+                      {ROLE_LABEL[machine.role]}
+                      {machine.role !== "owner" && <span className="muted truncate">{machine.ownerEmail}</span>}
+                      {accessTerms(machine) !== "" && <Tag tone="warn">{accessTerms(machine)}</Tag>}
+                    </span>
+                  </td>
+                  <td className="muted">
+                    {machine.viewers === null ? "" : machine.viewers.join(", ") || <span className="faint">—</span>}
                   </td>
                   <td className="actions">
-                    {share.expiresAt !== null && (
-                      <button type="button" onClick={() => void extend(share)}>
-                        +1 h
-                      </button>
-                    )}
-                    <button type="button" onClick={() => void run(() => unshareMachine(machine.id, share.userId))}>
-                      Revoke
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      disabled={!machine.online || machine.id === viewingId}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onConnect(machine);
+                      }}
+                    >
+                      {machine.id === viewingId ? "Live" : "Connect"}
                     </button>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
-        )}
-        <form className="row share-form" onSubmit={(e) => void submitShare(e)}>
-          <input
-            type="email"
-            placeholder="their account email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            required
-          />
-          <select value={role} onChange={(e) => setRole(e.target.value as Share["role"])}>
-            <option value="view">view only</option>
-            <option value="control">can control</option>
-          </select>
-          <select value={duration} onChange={(e) => setDuration(e.target.value as Duration)} aria-label="For how long">
-            {DURATIONS.map(([value, label]) => (
-              <option key={value} value={value}>
-                {label}
-              </option>
-            ))}
-          </select>
-          {duration === "until" && (
-            <input
-              type="datetime-local"
-              className="when"
-              aria-label="Share until"
-              value={until}
-              onChange={(e) => setUntil(e.target.value)}
-              required
-            />
-          )}
-          <button type="submit">Share</button>
-        </form>
-        <div className="row share-options">
-          <label className="check">
-            <input type="checkbox" checked={startLater} onChange={(e) => setStartLater(e.target.checked)} />
-            Start later
-          </label>
-          {startLater && (
-            <input
-              type="datetime-local"
-              className="when"
-              aria-label="Share starts at"
-              value={startAt}
-              onChange={(e) => setStartAt(e.target.value)}
-              required
-            />
-          )}
-          <label className="check">
-            <input type="checkbox" checked={singleView} onChange={(e) => setSingleView(e.target.checked)} />
-            One viewing only
-          </label>
         </div>
-        <p className="muted">
-          They need an account on this server first. "View only" can watch the screen but never send input. A
-          temporary share is revoked automatically when it runs out, cutting off a live view; "one viewing only"
-          ends the share once they stop watching. Sharing again with the same person replaces the terms.
-        </p>
-      </div>
+      )}
+    </div>
+  );
+}
 
-      <div>
-        <button type="button" className="danger" onClick={remove}>
-          Remove machine
+function Enrollment({ enrollment, onDone }: { enrollment: EnrollmentCode; onDone: () => void }): JSX.Element {
+  return (
+    <div className="enroll" role="region" aria-label="Add a machine">
+      <div className="block-head">
+        <h2 style={{ flex: 1 }}>Add a machine</h2>
+        <button type="button" className="btn btn-sm" onClick={onDone}>
+          Done
         </button>
       </div>
-    </section>
+      <ol className="steps">
+        <li>
+          <span>
+            Enrollment code. It works once and expires at{" "}
+            <span className="num">{formatTime(enrollment.expiresAt)}</span>. It won't be shown again.
+          </span>
+          <CodeBlock value={enrollment.code} big />
+        </li>
+        <li>
+          <span>On the PC, run this from an elevated PowerShell in the Hawk folder:</span>
+          <CodeBlock value={installCommand(enrollment)} />
+          {enrollment.relayPin !== null && (
+            <span className="field-hint">
+              -RelayPin makes the machine accept only this relay's TLS key, even from a certificate it would
+              otherwise trust.
+            </span>
+          )}
+        </li>
+        <li>
+          <span>The machine shows up in the list once it connects.</span>
+          <span />
+        </li>
+      </ol>
+    </div>
   );
 }
 
-type Duration = "forever" | "30m" | "1h" | "2h" | "8h" | "1d" | "1w" | "until";
+// The navigator.keyboard slice used here; not in TypeScript's lib.dom yet.
+// Chromium only: elsewhere system shortcuts just stay with the browser.
+interface KeyboardLock {
+  lock?: () => Promise<void>;
+  unlock?: () => void;
+}
+const keyboardLock = (): KeyboardLock | undefined => (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard;
 
-const DURATIONS: [Duration, string][] = [
-  ["forever", "until revoked"],
-  ["30m", "for 30 minutes"],
-  ["1h", "for 1 hour"],
-  ["2h", "for 2 hours"],
-  ["8h", "for 8 hours"],
-  ["1d", "for 1 day"],
-  ["1w", "for 1 week"],
-  ["until", "until…"],
-];
+function Viewer({
+  dashboard,
+  shown,
+  selected,
+  viewing,
+  status,
+  onConnect,
+}: {
+  dashboard: Dashboard;
+  shown: boolean;
+  selected: Machine | null;
+  viewing: Machine | null;
+  status: Dashboard["status"];
+  onConnect: (machine: Machine) => void;
+}): JSX.Element {
+  const { canvasRef, picture, stats, decodeError, sendInput, stopView } = dashboard;
+  const stageRef = useRef<HTMLDivElement>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [keysLocked, setKeysLocked] = useState(false);
 
-const DURATION_SECONDS: Record<Exclude<Duration, "forever" | "until">, number> = {
-  "30m": 30 * 60,
-  "1h": 60 * 60,
-  "2h": 2 * 60 * 60,
-  "8h": 8 * 60 * 60,
-  "1d": 24 * 60 * 60,
-  "1w": 7 * 24 * 60 * 60,
-};
+  const onScreen = shown && viewing !== null && selected?.id === viewing.id;
+  // Nothing to send input to unless a picture is actually up, and the relay
+  // would drop it from a view-only share anyway.
+  const canControl =
+    onScreen && viewing.role !== "view" && viewing.online && status === "open" && picture !== null;
+  const input = useRemoteInput(canvasRef, canControl, sendInput);
 
-// A <input type="datetime-local"> value (local time) as unix seconds.
-function fromLocalInput(value: string): number | null {
-  const millis = new Date(value).getTime();
-  return Number.isNaN(millis) ? null : Math.floor(millis / 1000);
+  useEffect(() => {
+    const onChange = (): void => {
+      const isFull = document.fullscreenElement === stageRef.current && stageRef.current !== null;
+      setFullscreen(isFull);
+      if (!isFull) {
+        keyboardLock()?.unlock?.();
+        setKeysLocked(false);
+      }
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  // Leaving the screen (another machine, another tab) ends fullscreen too.
+  useEffect(() => {
+    if (!onScreen && document.fullscreenElement !== null) void document.exitFullscreen().catch(() => {});
+  }, [onScreen]);
+
+  const toggleFullscreen = async (): Promise<void> => {
+    if (document.fullscreenElement !== null) {
+      await document.exitFullscreen().catch(() => {});
+      return;
+    }
+    try {
+      await stageRef.current?.requestFullscreen();
+    } catch {
+      return;
+    }
+    // In fullscreen, Chromium can hand the page the keys it normally keeps
+    // (Alt+Tab, Ctrl+W, Esc), so they reach the machine too.
+    try {
+      await keyboardLock()?.lock?.();
+      setKeysLocked(keyboardLock()?.lock !== undefined);
+    } catch {
+      setKeysLocked(false);
+    }
+    canvasRef.current?.focus();
+  };
+
+  const signal = signalFor({ onScreen, selected, viewing, status, picture, stats, decodeError, onConnect });
+  const name = selected?.name ?? "";
+
+  return (
+    <div className="stage-wrap" hidden={!shown}>
+      <div ref={stageRef} className={input.active ? "stage controlling" : "stage"}>
+        <div className="stage-bar">
+          {onScreen ? (
+            <span className="live">
+              <Dot tone={stats?.receiving === false ? "warn" : "accent"} />
+              Live
+            </span>
+          ) : (
+            <span>
+              <Dot tone="idle" />
+              Idle
+            </span>
+          )}
+          <span className="v truncate">{name}</span>
+          {onScreen && picture !== null && (
+            <span className="wide">
+              {picture.width}×{picture.height}
+            </span>
+          )}
+          {onScreen && stats !== null && <span>{String(stats.fps).padStart(2, " ")} fps</span>}
+          {/* Shown only when the browser falls behind what arrives. */}
+          {onScreen && stats !== null && stats.received - stats.fps > 2 && (
+            <span className="wide">{stats.received} in</span>
+          )}
+          {onScreen && stats !== null && stats.dropped > 0 && <span className="wide">{stats.dropped} dropped</span>}
+          {onScreen && stats?.debug != null && <span>{stats.debug}</span>}
+          {onScreen && stats !== null && <span className="wide">{formatBitrate(stats.kbps)}</span>}
+          <span className="spacer" />
+          {onScreen && viewing.role === "view" && <span>View only</span>}
+          {canControl && (
+            <span className={input.active ? "control live" : "control"}>
+              {input.active ? (keysLocked ? "Input + keyboard lock" : "Input captured") : "Click to control"}
+            </span>
+          )}
+          {input.active && (
+            <button type="button" onClick={input.release}>
+              Release
+            </button>
+          )}
+          {onScreen && (
+            <button type="button" onClick={() => void toggleFullscreen()}>
+              {fullscreen ? "Exit full screen" : "Full screen"}
+            </button>
+          )}
+        </div>
+        <div className="stage-screen">
+          <Corners />
+          <canvas
+            ref={canvasRef}
+            className={[
+              (!onScreen || picture === null) && "hidden",
+              canControl && "controllable",
+              input.active && "controlling",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+            // Focusable only when it can be controlled: focusing it is what
+            // starts sending input, and Tab shouldn't land on a dead screen.
+            tabIndex={canControl ? 0 : -1}
+            aria-label={onScreen ? `${name} screen` : undefined}
+          />
+          {signal}
+        </div>
+      </div>
+      {onScreen && (
+        <div className="stage-foot">
+          {viewing.singleView && (
+            <span>
+              <Tag tone="warn">One viewing</Tag> Once you disconnect, this machine is no longer shared with you.
+            </span>
+          )}
+          {viewing.role === "view" && <span>View only: you can watch this screen but not send it input.</span>}
+          {canControl && !input.active && <span>Click the screen to send it your mouse and keyboard.</span>}
+          {input.active && (
+            <span>
+              The machine's own pointer isn't in the picture; yours stands in for it.{" "}
+              {keysLocked ? (
+                <>
+                  System shortcuts go to the machine too. Hold <kbd>Esc</kbd> to leave full screen.
+                </>
+              ) : (
+                <>
+                  <kbd>Ctrl+W</kbd> <kbd>Alt+Tab</kbd> and <kbd>Ctrl+Alt+Del</kbd> stay on this computer; full
+                  screen forwards most of them.
+                </>
+              )}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
-// Where the machine keeps the key it authenticates with, as it reports it.
-function KeyBadge({ storage }: { storage: Machine["keyStorage"] }): JSX.Element {
-  if (storage === null) {
+// What covers the screen when there's no live picture to show, if anything.
+function signalFor({
+  onScreen,
+  selected,
+  viewing,
+  status,
+  picture,
+  stats,
+  decodeError,
+  onConnect,
+}: {
+  onScreen: boolean;
+  selected: Machine | null;
+  viewing: Machine | null;
+  status: Dashboard["status"];
+  picture: Dashboard["picture"];
+  stats: Dashboard["stats"];
+  decodeError: Dashboard["decodeError"];
+  onConnect: (machine: Machine) => void;
+}): ReactNode {
+  if (selected === null) return null;
+
+  if (!onScreen) {
+    if (!selected.online) {
+      return (
+        <Signal label="Offline">
+          {selected.lastSeenAt === null
+            ? `${selected.name} hasn't connected yet.`
+            : `${selected.name} was last seen ${formatTime(selected.lastSeenAt)}.`}
+        </Signal>
+      );
+    }
     return (
-      <span className="badge warn" title="Enrolled before key-based authentication; remove and enroll it again">
-        re-enroll needed
-      </span>
+      <Signal label="Not connected">
+        {viewing !== null ? `Connecting ends your view of ${viewing.name}.` : `Connect to see ${selected.name}'s screen.`}
+        <button type="button" className="btn btn-accent" onClick={() => onConnect(selected)}>
+          Connect
+        </button>
+      </Signal>
     );
   }
-  return storage === "tpm" ? (
-    <span className="badge" title="Its key lives in the TPM and can't be copied off the machine">
-      TPM
-    </span>
-  ) : (
-    <span className="badge" title="No usable TPM: its key is in the Windows software key store">
-      software key
-    </span>
+
+  const over = picture !== null;
+  if (status !== "open") {
+    return (
+      <Signal label="Link down" over={over} searching>
+        Lost the connection to the relay. The view resumes once it's back.
+      </Signal>
+    );
+  }
+  if (!selected.online) {
+    return (
+      <Signal label="Machine offline" over={over} searching>
+        {selected.name} went offline. The view resumes when it reconnects.
+      </Signal>
+    );
+  }
+  if (decodeError !== null) {
+    return <Signal label="Can't decode" over={over}>{decodeError}</Signal>;
+  }
+  if (picture === null) {
+    return (
+      <Signal label="Awaiting signal" searching>
+        Waiting for the first keyframe from {selected.name}.
+      </Signal>
+    );
+  }
+  if (stats !== null && !stats.receiving) {
+    return (
+      <Signal label="Signal lost" over searching>
+        No frames for a few seconds. The machine may be switching desktops.
+      </Signal>
+    );
+  }
+  return null;
+}
+
+function Signal({
+  label,
+  over = false,
+  searching = false,
+  children,
+}: {
+  label: string;
+  over?: boolean;
+  searching?: boolean;
+  children: ReactNode;
+}): JSX.Element {
+  const className = ["signal", over && "over-frame", searching && "searching"].filter(Boolean).join(" ");
+  return (
+    <div className={className} role="status">
+      <span className="bars" aria-hidden>
+        <i />
+        <i />
+        <i />
+      </span>
+      <span className="label">{label}</span>
+      {children}
+    </div>
   );
-}
-
-// Seconds left until `until` (ms since epoch), ticking.
-function Countdown({ until }: { until: number }): JSX.Element {
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 500);
-    return () => window.clearInterval(timer);
-  }, []);
-  return <>{Math.max(0, Math.ceil((until - now) / 1000))}s</>;
-}
-
-function StatusDot({ status }: { status: ConnectionStatus }): JSX.Element {
-  return <span aria-hidden className={`dot dot-${status}`} />;
 }

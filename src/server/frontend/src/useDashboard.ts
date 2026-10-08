@@ -1,11 +1,13 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
 import { getSession } from "./api.js";
+import { MseDecoder, mseSupported } from "./mseDecoder.js";
 import {
   type DashboardCommand,
   type DashboardEvent,
   type InputEvent,
   type Machine,
+  type ParsedVideoFrame,
   parseVideoFrame,
 } from "./protocol.js";
 
@@ -28,8 +30,55 @@ function reconnectDelay(attempt: number): number {
 // SPS/PPS inline on keyframes, so no description is needed out of band.
 const DECODER_CODEC = "avc1.4D402A";
 
+// How frames get decoded: WebCodecs where the browser has an H.264 decoder
+// (Chromium), MSE through a hidden <video> otherwise (Firefox for Android).
+type Backend = "webcodecs" | "mse" | "none";
+
+async function detectBackend(): Promise<Backend> {
+  if (typeof VideoDecoder !== "undefined") {
+    try {
+      const { supported } = await VideoDecoder.isConfigSupported({ codec: DECODER_CODEC, optimizeForLatency: true });
+      if (supported) return "webcodecs";
+    } catch {
+      // Treated as unsupported.
+    }
+  }
+  return mseSupported(DECODER_CODEC) ? "mse" : "none";
+}
+
+const UNSUPPORTED_MESSAGE = "This browser can't play H.264 video. Try an up-to-date Chrome or Firefox.";
+
+// Decode errors in a row, with no picture in between, before giving up on
+// a backend.
+const MAX_DECODE_FAILURES = 3;
+
+// What either backend looks like to the dashboard.
+interface StreamDecoder {
+  decode(frame: ParsedVideoFrame): void;
+  close(): void;
+  // Frames shown and dropped so far, where the browser counts them itself.
+  playbackQuality?(): { shown: number; dropped: number } | null;
+  debugInfo?(): string;
+}
+
 function sortByName(machines: Machine[]): Machine[] {
   return [...machines].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// A frame gap this long means the stream has stalled: the host encodes on a
+// fixed clock, so an idle screen still sends frames.
+const STALL_MS = 3000;
+
+// ?debug in the URL adds the decoder's readout to the stream stats.
+const DEBUG = new URLSearchParams(window.location.search).has("debug");
+
+export interface StreamStats {
+  fps: number; // frames shown over the last second
+  received: number; // frames that arrived over the last second
+  dropped: number; // decoded but not shown over the last second (MSE only)
+  debug: string | null; // the decoder's own readout, with ?debug in the URL
+  kbps: number; // video received over the last second
+  receiving: boolean; // frames are arriving
 }
 
 export interface Dashboard {
@@ -42,6 +91,14 @@ export interface Dashboard {
   viewingId: string | null;
   // Attach to the <canvas> that frames are drawn into.
   canvasRef: RefObject<HTMLCanvasElement>;
+  // The size of the picture on the canvas; null until the open view's
+  // first frame is drawn.
+  picture: { width: number; height: number } | null;
+  // Measured once a second while a view is open.
+  stats: StreamStats | null;
+  // Set when this browser can't decode the stream, or the decoder keeps
+  // failing; the view shows it instead of waiting for a picture.
+  decodeError: string | null;
   startView: (deviceId: string) => void;
   stopView: () => void;
   // Sends one input event to the machine being watched. The relay drops it
@@ -64,10 +121,16 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [retryAt, setRetryAt] = useState<number | null>(null);
   const [viewingId, setViewingId] = useState<string | null>(null);
+  const [picture, setPicture] = useState<Dashboard["picture"]>(null);
+  const [stats, setStats] = useState<StreamStats | null>(null);
+  const [decodeError, setDecodeError] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const decoderRef = useRef<VideoDecoder | null>(null);
+  const decoderRef = useRef<StreamDecoder | null>(null);
+  // null until detectBackend() settles; frames before that are dropped.
+  const backendRef = useRef<Backend | null>(null);
+  const failuresRef = useRef(0);
   const sawKeyframeRef = useRef(false);
   // Read inside the socket's handlers, which are created once per socket.
   const viewingRef = useRef<string | null>(null);
@@ -75,6 +138,11 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
   // reconnect until the view is resumed.
   const streamingRef = useRef<string | null>(null);
   const reconnectNowRef = useRef<() => void>(() => {});
+  // Counted per frame, read and reset by the once-a-second stats sample.
+  const framesRef = useRef(0);
+  const bytesRef = useRef(0);
+  const receivedRef = useRef(0);
+  const lastFrameAtRef = useRef(0);
 
   const send = useCallback((command: DashboardCommand): boolean => {
     const socket = socketRef.current;
@@ -94,68 +162,161 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
     sawKeyframeRef.current = false;
     const decoder = decoderRef.current;
     decoderRef.current = null;
-    if (decoder !== null && decoder.state !== "closed") decoder.close();
+    decoder?.close();
   }, []);
 
-  const drawFrame = useCallback((frame: VideoFrame): void => {
-    const canvas = canvasRef.current;
-    if (canvas === null) {
+  // Sizes the canvas to the picture, lets `draw` paint it, and counts it.
+  const paint = useCallback(
+    (width: number, height: number, draw: (context: CanvasRenderingContext2D) => void): void => {
+      const canvas = canvasRef.current;
+      if (canvas === null || width === 0 || height === 0) return;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+        setPicture({ width, height });
+      }
+      const context = canvas.getContext("2d");
+      if (context !== null) draw(context);
+      failuresRef.current = 0;
+      framesRef.current += 1;
+      lastFrameAtRef.current = performance.now();
+    },
+    [],
+  );
+
+  const drawFrame = useCallback(
+    (frame: VideoFrame): void => {
+      paint(frame.displayWidth, frame.displayHeight, (context) => context.drawImage(frame, 0, 0));
       frame.close();
-      return;
+    },
+    [paint],
+  );
+
+  // The <video> shows the picture itself, under the canvas; the canvas is
+  // only sized to it, left transparent, and takes the input.
+  const sizeToVideo = useCallback(
+    (video: HTMLVideoElement): void => {
+      paint(video.videoWidth, video.videoHeight, () => {});
+    },
+    [paint],
+  );
+
+  // Blanks the canvas, so one machine's screen never shows under another's
+  // name. The next frame drawn sizes it again.
+  const clearPicture = useCallback((): void => {
+    const canvas = canvasRef.current;
+    if (canvas !== null) {
+      canvas.width = 0;
+      canvas.height = 0;
     }
-    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-      canvas.width = frame.displayWidth;
-      canvas.height = frame.displayHeight;
-    }
-    canvas.getContext("2d")?.drawImage(frame, 0, 0);
-    frame.close();
+    setPicture(null);
   }, []);
 
-  const ensureDecoder = useCallback((): VideoDecoder | null => {
+  // A decoder failed: drop it, and the next keyframe starts a new one. If
+  // that keeps happening, move from WebCodecs to MSE, or give up and say so.
+  const onDecodeError = useCallback(
+    (failed: StreamDecoder, message: string): void => {
+      console.error("video decode error:", message);
+      if (decoderRef.current !== failed) return; // already replaced
+      teardownDecoder();
+      failuresRef.current += 1;
+      if (failuresRef.current < MAX_DECODE_FAILURES) return;
+      failuresRef.current = 0;
+      if (backendRef.current === "webcodecs" && mseSupported(DECODER_CODEC)) {
+        backendRef.current = "mse";
+      } else {
+        setDecodeError(`The video decoder keeps failing (${message}).`);
+      }
+    },
+    [teardownDecoder],
+  );
+
+  const ensureDecoder = useCallback((): StreamDecoder | null => {
     if (decoderRef.current !== null) return decoderRef.current;
-    if (typeof VideoDecoder === "undefined") {
-      console.error("WebCodecs VideoDecoder is unavailable in this browser.");
-      return null;
+    let decoder: StreamDecoder;
+    switch (backendRef.current) {
+      case "webcodecs": {
+        const videoDecoder = new VideoDecoder({
+          output: drawFrame,
+          error: (error) => onDecodeError(decoder, error.message),
+        });
+        videoDecoder.configure({ codec: DECODER_CODEC, optimizeForLatency: true });
+        decoder = {
+          decode: (frame) => {
+            if (videoDecoder.state !== "configured") return;
+            videoDecoder.decode(
+              new EncodedVideoChunk({
+                type: frame.isKeyframe ? "key" : "delta",
+                timestamp: frame.timestamp,
+                data: frame.data,
+              }),
+            );
+          },
+          close: () => {
+            if (videoDecoder.state !== "closed") videoDecoder.close();
+          },
+        };
+        break;
+      }
+      case "mse": {
+        const canvas = canvasRef.current;
+        if (canvas === null) return null;
+        const mse: StreamDecoder = new MseDecoder(canvas, sizeToVideo, (message) => onDecodeError(mse, message));
+        decoder = mse;
+        break;
+      }
+      default:
+        return null;
     }
-    const decoder = new VideoDecoder({
-      output: drawFrame,
-      error: (error) => console.error("video decode error:", error.message),
-    });
-    decoder.configure({ codec: DECODER_CODEC, optimizeForLatency: true });
     decoderRef.current = decoder;
     return decoder;
-  }, [drawFrame]);
+  }, [drawFrame, sizeToVideo, onDecodeError]);
 
   const handleFrame = useCallback(
     (buffer: ArrayBuffer): void => {
       const frame = parseVideoFrame(buffer);
       if (frame === null) return;
+      bytesRef.current += buffer.byteLength;
+      receivedRef.current += 1;
 
       // Decoding can only begin on a keyframe; drop deltas until the first
       // one arrives (e.g. when attaching mid-stream).
       if (!sawKeyframeRef.current && !frame.isKeyframe) return;
       sawKeyframeRef.current = true;
 
-      const decoder = ensureDecoder();
-      if (decoder === null || decoder.state !== "configured") return;
-      decoder.decode(
-        new EncodedVideoChunk({
-          type: frame.isKeyframe ? "key" : "delta",
-          timestamp: frame.timestamp,
-          data: frame.data,
-        }),
-      );
+      ensureDecoder()?.decode(frame);
     },
     [ensureDecoder],
   );
 
+  // A new view starts with a clean slate, unless the browser can't decode
+  // at all.
+  const resetDecodeError = useCallback((): void => {
+    failuresRef.current = 0;
+    setDecodeError(backendRef.current === "none" ? UNSUPPORTED_MESSAGE : null);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    void detectBackend().then((backend) => {
+      if (disposed) return;
+      backendRef.current = backend;
+      if (backend === "none") setDecodeError(UNSUPPORTED_MESSAGE);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
   // The open view is gone for good: stopped, or the machine was taken away.
   const clearView = useCallback((): void => {
+    resetDecodeError();
     viewingRef.current = null;
     streamingRef.current = null;
     setViewingId(null);
     teardownDecoder();
-  }, [teardownDecoder]);
+    clearPicture();
+  }, [clearPicture, resetDecodeError, teardownDecoder]);
 
   const handleEvent = useCallback(
     (payload: DashboardEvent): void => {
@@ -288,13 +449,61 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
       if (streamingRef.current !== null) send({ type: "stop_view", deviceId: streamingRef.current });
       streamingRef.current = null;
       teardownDecoder();
+      clearPicture();
+      resetDecodeError();
 
       viewingRef.current = deviceId;
       setViewingId(deviceId);
       requestStream(deviceId); // while disconnected, the snapshot resumes it
     },
-    [requestStream, send, teardownDecoder],
+    [clearPicture, requestStream, resetDecodeError, send, teardownDecoder],
   );
+
+  useEffect(() => {
+    if (viewingId === null) {
+      setStats(null);
+      return;
+    }
+    framesRef.current = 0;
+    bytesRef.current = 0;
+    receivedRef.current = 0;
+    lastFrameAtRef.current = 0;
+    let last = performance.now();
+    // Per decoder, since a new one starts counting from zero.
+    let lastDecoder: StreamDecoder | null = null;
+    let lastQuality = { shown: 0, dropped: 0 };
+    const timer = window.setInterval(() => {
+      const now = performance.now();
+      const seconds = Math.max(0.001, (now - last) / 1000);
+      last = now;
+      // The browser's own counts where it keeps them (MSE), else the
+      // frames drawn here (WebCodecs).
+      const decoder = decoderRef.current;
+      const quality = decoder?.playbackQuality?.() ?? null;
+      let shown = framesRef.current;
+      let dropped = 0;
+      if (quality !== null) {
+        if (decoder === lastDecoder) {
+          shown = Math.max(0, quality.shown - lastQuality.shown);
+          dropped = Math.max(0, quality.dropped - lastQuality.dropped);
+        }
+        lastQuality = quality;
+      }
+      lastDecoder = decoder;
+      setStats({
+        fps: Math.round(shown / seconds),
+        received: Math.round(receivedRef.current / seconds),
+        dropped: Math.round(dropped / seconds),
+        debug: DEBUG ? (decoder?.debugInfo?.() ?? null) : null,
+        kbps: Math.round((bytesRef.current * 8) / 1000 / seconds),
+        receiving: now - lastFrameAtRef.current < STALL_MS,
+      });
+      framesRef.current = 0;
+      bytesRef.current = 0;
+      receivedRef.current = 0;
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [viewingId]);
 
   const sendInput = useCallback(
     (event: InputEvent): void => {
@@ -315,5 +524,18 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
 
   const reconnectNow = useCallback((): void => reconnectNowRef.current(), []);
 
-  return { machines, status, retryAt, viewingId, canvasRef, startView, stopView, sendInput, reconnectNow };
+  return {
+    machines,
+    status,
+    retryAt,
+    viewingId,
+    canvasRef,
+    picture,
+    stats,
+    decodeError,
+    startView,
+    stopView,
+    sendInput,
+    reconnectNow,
+  };
 }

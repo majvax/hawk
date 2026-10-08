@@ -37,7 +37,3 @@ declare class VideoDecoder {
   close(): void;
   static isConfigSupported(config: VideoDecoderConfig): Promise<{ supported: boolean }>;
 }
-
-interface CanvasRenderingContext2D {
-  drawImage(image: VideoFrame, dx: number, dy: number): void;
-}

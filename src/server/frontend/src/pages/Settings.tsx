@@ -1,4 +1,4 @@
-import { type FormEvent, type JSX, useCallback, useEffect, useState } from "react";
+import { type CSSProperties, type FormEvent, type JSX, useCallback, useEffect, useState } from "react";
 
 import {
   type Session,
@@ -9,26 +9,110 @@ import {
   revokeOtherSessions,
   revokeSession,
 } from "../api.js";
+import { ACCENT_PRESETS, DEFAULT_ACCENT, applyAccent, isAccent, loadAccent, saveAccent } from "../theme.js";
+import { Alert, ConfirmButton, Dot, Tag, errorMessage } from "../ui.js";
 
 const MIN_PASSWORD_LENGTH = 10; // mirrors auth::MIN_PASSWORD_LEN
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "request failed";
-}
-
-// Every user's own account: password and sign-in sessions.
+// Every user's own settings: the look of this dashboard, password and
+// sign-in sessions.
 export function SettingsPage(): JSX.Element {
-  const [sessions, setSessions] = useState<Session[]>([]);
+  const [sessions, setSessions] = useState<Session[] | null>(null);
 
   const refreshSessions = useCallback(async (): Promise<void> => {
     setSessions(await listSessions());
   }, []);
 
   return (
-    <div className="stack">
-      <PasswordSection onChanged={refreshSessions} />
+    <div className="page">
+      <div className="page-head">
+        <h1>Settings</h1>
+      </div>
+      <AccentSection />
       <SessionsSection sessions={sessions} refresh={refreshSessions} />
+      <PasswordSection onChanged={refreshSessions} />
     </div>
+  );
+}
+
+function AccentSection(): JSX.Element {
+  const [accent, setAccent] = useState(loadAccent);
+  const [draft, setDraft] = useState(accent);
+
+  const choose = (color: string): void => {
+    const next = color.toLowerCase();
+    setAccent(next);
+    setDraft(next);
+    applyAccent(next);
+    saveAccent(next);
+  };
+
+  const preset = ACCENT_PRESETS.find((candidate) => candidate.color === accent);
+
+  return (
+    <section className="section">
+      <div className="section-aside">
+        <h2>Accent color</h2>
+        <p>Marks live sessions, captured input and the connect button. Saved in this browser only.</p>
+      </div>
+      <div className="section-main">
+        <div className="swatches" role="radiogroup" aria-label="Accent color">
+          {ACCENT_PRESETS.map((candidate) => (
+            <button
+              key={candidate.id}
+              type="button"
+              role="radio"
+              aria-checked={candidate.color === accent}
+              className="swatch"
+              style={{ "--swatch": candidate.color } as CSSProperties}
+              onClick={() => choose(candidate.color)}
+            >
+              <span className="swatch-chip" aria-hidden />
+              {candidate.label}
+            </button>
+          ))}
+          <label className="swatch" aria-checked={preset === undefined} role="radio">
+            <input type="color" value={accent} onChange={(e) => choose(e.target.value)} aria-label="Custom color" />
+            Custom
+          </label>
+        </div>
+        <div className="form-row tight">
+          <label className="field" style={{ flex: "none", minWidth: 0 }}>
+            <span className="label faint">Hex</span>
+            <input
+              className="input"
+              style={{ width: 120 }}
+              value={draft}
+              maxLength={7}
+              spellCheck={false}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                if (isAccent(e.target.value)) choose(e.target.value);
+              }}
+              onBlur={() => setDraft(accent)}
+            />
+          </label>
+          {accent !== DEFAULT_ACCENT && (
+            <button type="button" className="btn btn-ghost" style={{ alignSelf: "flex-end" }} onClick={() => choose(DEFAULT_ACCENT)}>
+              Reset to cyan
+            </button>
+          )}
+        </div>
+        <div className="accent-preview" aria-label="Preview">
+          <Tag tone="accent" solid>
+            Live
+          </Tag>
+          <button type="button" className="btn btn-accent" tabIndex={-1}>
+            Connect
+          </button>
+          <Tag tone="accent">Live</Tag>
+          <span className="cell muted" style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
+            <Dot tone="accent" />
+            Studio workstation
+          </span>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -64,12 +148,16 @@ function PasswordSection({ onChanged }: { onChanged: () => Promise<void> }): JSX
   };
 
   return (
-    <section>
-      <h2>Change password</h2>
-      <form className="card" onSubmit={submit}>
-        <label>
-          Current password
+    <section className="section">
+      <div className="section-aside">
+        <h2>Password</h2>
+        <p>Changing it signs out every other session on this account.</p>
+      </div>
+      <form className="section-main form-grid" onSubmit={(e) => void submit(e)}>
+        <label className="field">
+          <span className="label">Current password</span>
           <input
+            className="input"
             type="password"
             autoComplete="current-password"
             value={current}
@@ -77,9 +165,10 @@ function PasswordSection({ onChanged }: { onChanged: () => Promise<void> }): JSX
             required
           />
         </label>
-        <label>
-          New password <span className="muted">(at least {MIN_PASSWORD_LENGTH} characters)</span>
+        <label className="field">
+          <span className="label">New password</span>
           <input
+            className="input"
             type="password"
             autoComplete="new-password"
             minLength={MIN_PASSWORD_LENGTH}
@@ -87,10 +176,12 @@ function PasswordSection({ onChanged }: { onChanged: () => Promise<void> }): JSX
             onChange={(e) => setNext(e.target.value)}
             required
           />
+          <span className="field-hint">At least {MIN_PASSWORD_LENGTH} characters.</span>
         </label>
-        <label>
-          Confirm new password
+        <label className="field">
+          <span className="label">Confirm new password</span>
           <input
+            className="input"
             type="password"
             autoComplete="new-password"
             value={confirm}
@@ -98,11 +189,13 @@ function PasswordSection({ onChanged }: { onChanged: () => Promise<void> }): JSX
             required
           />
         </label>
-        {error !== null && <p className="error">{error}</p>}
-        {done && <p className="muted">Password changed. Your other sessions were signed out.</p>}
-        <button type="submit" disabled={busy}>
-          Change password
-        </button>
+        {error !== null && <Alert>{error}</Alert>}
+        {done && <Alert ok>Password changed. Your other sessions were signed out.</Alert>}
+        <div>
+          <button type="submit" className="btn btn-primary" disabled={busy}>
+            {busy ? "Changing…" : "Change password"}
+          </button>
+        </div>
       </form>
     </section>
   );
@@ -112,7 +205,7 @@ function SessionsSection({
   sessions,
   refresh,
 }: {
-  sessions: Session[];
+  sessions: Session[] | null;
   refresh: () => Promise<void>;
 }): JSX.Element {
   const [error, setError] = useState<string | null>(null);
@@ -131,48 +224,61 @@ function SessionsSection({
     await refresh().catch(() => {});
   };
 
-  const others = sessions.filter((session) => !session.current).length;
+  const others = sessions?.filter((session) => !session.current).length ?? 0;
 
   return (
-    <section>
-      <div className="row">
+    <section className="section">
+      <div className="section-aside">
         <h2>Sessions</h2>
-        <button type="button" className="danger" disabled={others === 0} onClick={run(revokeOtherSessions)}>
-          Sign out everywhere else
-        </button>
+        <p>Every browser signed in to this account. Revoke any you don't recognise.</p>
       </div>
-      {error !== null && <p className="error">{error}</p>}
-      <table>
-        <thead>
-          <tr>
-            <th>Browser</th>
-            <th>IP address</th>
-            <th>Signed in</th>
-            <th>Expires</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {sessions.map((session) => (
-            <tr key={session.id}>
-              <td title={session.userAgent ?? undefined}>
-                {describeUserAgent(session.userAgent)}
-                {session.current && <span className="badge">this session</span>}
-              </td>
-              <td>{session.ip ?? <span className="muted">unknown</span>}</td>
-              <td>{formatTime(session.createdAt)}</td>
-              <td>{formatTime(session.expiresAt)}</td>
-              <td className="actions">
-                {!session.current && (
-                  <button type="button" onClick={run(() => revokeSession(session.id))}>
-                    Revoke
-                  </button>
-                )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <div className="section-main">
+        {error !== null && <Alert>{error}</Alert>}
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Browser</th>
+                <th>IP address</th>
+                <th>Signed in</th>
+                <th>Expires</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {sessions?.map((session) => (
+                <tr key={session.id}>
+                  <td title={session.userAgent ?? undefined}>
+                    <span className="cell">
+                      <span className="truncate">{describeUserAgent(session.userAgent)}</span>
+                      {session.current && <Tag tone="ok">This browser</Tag>}
+                    </span>
+                  </td>
+                  <td className="mono">{session.ip ?? <span className="faint">unknown</span>}</td>
+                  <td className="num muted">{formatTime(session.createdAt)}</td>
+                  <td className="num muted">{formatTime(session.expiresAt)}</td>
+                  <td className="actions">
+                    {!session.current && (
+                      <button type="button" className="btn btn-sm" onClick={run(() => revokeSession(session.id))}>
+                        Revoke
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div>
+          <ConfirmButton
+            confirmLabel={`Sign out ${others} ${others === 1 ? "session" : "sessions"}`}
+            disabled={others === 0}
+            onConfirm={() => void run(revokeOtherSessions)()}
+          >
+            Sign out everywhere else
+          </ConfirmButton>
+        </div>
+      </div>
     </section>
   );
 }
