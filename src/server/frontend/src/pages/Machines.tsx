@@ -2,15 +2,16 @@ import { type JSX, type ReactNode, useEffect, useRef, useState } from "react";
 
 import {
   type EnrollmentCode,
-  createEnrollmentCode,
   describeShareTerms,
   formatAgo,
   formatElapsed,
   formatTime,
 } from "../api.js";
+import { createEnrollment } from "../e2e.js";
+import type { Identity } from "../keys.js";
 import type { Machine, Role } from "../protocol.js";
 import { Alert, CodeBlock, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
-import type { Dashboard } from "../useDashboard.js";
+import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
 import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
 
@@ -42,7 +43,15 @@ function accessTerms(machine: Machine): string {
   return describeShareTerms({ startsAt: null, expiresAt: machine.accessExpiresAt, singleView: machine.singleView });
 }
 
-export function MachinesPage({ dashboard, visible }: { dashboard: Dashboard; visible: boolean }): JSX.Element {
+export function MachinesPage({
+  dashboard,
+  identity,
+  visible,
+}: {
+  dashboard: Dashboard;
+  identity: Identity;
+  visible: boolean;
+}): JSX.Element {
   const { machines, status, viewingId, startView, stopView } = dashboard;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [tab, setTab] = useState<DetailTab>("screen");
@@ -69,7 +78,7 @@ export function MachinesPage({ dashboard, visible }: { dashboard: Dashboard; vis
   const addMachine = async (): Promise<void> => {
     setError(null);
     try {
-      setEnrollment(await createEnrollmentCode());
+      setEnrollment(await createEnrollment(identity));
     } catch (caught) {
       setError(errorMessage(caught));
     }
@@ -191,9 +200,15 @@ export function MachinesPage({ dashboard, visible }: { dashboard: Dashboard; vis
                 ))}
               </div>
             )}
-            {detailTab === "sharing" && <SharingPanel key={selected.id} machine={selected} />}
+            {detailTab === "sharing" && <SharingPanel key={selected.id} machine={selected} identity={identity} />}
             {detailTab === "machine" && (
-              <MachineSettings key={selected.id} machine={selected} onRemoved={() => select(null)} />
+              <MachineSettings
+                key={selected.id}
+                machine={selected}
+                identity={identity}
+                enrollmentCheck={dashboard.enrollmentChecks[selected.id]}
+                onRemoved={() => select(null)}
+              />
             )}
           </>
         )}
@@ -238,6 +253,10 @@ function RailItem({
         <Tag tone="accent">Live</Tag>
       ) : machine.role === "owner" && machine.keyStorage === null ? (
         <Tag tone="err">Re-enroll</Tag>
+      ) : machine.publicKey !== null && machine.endorsement === null ? (
+        <Tag tone="warn" title="Its key hasn't been verified yet, so nobody can watch it">
+          Unverified
+        </Tag>
       ) : watchers > 0 ? (
         <Tag title={machine.viewers?.join(", ")}>{watchers} watching</Tag>
       ) : (
@@ -423,7 +442,10 @@ function Enrollment({ enrollment, onDone }: { enrollment: EnrollmentCode; onDone
           <CodeBlock value={enrollment.code} big />
         </li>
         <li>
-          <span>On the PC, run this from an elevated PowerShell in the Hawk folder:</span>
+          <span>
+            On the PC, run this from an elevated PowerShell in the Hawk folder. The code never reaches the relay: it
+            lets your machine and this browser check each other's keys.
+          </span>
           <CodeBlock value={installCommand(enrollment)} />
           {enrollment.relayPin !== null && (
             <span className="field-hint">
@@ -433,7 +455,10 @@ function Enrollment({ enrollment, onDone }: { enrollment: EnrollmentCode; onDone
           )}
         </li>
         <li>
-          <span>The machine shows up in the list once it connects.</span>
+          <span>
+            The machine shows up in the list once it connects, and this browser verifies its key on its own. Made
+            the code elsewhere? Compare fingerprints in the machine's Machine tab instead.
+          </span>
           <span />
         </li>
       </ol>
@@ -464,7 +489,7 @@ function Viewer({
   status: Dashboard["status"];
   onConnect: (machine: Machine) => void;
 }): JSX.Element {
-  const { canvasRef, picture, stats, decodeError, sendInput, stopView } = dashboard;
+  const { canvasRef, picture, stats, decodeError, security, sendInput, stopView } = dashboard;
   const stageRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [keysLocked, setKeysLocked] = useState(false);
@@ -473,7 +498,13 @@ function Viewer({
   // Nothing to send input to unless a picture is actually up, and the relay
   // would drop it from a view-only share anyway.
   const canControl =
-    onScreen && viewing.role !== "view" && viewing.online && status === "open" && picture !== null;
+    onScreen &&
+    viewing.role !== "view" &&
+    viewing.online &&
+    status === "open" &&
+    picture !== null &&
+    security?.kind === "secured" &&
+    security.role !== "view";
   const input = useRemoteInput(canvasRef, canControl, sendInput);
 
   useEffect(() => {
@@ -515,7 +546,7 @@ function Viewer({
     canvasRef.current?.focus();
   };
 
-  const signal = signalFor({ onScreen, selected, viewing, status, picture, stats, decodeError, onConnect });
+  const signal = signalFor({ onScreen, selected, viewing, status, picture, stats, decodeError, security, onConnect });
   const name = selected?.name ?? "";
 
   return (
@@ -623,6 +654,7 @@ function signalFor({
   picture,
   stats,
   decodeError,
+  security,
   onConnect,
 }: {
   onScreen: boolean;
@@ -632,6 +664,7 @@ function signalFor({
   picture: Dashboard["picture"];
   stats: Dashboard["stats"];
   decodeError: Dashboard["decodeError"];
+  security: ViewSecurity | null;
   onConnect: (machine: Machine) => void;
 }): ReactNode {
   if (selected === null) return null;
@@ -671,6 +704,16 @@ function signalFor({
       </Signal>
     );
   }
+  const problem = securityProblem(security);
+  if (problem !== null) return <Signal label={problem.label}>{problem.detail}</Signal>;
+  if (security?.kind === "securing" && picture === null) {
+    return (
+      <Signal label="Securing" searching>
+        Exchanging keys with {selected.name}. The stream is encrypted end to end, so it starts once the machine
+        has checked your access.
+      </Signal>
+    );
+  }
   if (decodeError !== null) {
     return <Signal label="Can't decode" over={over}>{decodeError}</Signal>;
   }
@@ -689,6 +732,29 @@ function signalFor({
     );
   }
   return null;
+}
+
+const UNTRUSTED: Record<Extract<ViewSecurity, { kind: "untrusted" }>["reason"], string> = {
+  "re-enroll": "This machine was enrolled before end-to-end encryption. Its owner needs to enroll it again.",
+  unendorsed:
+    "Its owner hasn't verified this machine's key yet, so there's no way to be sure the stream really comes from it.",
+  "owner-key-changed":
+    "The owner's key isn't the one first seen for them. Someone may be between you and the machine; check with the owner before going on.",
+  "bad-endorsement": "The machine's key isn't vouched for by its owner's key. Don't trust this machine.",
+};
+
+// Why the open view can't go ahead securely, if it can't.
+function securityProblem(security: ViewSecurity | null): { label: string; detail: string } | null {
+  switch (security?.kind) {
+    case "untrusted":
+      return { label: "Not verified", detail: UNTRUSTED[security.reason] };
+    case "rejected":
+      return { label: "Refused", detail: `The machine refused this view: ${security.reason}.` };
+    case "failed":
+      return { label: "Insecure answer", detail: `The machine's answer didn't check out (${security.message}).` };
+    default:
+      return null;
+  }
 }
 
 function Signal({

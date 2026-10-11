@@ -1,5 +1,6 @@
 // Typed wrappers over the relay's /api routes (relay/src/api.rs). The
 // session lives in an HttpOnly cookie, so nothing here touches tokens.
+// Nothing here sees a password either: keys.ts derives what's sent from it.
 
 export interface User {
   id: number;
@@ -65,11 +66,33 @@ export async function getSession(): Promise<User | null> {
   }
 }
 
+// How to derive this account's keys from its password. "legacy" accounts
+// still log in with the password itself until they're upgraded.
+export interface LoginParams {
+  kdf: "pbkdf2-sha256" | "legacy";
+  iterations: number;
+}
+
+// An identity key as stored on the relay: the public half, and the private
+// half encrypted under the password (base64).
+export interface KeyUpload {
+  publicKey: string;
+  wrappedKey: string;
+  iterations: number;
+}
+
+export const loginParams = (email: string) => request<LoginParams>("POST", "/api/login/params", { email });
+// `password` is the derived auth key, or for a legacy account the password.
 export const login = (email: string, password: string) => request<User>("POST", "/api/login", { email, password });
 export const logout = () => request<void>("POST", "/api/logout");
 export const getInvite = (token: string) => request<InviteInfo>("GET", `/api/invites/${encodeURIComponent(token)}`);
-export const signup = (token: string, email: string, password: string) =>
-  request<User>("POST", "/api/signup", { token, email, password });
+export const signup = (token: string, email: string, password: string, key: KeyUpload) =>
+  request<User>("POST", "/api/signup", { token, email, password, ...key });
+export const getAccountKey = () => request<{ publicKey: string; wrappedKey: string }>("GET", "/api/account/key");
+export const upgradeAccount = (currentPassword: string, password: string, key: KeyUpload) =>
+  request<void>("POST", "/api/account/upgrade", { currentPassword, password, ...key });
+export const lookupUserKey = (email: string) =>
+  request<{ userId: number; email: string; publicKey: string | null }>("POST", "/api/users/lookup", { email });
 
 export interface Session {
   id: number;
@@ -80,8 +103,10 @@ export interface Session {
   current: boolean; // the session this dashboard is using
 }
 
-export const changePassword = (currentPassword: string, newPassword: string) =>
-  request<void>("POST", "/api/account/password", { currentPassword, newPassword });
+// Both passwords as derived auth keys, and the identity key re-wrapped
+// under the new one.
+export const changePassword = (currentPassword: string, newPassword: string, wrappedKey: string) =>
+  request<void>("POST", "/api/account/password", { currentPassword, newPassword, wrappedKey });
 export const listSessions = () => request<Session[]>("GET", "/api/sessions");
 export const revokeSession = (id: number) => request<void>("DELETE", `/api/sessions/${id}`);
 export const revokeOtherSessions = () => request<void>("POST", "/api/sessions/revoke-others");
@@ -119,9 +144,15 @@ export const createInvite = () => request<CreatedInvite>("POST", "/api/admin/inv
 export const deleteInvite = (id: number) => request<void>("DELETE", `/api/admin/invites/${id}`);
 
 export interface EnrollmentCode {
-  code: string; // shown once; the server keeps only its hash
+  code: string; // made in this browser; the relay only ever sees its hash
   expiresAt: number;
   relayPin: string | null; // the relay's TLS key pin; null when serving without TLS
+}
+
+// A statement and its signer's signature (base64), as the relay stores it.
+export interface SignedStatement {
+  statement: string;
+  signature: string;
 }
 
 // When and how long a share grants access. All optional: an open-ended
@@ -136,18 +167,23 @@ export interface ShareTerms {
 export interface Share extends ShareTerms {
   userId: number;
   email: string;
+  publicKey: string | null; // the recipient's identity key; null until they set one up
+  grant: SignedStatement | null; // what the owner signed; null for a share from before grants
 }
 
 const machinePath = (id: string) => `/api/machines/${encodeURIComponent(id)}`;
 
-export const createEnrollmentCode = () => request<EnrollmentCode>("POST", "/api/machines/enroll");
+export const registerEnrollmentCode = (codeHash: string, ownerBinding: string) =>
+  request<Omit<EnrollmentCode, "code">>("POST", "/api/machines/enroll", { codeHash, ownerBinding });
+export const endorseMachine = (id: string, signature: string) =>
+  request<void>("POST", `${machinePath(id)}/endorsement`, { signature });
 export const renameMachine = (id: string, name: string) => request<void>("PATCH", machinePath(id), { name });
 export const removeMachine = (id: string) => request<void>("DELETE", machinePath(id));
 export const listShares = (id: string) => request<Share[]>("GET", `${machinePath(id)}/shares`);
-export const shareMachine = (id: string, email: string, terms: ShareTerms) =>
-  request<void>("PUT", `${machinePath(id)}/shares`, { email, ...terms });
-export const unshareMachine = (id: string, userId: number) =>
-  request<void>("DELETE", `${machinePath(id)}/shares/${userId}`);
+export const shareMachine = (id: string, email: string, terms: ShareTerms, grant: SignedStatement) =>
+  request<void>("PUT", `${machinePath(id)}/shares`, { email, ...terms, grant });
+export const unshareMachine = (id: string, userId: number, revocation: SignedStatement | null) =>
+  request<void>("DELETE", `${machinePath(id)}/shares/${userId}`, { revocation });
 
 export function inviteUrl(token: string): string {
   return `${window.location.origin}/invite/${token}`;

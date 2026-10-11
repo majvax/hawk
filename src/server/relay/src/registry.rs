@@ -3,7 +3,7 @@
 //! is the source of truth for access; API handlers mirror every change into
 //! the registry so open dashboards update (and lose access) immediately.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,8 +12,11 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 
-use crate::db::{MachineRow, Role};
-use crate::protocol::{DashboardEvent, DeviceCommand, InputEvent, MachineView, MouseButton, is_keyframe};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
+use crate::db::{MachineRow, Role, Signed};
+use crate::protocol::{DashboardEvent, DeviceCommand, MachineView, SignedView, is_keyframe};
 
 pub type DashboardId = u64;
 
@@ -71,48 +74,6 @@ struct Viewer {
     // Set for a new viewer and whenever its queue overflowed: a dropped
     // frame breaks every delta after it, so skip ahead to the next keyframe.
     awaiting_keyframe: bool,
-    /// This viewer has sent input, so it may have keys or buttons held down
-    /// on the machine that must be released when it stops controlling.
-    sent_input: bool,
-    /// What this viewer's input is holding down right now, so letting go on
-    /// its behalf leaves another controller's keys and buttons alone.
-    held: HashSet<Held>,
-}
-
-/// A key or button some viewer's input pressed and hasn't released.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum Held {
-    Button(MouseButton),
-    Key(String),
-}
-
-impl Held {
-    fn released(self) -> InputEvent {
-        match self {
-            Self::Button(button) => InputEvent::MouseButton { button, down: false },
-            Self::Key(code) => InputEvent::Key { code, down: false },
-        }
-    }
-}
-
-/// More keys than a person can hold. The relay doesn't know which key codes
-/// the machine understands, so without a cap a dashboard could grow the set
-/// with made-up ones.
-const MAX_HELD: usize = 32;
-
-impl Viewer {
-    fn track(&mut self, event: &InputEvent) {
-        let (held, down) = match event {
-            InputEvent::MouseButton { button, down } => (Held::Button(*button), *down),
-            InputEvent::Key { code, down } => (Held::Key(code.clone()), *down),
-            InputEvent::MouseMove { .. } | InputEvent::Wheel { .. } => return,
-        };
-        if !down {
-            self.held.remove(&held);
-        } else if self.held.len() < MAX_HELD {
-            self.held.insert(held);
-        }
-    }
 }
 
 struct Device {
@@ -128,29 +89,13 @@ impl Device {
     fn send(&self, command: DeviceCommand) {
         let _ = self.outbound.send(DeviceOutbound::Command(command));
     }
+}
 
-    /// Lets go of whatever `dashboard`'s input is holding on the machine.
-    /// With no other viewer holding anything, the machine releases
-    /// everything, which also catches a release the relay never saw.
-    /// Otherwise only this viewer's own keys and buttons are released, and
-    /// not those another viewer is holding too, so their drag or modifier
-    /// survives.
-    fn release_input(&mut self, dashboard: DashboardId) {
-        let Some(viewer) = self.viewers.get_mut(&dashboard) else { return };
-        if !std::mem::take(&mut viewer.sent_input) {
-            return;
-        }
-        let held = std::mem::take(&mut viewer.held);
-        if self.viewers.values().all(|viewer| viewer.held.is_empty()) {
-            self.send(DeviceCommand::ReleaseInput);
-            return;
-        }
-        for item in held {
-            if !self.viewers.values().any(|viewer| viewer.held.contains(&item)) {
-                self.send(DeviceCommand::Input { event: item.released() });
-            }
-        }
-    }
+/// What the machine sent for one of its viewers.
+pub enum Answer {
+    Accept { statement: String, signature: String, wrapped_key: String },
+    Reject { reason: String },
+    StreamKey { wrapped_key: String },
 }
 
 #[derive(Default)]
@@ -185,6 +130,12 @@ impl Inner {
                 emails.dedup();
                 emails
             }),
+            public_key: row.public_key.as_ref().map(|key| BASE64.encode(key)),
+            owner_public_key: row.owner_public_key.as_ref().map(|key| BASE64.encode(key)),
+            endorsement: row.endorsement.as_ref().map(|signature| BASE64.encode(signature)),
+            enroll_code_hash: row.enroll_code_hash.as_ref().map(|hash| BASE64.encode(hash)),
+            enroll_binding: row.enroll_binding.as_ref().map(|binding| BASE64.encode(binding)),
+            granted: row.role == Role::Owner || row.grant.is_some(),
         }
     }
 
@@ -197,14 +148,15 @@ impl Inner {
         }
     }
 
-    /// Stops `dashboard` watching `machine_id`. The last viewer leaving stops
-    /// capture on the device. Returns whether it was watching.
+    /// Stops `dashboard` watching `machine_id`. The machine lets go of its
+    /// input and rekeys the stream for whoever is left; the last viewer
+    /// leaving stops capture. Returns whether it was watching.
     fn detach(&mut self, dashboard: DashboardId, machine_id: &str) -> bool {
         let Some(device) = self.devices.get_mut(machine_id) else { return false };
-        device.release_input(dashboard);
         if device.viewers.remove(&dashboard).is_none() {
             return false;
         }
+        device.send(DeviceCommand::ViewerLeft { viewer: dashboard });
         if device.viewers.is_empty() {
             device.send(DeviceCommand::StopCapture);
         }
@@ -395,39 +347,44 @@ impl Registry {
     }
 
     /// The first viewer makes the machine start capturing; later viewers just
-    /// attach to the stream. Returns false if the machine is offline or this
-    /// dashboard has no access to it.
-    pub fn start_view(&self, dashboard_id: DashboardId, machine_id: &str) -> bool {
+    /// attach to the stream. Either way the machine is handed the viewer's
+    /// signed join request and its grant, and only streams to it once it
+    /// has checked them (see [`Registry::answer`]). Returns false if the
+    /// machine is offline or this dashboard has no access to it.
+    pub fn start_view(&self, dashboard_id: DashboardId, machine_id: &str, join: SignedView) -> bool {
         let mut inner = self.lock();
         let Some(dashboard) = inner.dashboards.get(&dashboard_id) else { return false };
-        if !dashboard.access.contains_key(machine_id) {
-            return false;
-        }
+        let Some(row) = dashboard.access.get(machine_id) else { return false };
+        let grant = row.grant.as_ref().map(SignedView::from);
         let viewer = Viewer {
             frames: dashboard.handle.frames.clone(),
             email: dashboard.handle.email.clone(),
             awaiting_keyframe: true,
-            sent_input: false,
-            held: HashSet::new(),
         };
         let Some(device) = inner.devices.get_mut(machine_id) else { return false };
         let was_idle = device.viewers.is_empty();
-        // Asked again while already watching: start over from the next
-        // keyframe, but keep what its input is holding, or it would never be
-        // released when this viewer leaves.
+        // Asked again while already watching (a fresh key exchange): start
+        // over from the next keyframe.
         device.viewers.entry(dashboard_id).and_modify(|viewer| viewer.awaiting_keyframe = true).or_insert(viewer);
         if was_idle {
             device.send(DeviceCommand::StartCapture);
         }
+        device.send(DeviceCommand::ViewerJoin {
+            viewer: dashboard_id,
+            statement: join.statement,
+            signature: join.signature,
+            grant,
+        });
         inner.publish(machine_id);
         true
     }
 
-    /// Forwards input to the machine if this dashboard may control it: its
-    /// user has a control (or owner) role, and it's watching the machine
-    /// right now. Returns whether it was forwarded.
-    pub fn input(&self, dashboard_id: DashboardId, machine_id: &str, event: InputEvent) -> bool {
-        let mut inner = self.lock();
+    /// Passes sealed input on to the machine if this dashboard may control
+    /// it: its user has a control (or owner) role, and it's watching the
+    /// machine right now. The machine checks the role again against the
+    /// owner's grant before acting on it. Returns whether it was passed on.
+    pub fn input(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
         let may_control = inner
             .dashboards
             .get(&dashboard_id)
@@ -436,12 +393,44 @@ impl Registry {
         if !may_control {
             return false;
         }
-        let Some(device) = inner.devices.get_mut(machine_id) else { return false };
-        let Some(viewer) = device.viewers.get_mut(&dashboard_id) else { return false };
-        viewer.sent_input = true;
-        viewer.track(&event);
-        device.send(DeviceCommand::Input { event });
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !device.viewers.contains_key(&dashboard_id) {
+            return false;
+        }
+        device.send(DeviceCommand::Input { viewer: dashboard_id, sealed });
         true
+    }
+
+    /// Routes the machine's answer to one of its viewers. A refused viewer
+    /// stops being sent frames, and is told why.
+    pub fn answer(&self, machine_id: &str, viewer: DashboardId, answer: Answer) {
+        let mut inner = self.lock();
+        let watching = inner.devices.get(machine_id).is_some_and(|device| device.viewers.contains_key(&viewer));
+        if !watching {
+            return;
+        }
+        let device_id = machine_id.to_owned();
+        let event = match answer {
+            Answer::Accept { statement, signature, wrapped_key } => {
+                DashboardEvent::ViewAccepted { device_id, statement, signature, wrapped_key }
+            }
+            Answer::StreamKey { wrapped_key } => DashboardEvent::StreamKey { device_id, wrapped_key },
+            Answer::Reject { reason } => {
+                inner.detach(viewer, machine_id);
+                DashboardEvent::ViewRejected { device_id, reason }
+            }
+        };
+        if let Some(dashboard) = inner.dashboards.get(&viewer) {
+            dashboard.handle.send(event);
+        }
+    }
+
+    /// Hands the machine every revocation its owner signed, if it's online.
+    pub fn send_revocations(&self, machine_id: &str, revocations: &[Signed]) {
+        let inner = self.lock();
+        if let Some(device) = inner.devices.get(machine_id) {
+            device.send(DeviceCommand::Revocations { revocations: revocations.iter().map(SignedView::from).collect() });
+        }
     }
 
     pub fn stop_view(&self, dashboard_id: DashboardId, machine_id: &str) {
@@ -465,7 +454,9 @@ impl Registry {
     // ---- access changes (mirrors of committed database changes) -----------
 
     /// `row.role` on `row.public_id` for every open dashboard of `user_id`:
-    /// a new share, a changed role, or a newly enrolled machine.
+    /// a new share, changed terms, or a newly enrolled or endorsed machine.
+    /// Their open views of it end and start over, so the machine checks the
+    /// new grant (and lets go of their input if they lost control).
     pub fn grant(&self, user_id: i64, row: &MachineRow) {
         let mut inner = self.lock();
         let ids: Vec<DashboardId> = inner
@@ -478,13 +469,12 @@ impl Registry {
             if let Some(dashboard) = inner.dashboards.get_mut(id) {
                 dashboard.access.insert(row.public_id.clone(), row.clone());
             }
-        }
-        // Down to view only: whatever their input was holding is let go.
-        if row.role < Role::Control
-            && let Some(device) = inner.devices.get_mut(&row.public_id)
-        {
-            for id in &ids {
-                device.release_input(*id);
+            if inner.detach(*id, &row.public_id)
+                && let Some(dashboard) = inner.dashboards.get(id)
+            {
+                // The dashboard asks again once it hears the machine is
+                // online (the update published below).
+                dashboard.handle.send(DashboardEvent::CaptureEnded { device_id: row.public_id.clone() });
             }
         }
         inner.publish(&row.public_id);
@@ -536,7 +526,6 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{InputEvent, MouseButton};
 
     const MACHINE: &str = "machine-1";
 
@@ -552,128 +541,136 @@ mod tests {
             role,
             share_expires_at: None,
             single_view: false,
+            public_key: None,
+            owner_public_key: None,
+            endorsement: None,
+            enroll_code_hash: None,
+            enroll_binding: None,
+            grant: (role != Role::Owner)
+                .then(|| Signed { statement: "hawk-grant-v1".to_owned(), signature: vec![1, 2, 3] }),
         }
     }
 
-    fn handle(user_id: i64) -> DashboardHandle {
-        let (events, _) = mpsc::unbounded_channel();
+    fn handle(user_id: i64) -> (DashboardHandle, mpsc::UnboundedReceiver<Outbound>) {
+        let (events, events_rx) = mpsc::unbounded_channel();
         let (frames, _) = mpsc::channel(1);
-        DashboardHandle { events, frames, user_id, session_id: user_id, email: format!("user{user_id}@example.com") }
+        let handle =
+            DashboardHandle { events, frames, user_id, session_id: user_id, email: format!("user{user_id}@example.com") };
+        (handle, events_rx)
+    }
+
+    fn join() -> SignedView {
+        SignedView { statement: "hawk-join-v1".to_owned(), signature: "c2ln".to_owned() }
+    }
+
+    fn next(device_rx: &mut mpsc::UnboundedReceiver<DeviceOutbound>) -> Option<DeviceCommand> {
+        match device_rx.try_recv() {
+            Ok(DeviceOutbound::Command(command)) => Some(command),
+            _ => None,
+        }
     }
 
     /// A registry with the machine connected and one dashboard of `role`
-    /// watching it, plus the receiving end of the device's commands (its
-    /// start_capture already taken off).
-    fn watching(role: Role) -> (Registry, DashboardId, mpsc::UnboundedReceiver<DeviceOutbound>) {
+    /// watching it, plus the receiving ends of the device's commands (start
+    /// and join already taken off) and of the dashboard's events.
+    fn watching(
+        role: Role,
+    ) -> (Registry, DashboardId, mpsc::UnboundedReceiver<DeviceOutbound>, mpsc::UnboundedReceiver<Outbound>) {
         let registry = Registry::default();
         let user_id = if role == Role::Owner { 1 } else { 2 };
-        let dashboard = registry.add_dashboard(handle(user_id), vec![row(role)]);
+        let (handle, events_rx) = handle(user_id);
+        let dashboard = registry.add_dashboard(handle, vec![row(role)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
         registry.add_device(MACHINE, 1, outbound);
-        assert!(registry.start_view(dashboard, MACHINE));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StartCapture))));
-        (registry, dashboard, device_rx)
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture)));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
+        (registry, dashboard, device_rx, events_rx)
     }
 
-    fn click() -> InputEvent {
-        InputEvent::MouseButton { button: MouseButton::Left, down: true }
+    #[test]
+    fn joining_hands_the_machine_the_grant() {
+        let registry = Registry::default();
+        let (handle, _events) = handle(2);
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::View)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture)));
+        let Some(DeviceCommand::ViewerJoin { viewer, grant, .. }) = next(&mut device_rx) else { panic!("no join") };
+        assert_eq!(viewer, dashboard);
+        assert_eq!(grant.map(|grant| grant.statement), Some("hawk-grant-v1".to_owned()));
     }
 
     #[test]
     fn control_input_reaches_the_machine() {
-        let (registry, dashboard, mut device_rx) = watching(Role::Control);
-        assert!(registry.input(dashboard, MACHINE, click()));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::Input { .. }))));
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
+        assert!(registry.input(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Input { viewer, .. }) if viewer == dashboard));
     }
 
     #[test]
     fn view_only_input_is_dropped() {
-        let (registry, dashboard, mut device_rx) = watching(Role::View);
-        assert!(!registry.input(dashboard, MACHINE, click()));
-        assert!(device_rx.try_recv().is_err());
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::View);
+        assert!(!registry.input(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
     }
 
     #[test]
     fn input_needs_an_open_view() {
-        let (registry, dashboard, mut device_rx) = watching(Role::Control);
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
         registry.stop_view(dashboard, MACHINE);
-        assert!(!registry.input(dashboard, MACHINE, click()));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StopCapture))));
+        assert!(!registry.input(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerLeft { viewer }) if viewer == dashboard));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StopCapture)));
     }
 
-    /// Whatever a viewer's input is holding down is let go when they stop
-    /// watching, before the machine is told to stop capturing.
+    /// The machine hears who left before it's told to stop, so it can let
+    /// go of their input and rekey the stream.
     #[test]
-    fn leaving_releases_input() {
-        let (registry, dashboard, mut device_rx) = watching(Role::Control);
-        assert!(registry.input(dashboard, MACHINE, click()));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::Input { .. }))));
-
+    fn leaving_tells_the_machine() {
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
         registry.remove_dashboard(dashboard);
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StopCapture))));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerLeft { viewer }) if viewer == dashboard));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StopCapture)));
     }
 
-    /// Nothing to release from a viewer who never sent any input.
+    /// New terms end the view so it starts over with the new grant.
     #[test]
-    fn leaving_without_input_releases_nothing() {
-        let (registry, dashboard, mut device_rx) = watching(Role::Control);
-        registry.remove_dashboard(dashboard);
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StopCapture))));
-    }
-
-    /// Dropped to view only mid-session: the keys their input was holding
-    /// are released at once, and nothing more gets through.
-    #[test]
-    fn losing_control_releases_input() {
-        let (registry, dashboard, mut device_rx) = watching(Role::Control);
-        assert!(registry.input(dashboard, MACHINE, click()));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::Input { .. }))));
-
+    fn new_terms_restart_the_view() {
+        let (registry, dashboard, mut device_rx, mut events) = watching(Role::Control);
         registry.grant(2, &row(Role::View));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
-        assert!(!registry.input(dashboard, MACHINE, click()));
-        assert!(device_rx.try_recv().is_err());
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerLeft { viewer }) if viewer == dashboard));
+        let mut ended = false;
+        while let Ok(Outbound::Event(event)) = events.try_recv() {
+            ended |= matches!(*event, DashboardEvent::CaptureEnded { .. });
+        }
+        assert!(ended);
+        assert!(!registry.input(dashboard, MACHINE, "sealed".to_owned()));
     }
 
-    /// Re-requesting a view it already has doesn't make the relay forget
-    /// what this viewer's input is holding.
+    /// A refused viewer is told why and gets no more frames.
     #[test]
-    fn restarting_a_view_keeps_held_input() {
-        let (registry, dashboard, mut device_rx) = watching(Role::Control);
-        assert!(registry.input(dashboard, MACHINE, click()));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::Input { .. }))));
-        assert!(registry.start_view(dashboard, MACHINE));
-        assert!(device_rx.try_recv().is_err());
-
-        registry.remove_dashboard(dashboard);
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::StopCapture))));
+    fn rejected_viewers_are_detached() {
+        let (registry, dashboard, mut device_rx, mut events) = watching(Role::View);
+        registry.answer(MACHINE, dashboard, Answer::Reject { reason: "no grant".to_owned() });
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerLeft { .. })));
+        let mut rejected = false;
+        while let Ok(Outbound::Event(event)) = events.try_recv() {
+            rejected |= matches!(*event, DashboardEvent::ViewRejected { .. });
+        }
+        assert!(rejected);
+        assert!(!registry.is_watching(2, MACHINE));
     }
 
-    /// With two controllers, the one leaving lets go only of its own keys:
-    /// the other's held button stays down, and a key both hold stays down.
+    /// Answers only go to a dashboard that is watching that machine.
     #[test]
-    fn leaving_keeps_another_controllers_input() {
-        let (registry, owner, mut device_rx) = watching(Role::Owner);
-        let other = registry.add_dashboard(handle(2), vec![row(Role::Control)]);
-        assert!(registry.start_view(other, MACHINE));
-        let key = |code: &str, down| InputEvent::Key { code: code.to_owned(), down };
-        assert!(registry.input(owner, MACHINE, click()));
-        assert!(registry.input(owner, MACHINE, key("ShiftLeft", true)));
-        assert!(registry.input(other, MACHINE, key("ShiftLeft", true)));
-        assert!(registry.input(other, MACHINE, key("KeyA", true)));
-        while device_rx.try_recv().is_ok() {}
-
-        registry.stop_view(other, MACHINE);
-        let Ok(DeviceOutbound::Command(DeviceCommand::Input { event })) = device_rx.try_recv() else {
-            panic!("expected a key release");
-        };
-        assert_eq!(event, key("KeyA", false));
-        assert!(device_rx.try_recv().is_err());
-
-        // The last one holding anything leaving releases everything.
-        registry.stop_view(owner, MACHINE);
-        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Command(DeviceCommand::ReleaseInput))));
+    fn answers_for_strangers_are_dropped() {
+        let (registry, _dashboard, _device_rx, _events) = watching(Role::View);
+        let (handle, mut stranger_events) = handle(3);
+        let stranger = registry.add_dashboard(handle, vec![]);
+        while stranger_events.try_recv().is_ok() {}
+        registry.answer(MACHINE, stranger, Answer::StreamKey { wrapped_key: "k".to_owned() });
+        assert!(stranger_events.try_recv().is_err());
     }
 }

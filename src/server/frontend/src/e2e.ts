@@ -1,0 +1,350 @@
+// End-to-end encryption between this browser and a machine. The relay
+// carries everything but can read none of it, and nothing it says is taken
+// on trust:
+//
+// - Enrollment: the code is made here and only its hash goes to the relay.
+//   The machine and this browser each MAC their own key with the code, so
+//   each can check the other's key really came from the code's holder.
+// - Endorsement: once the machine's key checks out, the owner signs it.
+//   Everyone the machine is shared with trusts the key through that
+//   signature, and the owner's key through trust on first use (keystore.ts).
+// - Grants: the owner signs who may watch, in what role and when. The
+//   machine checks those signatures itself, against the owner key it pinned
+//   at enrollment, so the relay can't let anyone else in.
+// - Viewing: each view is a fresh ECDH exchange, signed by the viewer's
+//   identity key and by the machine's key. The machine sends back the
+//   stream key wrapped for this viewer; frames are AES-GCM under it, and
+//   input is sealed under a key only this viewer and the machine share.
+//
+// The formats match relay/src/e2e.rs and src/service/e2e.cpp.
+
+import type { EnrollmentCode, ShareTerms, SignedStatement } from "./api.js";
+import * as api from "./api.js";
+import {
+  aesDecrypt,
+  aesEncrypt,
+  aesKey,
+  concat,
+  equalBytes,
+  exchange,
+  exportPublicKey,
+  fromBase64,
+  generateExchangeKey,
+  hkdf,
+  hmac,
+  parseStatement,
+  randomBytes,
+  sha256,
+  sign,
+  statement,
+  toBase64,
+  unseal,
+  utf8,
+  verify,
+} from "./crypto.js";
+import type { Identity } from "./keys.js";
+import { checkContact, forgetPendingEnrollment, pendingEnrollment, savePendingEnrollment } from "./keystore.js";
+import type { InputEvent, Machine, ParsedVideoFrame, Role } from "./protocol.js";
+
+const NO_SALT = new Uint8Array(0);
+
+// --- Enrollment ------------------------------------------------------------------------
+
+// Crockford base32: no I, L, O or U, so a code read aloud or typed by hand
+// survives.
+const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+// 25 symbols, 125 bits: enough that the relay, which sees the code's hash
+// and both bindings, can't guess it.
+const CODE_LENGTH = 25;
+
+// Mirrors the machine's canonical form: alphanumerics only, uppercase, and
+// the letters people mistake for digits read as those digits.
+function canonicalCode(code: string): string {
+  return code
+    .toUpperCase()
+    .replace(/[^0-9A-Z]/g, "")
+    .replace(/O/g, "0")
+    .replace(/[IL]/g, "1");
+}
+
+async function enrollmentKey(code: string): Promise<Uint8Array<ArrayBuffer>> {
+  return hkdf(utf8(canonicalCode(code)), NO_SALT, "hawk-enroll-v1", 32);
+}
+
+export async function codeHash(code: string): Promise<string> {
+  return toBase64(await sha256(utf8(canonicalCode(code))));
+}
+
+async function binding(code: string, context: string, publicKey: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {
+  return hmac(await enrollmentKey(code), concat(utf8(`${context}\0`), publicKey));
+}
+
+// Makes a one-time enrollment code and registers its hash, with the owner's
+// key bound to it, on the relay.
+export async function createEnrollment(identity: Identity): Promise<EnrollmentCode> {
+  // 256 is a multiple of 32, so masking keeps every symbol equally likely.
+  const symbols = Array.from(randomBytes(CODE_LENGTH), (byte) => ALPHABET[byte & 31]).join("");
+  const code = symbols.match(/.{5}/g)?.join("-") ?? symbols;
+  const hash = await codeHash(code);
+  const ownerBinding = await binding(code, "hawk-enroll-owner-v1", identity.publicKey);
+  await savePendingEnrollment(hash, code);
+  const registered = await api.registerEnrollmentCode(hash, toBase64(ownerBinding));
+  return { code, ...registered };
+}
+
+// What the owner signs to vouch for their machine's key.
+function machineStatement(machineId: string, machineKey: Uint8Array): string {
+  return statement("hawk-machine-v1", [
+    ["machine", machineId],
+    ["key", toBase64(machineKey)],
+  ]);
+}
+
+export async function endorse(identity: Identity, machine: Machine): Promise<void> {
+  if (machine.publicKey === null) throw new Error("this machine has no key; enroll it again");
+  const signature = await sign(identity.privateKey, machineStatement(machine.id, fromBase64(machine.publicKey)));
+  await api.endorseMachine(machine.id, toBase64(signature));
+}
+
+export type EnrollmentCheck = "endorsed" | "unknown" | "mismatch";
+
+// For an owned machine not endorsed yet: if this browser made its
+// enrollment code, checks the key the machine answered with against the
+// code, and endorses it when it matches. "unknown" means another browser
+// made the code; the owner can still compare fingerprints by hand.
+export async function checkEnrollment(identity: Identity, machine: Machine): Promise<EnrollmentCheck> {
+  if (machine.enrollCodeHash === null || machine.enrollBinding === null || machine.publicKey === null) return "unknown";
+  const code = await pendingEnrollment(machine.enrollCodeHash);
+  if (code === null) return "unknown";
+  const expected = await binding(code, "hawk-enroll-machine-v1", fromBase64(machine.publicKey));
+  if (!equalBytes(expected, fromBase64(machine.enrollBinding))) return "mismatch";
+  await endorse(identity, machine);
+  await forgetPendingEnrollment(machine.enrollCodeHash);
+  return "endorsed";
+}
+
+// --- Grants and revocations -------------------------------------------------------------------
+
+const optionalTime = (time: number | null): string => (time === null ? "-" : String(time));
+
+function issuedOf(signed: SignedStatement | null, context: string): number {
+  const issued = signed === null ? undefined : parseStatement(signed.statement, context)?.get("issued");
+  return issued === undefined ? 0 : Number(issued) || 0;
+}
+
+// Later than anything signed before for this share, even if another of
+// the owner's devices had a clock running ahead: the machine only honours
+// the newest.
+function nextIssued(previous: SignedStatement | null): number {
+  return Math.max(Date.now(), issuedOf(previous, "hawk-grant-v1") + 1);
+}
+
+async function signed(identity: Identity, text: string): Promise<SignedStatement> {
+  return { statement: text, signature: toBase64(await sign(identity.privateKey, text)) };
+}
+
+export function signGrant(
+  identity: Identity,
+  machineId: string,
+  viewerKey: string,
+  terms: ShareTerms,
+  previous: SignedStatement | null,
+): Promise<SignedStatement> {
+  return signed(
+    identity,
+    statement("hawk-grant-v1", [
+      ["machine", machineId],
+      ["viewer", viewerKey],
+      ["role", terms.role],
+      ["not_before", optionalTime(terms.startsAt)],
+      ["not_after", optionalTime(terms.expiresAt)],
+      ["single_view", terms.singleView ? "1" : "0"],
+      ["issued", String(nextIssued(previous))],
+    ]),
+  );
+}
+
+export function signRevocation(
+  identity: Identity,
+  machineId: string,
+  viewerKey: string,
+  grant: SignedStatement | null,
+): Promise<SignedStatement> {
+  return signed(
+    identity,
+    statement("hawk-revoke-v1", [
+      ["machine", machineId],
+      ["viewer", viewerKey],
+      ["issued", String(nextIssued(grant))],
+    ]),
+  );
+}
+
+// --- Trusting a machine's key -------------------------------------------------------------------
+
+export type MachineTrust =
+  | { ok: true; machineKey: Uint8Array<ArrayBuffer> }
+  | { ok: false; reason: "re-enroll" | "unendorsed" | "owner-key-changed" | "bad-endorsement" };
+
+// The machine's key, if the owner vouched for it with a key this browser
+// trusts: its own, for the owner, or the one first seen for that owner.
+export async function trustMachine(identity: Identity, machine: Machine): Promise<MachineTrust> {
+  if (machine.publicKey === null || machine.ownerPublicKey === null) return { ok: false, reason: "re-enroll" };
+  if (machine.endorsement === null) return { ok: false, reason: "unendorsed" };
+  const ownerKey = fromBase64(machine.ownerPublicKey);
+  if (machine.role === "owner") {
+    if (!equalBytes(ownerKey, identity.publicKey)) return { ok: false, reason: "owner-key-changed" };
+  } else if ((await checkContact(machine.ownerEmail, ownerKey)).kind === "changed") {
+    return { ok: false, reason: "owner-key-changed" };
+  }
+  const machineKey = fromBase64(machine.publicKey);
+  if (!(await verify(ownerKey, machineStatement(machine.id, machineKey), fromBase64(machine.endorsement)))) {
+    return { ok: false, reason: "bad-endorsement" };
+  }
+  return { ok: true, machineKey };
+}
+
+// --- A viewing session ------------------------------------------------------------------------
+
+// Mirrors the machine's frame layout: kind, flags, timestamp (LE), key id
+// (BE), IV, then ciphertext and tag. Everything before the IV is
+// authenticated as associated data; the relay reads only the flags.
+const FRAME_KIND_ENCRYPTED = 0x02;
+const FRAME_KEYFRAME_FLAG = 0x01;
+const FRAME_AAD_SIZE = 14;
+const FRAME_HEADER_SIZE = FRAME_AAD_SIZE + 12;
+
+const STREAM_KEY_AAD = utf8("hawk-stream-key-v1");
+const INPUT_AAD = utf8("hawk-input-v1");
+// Stream keys kept around after a newer one arrives, for frames already in
+// flight under the old one.
+const KEEP_STREAM_KEYS = 2;
+
+export class ViewSession {
+  readonly join: SignedStatement;
+  role: Role | null = null;
+  private settle: (accepted: boolean) => void = () => {};
+  // Settles once the machine's answer checked out (true), or the session
+  // was given up (false). Frames that arrive first wait on it: the stream
+  // key they're under comes with the answer, and the first of them is
+  // usually the keyframe decoding has to start from.
+  private readonly ready = new Promise<boolean>((resolve) => {
+    this.settle = resolve;
+  });
+  private inputKey: CryptoKey | null = null;
+  private wrapKey: CryptoKey | null = null;
+  private readonly streamKeys = new Map<number, CryptoKey>();
+  private inputCounter = 0n;
+
+  private constructor(
+    private readonly machineId: string,
+    private readonly machineKey: Uint8Array<ArrayBuffer>,
+    private readonly exchangeKey: CryptoKeyPair,
+    join: SignedStatement,
+  ) {
+    this.join = join;
+  }
+
+  // A signed request to join `machineId`'s stream, with a fresh exchange key.
+  static async start(identity: Identity, machineId: string, machineKey: Uint8Array<ArrayBuffer>): Promise<ViewSession> {
+    const exchangeKey = await generateExchangeKey();
+    const text = statement("hawk-join-v1", [
+      ["machine", machineId],
+      ["viewer", toBase64(identity.publicKey)],
+      ["ephemeral", toBase64(await exportPublicKey(exchangeKey.publicKey))],
+      ["time", String(Date.now())],
+    ]);
+    return new ViewSession(machineId, machineKey, exchangeKey, await signed(identity, text));
+  }
+
+  get accepted(): boolean {
+    return this.inputKey !== null;
+  }
+
+  // Checks the machine's answer to the join and derives this session's
+  // keys from it. Throws if anything about it doesn't hold up.
+  async accept(answer: { statement: string; signature: string; wrappedKey: string }): Promise<void> {
+    if (!(await verify(this.machineKey, answer.statement, fromBase64(answer.signature)))) {
+      throw new Error("the machine's answer isn't signed by its key");
+    }
+    const fields = parseStatement(answer.statement, "hawk-accept-v1");
+    const joinHash = await sha256(utf8(this.join.statement));
+    const role = fields?.get("role");
+    const ephemeral = fields?.get("ephemeral");
+    if (
+      fields === null ||
+      fields.get("machine") !== this.machineId ||
+      fields.get("join") !== toBase64(joinHash) ||
+      ephemeral === undefined ||
+      (role !== "owner" && role !== "control" && role !== "view")
+    ) {
+      throw new Error("the machine's answer doesn't match this request");
+    }
+    const shared = await exchange(this.exchangeKey.privateKey, fromBase64(ephemeral));
+    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 64);
+    this.inputKey = await aesKey(keys.slice(0, 32), ["encrypt"]);
+    this.wrapKey = await aesKey(keys.slice(32, 64), ["decrypt"]);
+    this.role = role;
+    await this.addStreamKey(answer.wrappedKey);
+    this.settle(true);
+  }
+
+  // Ends the session: frames still waiting for the answer are dropped.
+  abandon(): void {
+    this.settle(false);
+  }
+
+  async addStreamKey(wrappedKey: string): Promise<void> {
+    if (this.wrapKey === null) throw new Error("stream key before the session was accepted");
+    const plain = await unseal(this.wrapKey, fromBase64(wrappedKey), STREAM_KEY_AAD);
+    if (plain.length !== 36) throw new Error("malformed stream key");
+    const id = new DataView(plain.buffer).getUint32(0);
+    this.streamKeys.set(id, await aesKey(plain.slice(4), ["decrypt"]));
+    while (this.streamKeys.size > KEEP_STREAM_KEYS + 1) {
+      const oldest = this.streamKeys.keys().next().value;
+      if (oldest === undefined) break;
+      this.streamKeys.delete(oldest);
+    }
+  }
+
+  // The access unit inside an encrypted frame; null for a frame this
+  // session can't open (a key it was never given, or tampering).
+  async openFrame(buffer: ArrayBuffer): Promise<ParsedVideoFrame | null> {
+    if (!(await this.ready) || buffer.byteLength < FRAME_HEADER_SIZE + 16) return null;
+    const bytes = new Uint8Array(buffer);
+    if (bytes[0] !== FRAME_KIND_ENCRYPTED) return null;
+    const view = new DataView(buffer);
+    const key = this.streamKeys.get(view.getUint32(10));
+    if (key === undefined) return null;
+    try {
+      const data = await aesDecrypt(
+        key,
+        bytes.slice(FRAME_AAD_SIZE, FRAME_HEADER_SIZE),
+        bytes.slice(FRAME_HEADER_SIZE),
+        bytes.slice(0, FRAME_AAD_SIZE),
+      );
+      return {
+        isKeyframe: ((bytes[1] ?? 0) & FRAME_KEYFRAME_FLAG) !== 0,
+        timestamp: Number(view.getBigInt64(2, true)),
+        data,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // Seals one input event for the machine: counter || ciphertext, base64.
+  // The counter numbers events in the order they're sealed, which is the
+  // order they must be sent in; the machine refuses any it has seen.
+  sealInput(event: InputEvent): Promise<string> | null {
+    const key = this.inputKey;
+    if (key === null) return null;
+    this.inputCounter += 1n;
+    const counter = new Uint8Array(8);
+    new DataView(counter.buffer).setBigUint64(0, this.inputCounter);
+    const iv = concat(counter, new Uint8Array(4));
+    return aesEncrypt(key, iv, utf8(JSON.stringify(event)), INPUT_AAD).then((sealed) =>
+      toBase64(concat(counter, sealed)),
+    );
+  }
+}

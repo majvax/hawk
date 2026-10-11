@@ -1,5 +1,13 @@
 //! Account endpoints: session, login/logout, invite-based signup, your own
-//! password and sessions, and the admin's user and invite management.
+//! password, identity key and sessions, and the admin's user and invite
+//! management.
+//!
+//! The password never reaches the relay. The browser stretches it into an
+//! auth key, which is what login, signup and password changes send as
+//! "password" and what the relay hashes, and a wrapping key that encrypts the
+//! account's identity key before it's stored here (see frontend/src/keys.ts).
+//! Accounts from before this are "legacy" until their next login, which
+//! sends the password itself one last time to upgrade them.
 
 use std::net::SocketAddr;
 
@@ -7,11 +15,14 @@ use axum::Json;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum_extra::extract::cookie::CookieJar;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::auth::{self, AdminUser, CurrentUser};
-use crate::db::{self, SignupError, User};
+use crate::db::{self, NewCredentials, SignupError, User};
+use crate::e2e;
 use crate::error::ApiError;
 
 #[derive(Serialize)]
@@ -30,6 +41,74 @@ impl From<User> for UserView {
 
 pub async fn session(current: CurrentUser) -> Json<UserView> {
     Json(current.user.into())
+}
+
+/// What new accounts are told to use, and what an unknown email is told,
+/// so the answer doesn't reveal which accounts exist.
+pub const KDF: &str = "pbkdf2-sha256";
+pub const DEFAULT_ITERATIONS: i64 = 600_000;
+/// Fewer than this is too weak to accept; more would take a phone minutes.
+const ITERATIONS_RANGE: std::ops::RangeInclusive<i64> = 100_000..=10_000_000;
+/// IV, a PKCS#8 P-256 key and the GCM tag come to well under this.
+const MAX_WRAPPED_KEY_LEN: usize = 512;
+
+#[derive(Deserialize)]
+pub struct EmailRequest {
+    email: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginParamsView {
+    /// "pbkdf2-sha256", or "legacy" for an account that still logs in with
+    /// its password itself.
+    kdf: String,
+    iterations: i64,
+}
+
+/// How the browser should derive this account's keys from its password.
+pub async fn login_params(
+    State(state): State<AppState>,
+    Json(body): Json<EmailRequest>,
+) -> Result<Json<LoginParamsView>, ApiError> {
+    let defaults = LoginParamsView { kdf: KDF.to_owned(), iterations: DEFAULT_ITERATIONS };
+    let Some(email) = auth::normalize_email(&body.email) else { return Ok(Json(defaults)) };
+    let params = state.db.call(move |conn| db::login_params(conn, &email)).await?;
+    Ok(Json(params.map_or(defaults, |params| LoginParamsView {
+        iterations: params.iterations.unwrap_or(DEFAULT_ITERATIONS),
+        kdf: params.kdf,
+    })))
+}
+
+/// An identity key as the browser sends it: the public half, its private
+/// half encrypted under the password, and how the password was stretched.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyUpload {
+    public_key: String,
+    wrapped_key: String,
+    iterations: i64,
+}
+
+struct DecodedKey {
+    public_key: Vec<u8>,
+    wrapped_key: Vec<u8>,
+    iterations: i64,
+}
+
+impl KeyUpload {
+    fn decode(&self) -> Result<DecodedKey, ApiError> {
+        let invalid = || ApiError::bad_request("invalid identity key");
+        let public_key = BASE64.decode(&self.public_key).map_err(|_| invalid())?;
+        let wrapped_key = BASE64.decode(&self.wrapped_key).map_err(|_| invalid())?;
+        if !e2e::is_public_key(&public_key) || wrapped_key.is_empty() || wrapped_key.len() > MAX_WRAPPED_KEY_LEN {
+            return Err(invalid());
+        }
+        if !ITERATIONS_RANGE.contains(&self.iterations) {
+            return Err(ApiError::bad_request("unsupported key derivation"));
+        }
+        Ok(DecodedKey { public_key, wrapped_key, iterations: self.iterations })
+    }
 }
 
 #[derive(Deserialize)]
@@ -116,7 +195,10 @@ pub async fn invite_info(State(state): State<AppState>, Path(token): Path<String
 pub struct SignupRequest {
     token: String,
     email: String,
+    /// The auth key derived from the password.
     password: String,
+    #[serde(flatten)]
+    key: KeyUpload,
 }
 
 pub async fn signup(
@@ -128,6 +210,7 @@ pub async fn signup(
 ) -> Result<(CookieJar, Json<UserView>), ApiError> {
     let email = auth::normalize_email(&body.email).ok_or_else(|| ApiError::bad_request("invalid email address"))?;
     auth::check_password_policy(&body.password)?;
+    let key = body.key.decode()?;
 
     let password = body.password;
     let password_hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
@@ -138,7 +221,15 @@ pub async fn signup(
     let now = auth::now();
     let user = state
         .db
-        .call(move |conn| Ok(db::redeem_invite(conn, &invite_hash, &email, &password_hash, now)))
+        .call(move |conn| {
+            let credentials = NewCredentials {
+                password_hash: &password_hash,
+                iterations: key.iterations,
+                public_key: &key.public_key,
+                wrapped_key: &key.wrapped_key,
+            };
+            Ok(db::redeem_invite(conn, &invite_hash, &email, &credentials, now))
+        })
         .await?
         .map_err(|error| match error {
             SignupError::InvalidInvite => ApiError::bad_request("this invite link is invalid or has expired"),
@@ -181,8 +272,11 @@ async fn start_session(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangePassword {
+    /// Auth keys, derived from the current and the new password.
     current_password: String,
     new_password: String,
+    /// The identity key, re-encrypted under the new password.
+    wrapped_key: String,
 }
 
 /// Checks the current password, stores the new one's hash, and ends every
@@ -200,6 +294,10 @@ pub async fn change_password(
         return Err(ApiError::TooManyRequests);
     }
     auth::check_password_policy(&body.new_password)?;
+    let wrapped_key = BASE64.decode(&body.wrapped_key).map_err(|_| ApiError::bad_request("invalid identity key"))?;
+    if wrapped_key.is_empty() || wrapped_key.len() > MAX_WRAPPED_KEY_LEN {
+        return Err(ApiError::bad_request("invalid identity key"));
+    }
 
     let user_id = current.user.id;
     let old_hash = state.db.call(move |conn| db::password_hash(conn, user_id)).await?;
@@ -220,12 +318,118 @@ pub async fn change_password(
     state.limiter.record_success(ip);
 
     let keep = current.session_id;
-    let changed = state.db.call(move |conn| db::change_password(conn, user_id, &old_hash, &new_hash, keep)).await?;
+    let changed = state
+        .db
+        .call(move |conn| db::change_password(conn, user_id, &old_hash, &new_hash, &wrapped_key, keep))
+        .await?;
     if !changed {
         return Err(ApiError::Conflict("your password was changed elsewhere; reload and try again".into()));
     }
     state.registry.close_other_sessions(user_id, keep);
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountKeyView {
+    public_key: String,
+    wrapped_key: String,
+}
+
+/// The account's identity key, still encrypted under the password: the
+/// browser unlocks it with the password on login. 404 for an account that
+/// hasn't been upgraded yet.
+pub async fn account_key(State(state): State<AppState>, current: CurrentUser) -> Result<Json<AccountKeyView>, ApiError> {
+    let user_id = current.user.id;
+    let key = state.db.call(move |conn| db::user_key(conn, user_id)).await?.ok_or(ApiError::NotFound)?;
+    Ok(Json(AccountKeyView { public_key: BASE64.encode(key.public_key), wrapped_key: BASE64.encode(key.wrapped_key) }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeRequest {
+    /// The password itself, one last time, to prove it's the account holder.
+    current_password: String,
+    /// The auth key derived from it, which replaces it from now on.
+    password: String,
+    #[serde(flatten)]
+    key: KeyUpload,
+}
+
+/// Moves a legacy account to a derived auth key and gives it an identity
+/// key. The browser does this right after a legacy login.
+pub async fn upgrade_account(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    current: CurrentUser,
+    Json(body): Json<UpgradeRequest>,
+) -> Result<StatusCode, ApiError> {
+    let ip = peer.ip();
+    if state.limiter.is_blocked(ip) {
+        return Err(ApiError::TooManyRequests);
+    }
+    auth::check_password_policy(&body.password)?;
+    let key = body.key.decode()?;
+
+    let user_id = current.user.id;
+    let old_hash = state.db.call(move |conn| db::password_hash(conn, user_id)).await?;
+    let stored = old_hash.clone();
+    let (current_password, auth_key) = (body.current_password, body.password);
+    let new_hash = tokio::task::spawn_blocking(move || {
+        if !auth::verify_password(&current_password, &stored) {
+            return Ok(None);
+        }
+        auth::hash_password(&auth_key).map(Some)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    let Some(new_hash) = new_hash else {
+        state.limiter.record_failure(ip);
+        return Err(ApiError::bad_request("current password is incorrect"));
+    };
+
+    let upgraded = state
+        .db
+        .call(move |conn| {
+            let credentials = NewCredentials {
+                password_hash: &new_hash,
+                iterations: key.iterations,
+                public_key: &key.public_key,
+                wrapped_key: &key.wrapped_key,
+            };
+            db::upgrade_account(conn, user_id, &old_hash, &credentials)
+        })
+        .await?;
+    if !upgraded {
+        return Err(ApiError::Conflict("this account was already upgraded; log in again".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserKeyView {
+    user_id: i64,
+    email: String,
+    /// None until that account has logged in since keys were introduced.
+    public_key: Option<String>,
+}
+
+/// Another account's identity key, to share a machine with them. The owner's
+/// browser pins it the first time and shows its fingerprint to compare.
+pub async fn lookup_user_key(
+    State(state): State<AppState>,
+    _current: CurrentUser,
+    Json(body): Json<EmailRequest>,
+) -> Result<Json<UserKeyView>, ApiError> {
+    let email = auth::normalize_email(&body.email).ok_or_else(|| ApiError::bad_request("invalid email address"))?;
+    let lookup = email.clone();
+    let (user_id, public_key) = state
+        .db
+        .call(move |conn| db::public_key_by_email(conn, &lookup))
+        .await?
+        .ok_or_else(|| ApiError::bad_request("no account with that email; ask the admin to invite them first"))?;
+    Ok(Json(UserKeyView { user_id, email, public_key: public_key.map(|key| BASE64.encode(key)) }))
 }
 
 #[derive(Serialize)]

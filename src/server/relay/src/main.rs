@@ -8,6 +8,7 @@ mod error;
 mod machines;
 mod protocol;
 mod registry;
+mod e2e;
 mod routes;
 
 use std::net::SocketAddr;
@@ -188,10 +189,14 @@ async fn main() -> Result<(), String> {
     let app = Router::new()
         .route("/api/session", get(api::session))
         .route("/api/login", post(api::login))
+        .route("/api/login/params", post(api::login_params))
         .route("/api/logout", post(api::logout))
         .route("/api/signup", post(api::signup))
         .route("/api/invites/{token}", get(api::invite_info))
         .route("/api/account/password", post(api::change_password))
+        .route("/api/account/key", get(api::account_key))
+        .route("/api/account/upgrade", post(api::upgrade_account))
+        .route("/api/users/lookup", post(api::lookup_user_key))
         .route("/api/sessions", get(api::list_sessions))
         .route("/api/sessions/revoke-others", post(api::revoke_other_sessions))
         .route("/api/sessions/{id}", delete(api::revoke_session))
@@ -201,6 +206,7 @@ async fn main() -> Result<(), String> {
         .route("/api/admin/invites/{id}", delete(api::delete_invite))
         .route("/api/machines/enroll", post(machines::create_enrollment_code))
         .route("/api/machines/{id}", delete(machines::remove).patch(machines::rename))
+        .route("/api/machines/{id}/endorsement", post(machines::endorse))
         .route("/api/machines/{id}/shares", get(machines::list_shares).put(machines::share))
         .route("/api/machines/{id}/shares/{user_id}", delete(machines::unshare))
         .route("/v1/ws", get(routes::device_socket))

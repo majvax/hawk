@@ -17,10 +17,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::AppState;
 use crate::auth::{self, CurrentUser};
-use crate::db::{self, MachineAuth};
+use crate::db::{self, EnrollmentOwner, MachineAuth};
+use crate::e2e;
 use crate::error::ApiError;
-use crate::protocol::{DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, machine_auth_message};
-use crate::registry::{DashboardHandle, DeviceOutbound, Outbound, Registry};
+use crate::protocol::{
+    DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_INPUT_LEN, answer_fits,
+    machine_auth_message,
+};
+use crate::registry::{Answer, DashboardHandle, DeviceOutbound, Outbound, Registry};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -39,8 +43,8 @@ pub async fn device_socket(ws: WebSocketUpgrade, State(state): State<AppState>) 
 /// Signing happens in the machine's TPM, which can take a moment.
 const PROOF_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// An uncompressed P-256 point: 0x04 || X || Y.
-const P256_PUBLIC_KEY_LEN: usize = 65;
+/// An HMAC-SHA256.
+const BINDING_LEN: usize = 32;
 
 type DeviceSink = futures_util::stream::SplitSink<WebSocket, Message>;
 type DeviceStream = futures_util::stream::SplitStream<WebSocket>;
@@ -48,7 +52,7 @@ type DeviceStream = futures_util::stream::SplitStream<WebSocket>;
 /// Who the device claims to be, and the key it must prove it holds.
 enum Claim {
     Existing { public_id: String, owner_id: i64, public_key: Vec<u8> },
-    Enroll { code_hash: Vec<u8>, public_key: Vec<u8>, key_storage: String },
+    Enroll { code_hash: Vec<u8>, public_key: Vec<u8>, key_storage: String, binding: Vec<u8> },
 }
 
 impl Claim {
@@ -72,34 +76,47 @@ impl From<rusqlite::Error> for Refusal {
     }
 }
 
-async fn resolve_claim(
-    state: &AppState,
+/// What a hello carries beyond the hostname.
+struct HelloClaim {
     machine: Option<String>,
-    enroll_code: Option<String>,
+    enroll_code_hash: Option<String>,
     public_key: Option<String>,
     key_storage: Option<String>,
-) -> Result<Claim, Refusal> {
+    binding: Option<String>,
+}
+
+async fn resolve_claim(state: &AppState, hello: HelloClaim) -> Result<Claim, Refusal> {
+    let HelloClaim { machine, enroll_code_hash, public_key, key_storage, binding } = hello;
     if let Some(public_id) = machine {
         let lookup = public_id.clone();
         let key = state.db.call(move |conn| db::machine_key(conn, &lookup)).await?.ok_or(Refusal::Unknown)?;
         return Ok(Claim::Existing { public_id, owner_id: key.owner_id, public_key: key.public_key });
     }
 
-    let (Some(code), Some(public_key), Some(key_storage)) = (enroll_code, public_key, key_storage) else {
+    let (Some(code_hash), Some(public_key), Some(key_storage), Some(binding)) =
+        (enroll_code_hash, public_key, key_storage, binding)
+    else {
         return Err(Refusal::Malformed);
     };
     let public_key = BASE64.decode(public_key).map_err(|_| Refusal::Malformed)?;
-    if public_key.len() != P256_PUBLIC_KEY_LEN || public_key[0] != 0x04 {
+    if !e2e::is_public_key(&public_key) {
+        return Err(Refusal::Malformed);
+    }
+    let binding = BASE64.decode(binding).map_err(|_| Refusal::Malformed)?;
+    if binding.len() != BINDING_LEN {
         return Err(Refusal::Malformed);
     }
     if key_storage != "tpm" && key_storage != "software" {
         return Err(Refusal::Malformed);
     }
+    let code_hash = BASE64.decode(code_hash).map_err(|_| Refusal::Malformed)?;
+    if code_hash.len() != 32 {
+        return Err(Refusal::Malformed);
+    }
     // Checked now so a bad code fails fast; consumed only after the proof.
-    let code_hash = auth::enrollment_code_hash(&code);
     let (lookup, now) = (code_hash.clone(), auth::now());
     state.db.call(move |conn| db::enrollment_code_owner(conn, &lookup, now)).await?.ok_or(Refusal::Unknown)?;
-    Ok(Claim::Enroll { code_hash, public_key, key_storage })
+    Ok(Claim::Enroll { code_hash, public_key, key_storage, binding })
 }
 
 /// The next text message within `limit`, parsed. None on timeout, close,
@@ -119,19 +136,20 @@ async fn send_command(sink: &mut DeviceSink, command: &DeviceCommand) -> bool {
 }
 
 /// Runs hello -> challenge -> proof. Returns the authenticated machine, and
-/// whether this connection enrolled it.
+/// who it was enrolled for if this connection enrolled it.
 async fn authenticate_device(
     state: &AppState,
     sink: &mut DeviceSink,
     stream: &mut DeviceStream,
-) -> Result<(MachineAuth, bool), Refusal> {
-    let Some(DeviceMessage::Hello { machine_id: hostname, machine, enroll_code, public_key, key_storage }) =
+) -> Result<(MachineAuth, Option<EnrollmentOwner>), Refusal> {
+    let Some(DeviceMessage::Hello { machine_id: hostname, machine, enroll_code_hash, public_key, key_storage, binding }) =
         next_device_message(stream, HELLO_TIMEOUT).await
     else {
         return Err(Refusal::Malformed);
     };
     let hostname: String = hostname.chars().take(255).collect();
-    let claim = resolve_claim(state, machine, enroll_code, public_key, key_storage).await?;
+    let claim =
+        resolve_claim(state, HelloClaim { machine, enroll_code_hash, public_key, key_storage, binding }).await?;
 
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).expect("OS random number generator unavailable");
@@ -151,9 +169,9 @@ async fn authenticate_device(
         Claim::Existing { public_id, owner_id, .. } => {
             let id = public_id.clone();
             state.db.call(move |conn| db::record_connect(conn, &id, &hostname, now)).await?;
-            Ok((MachineAuth { public_id, owner_id }, false))
+            Ok((MachineAuth { public_id, owner_id }, None))
         }
-        Claim::Enroll { code_hash, public_key, key_storage } => {
+        Claim::Enroll { code_hash, public_key, key_storage, binding } => {
             let public_id = uuid::Uuid::new_v4().to_string();
             let enrolled = state
                 .db
@@ -164,13 +182,15 @@ async fn authenticate_device(
                         hostname: &hostname,
                         public_key: &public_key,
                         key_storage: &key_storage,
+                        binding: &binding,
                     };
                     db::enroll_machine(conn, &machine, now)
                 })
                 .await?
                 // The code was used by another connection while this one signed.
                 .ok_or(Refusal::Unknown)?;
-            Ok((enrolled, true))
+            let (machine, owner) = enrolled;
+            Ok((machine, Some(owner)))
         }
     }
 }
@@ -198,9 +218,14 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     };
     let machine_id = machine.public_id.clone();
 
-    if enrolled {
+    if let Some(owner) = enrolled {
         info!(%machine_id, owner_id = machine.owner_id, "relay: machine enrolled");
-        if !send_command(&mut sink, &DeviceCommand::Enrolled { machine_id: machine_id.clone() }).await {
+        let enrolled = DeviceCommand::Enrolled {
+            machine_id: machine_id.clone(),
+            owner_key: BASE64.encode(&owner.owner_public_key),
+            owner_binding: BASE64.encode(&owner.owner_binding),
+        };
+        if !send_command(&mut sink, &enrolled).await {
             return;
         }
         // The new machine shows up on its owner's open dashboards.
@@ -216,6 +241,13 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
     let connection = state.registry.add_device(&machine_id, machine.owner_id, outbound);
     info!(%machine_id, "relay: machine connected");
+
+    // Before any viewer can join, so a revoked one is refused.
+    let lookup = machine_id.clone();
+    match state.db.call(move |conn| db::revocations(conn, &lookup)).await {
+        Ok(revocations) => state.registry.send_revocations(&machine_id, &revocations),
+        Err(error) => error!(%error, "relay: loading revocations failed"),
+    }
 
     let writer = tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
@@ -237,6 +269,7 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     while let Some(Ok(message)) = stream.next().await {
         match message {
             Message::Binary(frame) => state.registry.forward_frame(&machine_id, frame),
+            Message::Text(text) => route_device_answer(&state.registry, &machine_id, &text),
             Message::Close(_) => break,
             _ => {}
         }
@@ -250,6 +283,28 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     state.registry.remove_device(&machine_id, connection, now);
     writer.abort();
     info!(%machine_id, "relay: machine disconnected");
+}
+
+/// Passes the machine's answer to one of its viewers on, unread.
+fn route_device_answer(registry: &Registry, machine_id: &str, text: &str) {
+    let (viewer, answer) = match serde_json::from_str::<DeviceMessage>(text) {
+        Ok(DeviceMessage::ViewerAccept { viewer, statement, signature, wrapped_key })
+            if answer_fits(&[&statement, &signature, &wrapped_key]) =>
+        {
+            (viewer, Answer::Accept { statement, signature, wrapped_key })
+        }
+        Ok(DeviceMessage::ViewerReject { viewer, reason }) => {
+            (viewer, Answer::Reject { reason: reason.chars().take(200).collect() })
+        }
+        Ok(DeviceMessage::StreamKey { viewer, wrapped_key }) if answer_fits(&[&wrapped_key]) => {
+            (viewer, Answer::StreamKey { wrapped_key })
+        }
+        _ => {
+            debug!(%machine_id, "relay: ignoring an unexpected message from a machine");
+            return;
+        }
+    };
+    registry.answer(machine_id, viewer, answer);
 }
 
 /// The dashboard's view into the relay: a snapshot of the user's machines on
@@ -331,9 +386,6 @@ async fn handle_dashboard(
     });
 
     let mut input_budget = InputBudget::new();
-    // Releases draw on their own budget: a burst of moves that drains the
-    // main one must not swallow the key-up after it and leave a key held.
-    let mut release_budget = InputBudget::new();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -344,19 +396,19 @@ async fn handle_dashboard(
             _ => continue, // dashboards only send JSON control messages
         };
         match serde_json::from_str::<DashboardCommand>(&text) {
-            Ok(DashboardCommand::StartView { device_id }) => {
-                if !registry.start_view(dashboard_id, &device_id) {
+            Ok(DashboardCommand::StartView { device_id, join }) => {
+                if join.decode().is_none() || !registry.start_view(dashboard_id, &device_id, join) {
                     let _ = events.send(Outbound::Event(Box::new(DashboardEvent::CaptureEnded { device_id })));
                 }
             }
             Ok(DashboardCommand::StopView { device_id }) => registry.stop_view(dashboard_id, &device_id),
-            Ok(DashboardCommand::Input { device_id, event }) => {
+            Ok(DashboardCommand::Input { device_id, sealed }) => {
                 // Dropped quietly: a view-only or flooding dashboard gets
-                // nothing through, and no reply it could time against.
-                if let Some(event) = event.sanitized()
-                    && if event.is_release() { release_budget.take() } else { input_budget.take() }
-                {
-                    registry.input(dashboard_id, &device_id, event);
+                // nothing through, and no reply it could time against. The
+                // relay can't tell a release from a press any more, so the
+                // budget is generous enough that a person never runs it dry.
+                if sealed.len() <= MAX_SEALED_INPUT_LEN && input_budget.take() {
+                    registry.input(dashboard_id, &device_id, sealed);
                 }
             }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {

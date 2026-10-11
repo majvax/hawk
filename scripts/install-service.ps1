@@ -19,9 +19,10 @@
 
 .PARAMETER EnrollCode
     One-time enrollment code from the dashboard (Machines > Add machine),
-    e.g. 7K3QD-WX2MP. Needed the first time, or to re-enroll a machine that
-    was removed. The service uses it once to get this machine's credential,
-    then deletes it. Omit it when reinstalling an already enrolled machine.
+    e.g. 7K3QD-WX2MP-4HZ8R-QN1CV-B6T2J. Needed the first time, or to re-enroll
+    a machine that was removed. The code itself never leaves this machine:
+    the relay gets its hash, and the code is what lets this machine check its
+    owner's key. The service uses it once, then deletes it. Omit it when reinstalling an already enrolled machine.
 
 .PARAMETER RelayPin
     The relay's TLS key pin, shown in the dashboard next to the enrollment
@@ -32,7 +33,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$BinPath = (Join-Path $PSScriptRoot "..\bin\hawk-service.exe"),
+    [string]$BinPath,
     [string]$EnrollCode,
     [string[]]$RelayPin
 )
@@ -40,9 +41,13 @@ param(
 $ErrorActionPreference = "Stop"
 $ServiceName = "HawkService"
 
+# Worked out here rather than as the parameter's default: Windows
+# PowerShell 5.1 can leave $PSScriptRoot empty while binding parameters.
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $BinPath) { $BinPath = Join-Path $ScriptDir "..\bin\hawk-service.exe" }
 $BinPath = (Resolve-Path $BinPath).Path
 if (-not (Test-Path $BinPath)) {
-    throw "hawk-service.exe not found at '$BinPath' — build the project first."
+    throw "hawk-service.exe not found at '$BinPath': build the project first."
 }
 $CapturePath = Join-Path (Split-Path $BinPath) "hawk-capture.exe"
 if (-not (Test-Path $CapturePath)) {
@@ -62,7 +67,7 @@ if ($RelayPin) {
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "Service '$ServiceName' already exists; stopping and removing it first."
-    & "$PSScriptRoot\uninstall-service.ps1"
+    & (Join-Path $ScriptDir "uninstall-service.ps1")
 }
 
 # sc.exe is picky: the space after each `name=` is part of the syntax.

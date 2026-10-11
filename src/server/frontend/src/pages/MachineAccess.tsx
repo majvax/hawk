@@ -1,16 +1,28 @@
 // The owner's tabs on a machine: who it's shared with, and the machine
 // itself (name, key, removal).
-import { type FormEvent, type JSX, useCallback, useEffect, useState } from "react";
+//
+// Every share is a grant the owner's browser signs, and every revocation
+// too: the machine checks those signatures itself, so the relay can't add
+// viewers. A recipient's key is pinned the first time it's seen here, and a
+// different key later is refused until the owner has checked it with them.
+import { type FormEvent, type JSX, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   type Share,
+  type ShareTerms,
+  type SignedStatement,
   describeShareTerms,
   listShares,
+  lookupUserKey,
   removeMachine,
   renameMachine,
   shareMachine,
   unshareMachine,
 } from "../api.js";
+import { fingerprint, fromBase64 } from "../crypto.js";
+import { type EnrollmentCheck, endorse, signGrant, signRevocation } from "../e2e.js";
+import type { Identity } from "../keys.js";
+import { type PinStatus, checkContact, trustContact } from "../keystore.js";
 import type { Machine } from "../protocol.js";
 import { Alert, ConfirmButton, Segmented, Tag, errorMessage } from "../ui.js";
 
@@ -47,7 +59,48 @@ function fromLocalInput(value: string): number | null {
   return Number.isNaN(millis) ? null : Math.floor(millis / 1000);
 }
 
-export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
+// A recipient whose key isn't the one first seen for them.
+interface KeyChange {
+  email: string;
+  publicKey: string;
+  pinned: string; // fingerprints
+  current: string;
+}
+
+class KeyChangedError extends Error {
+  constructor(readonly change: KeyChange) {
+    super(`${change.email}'s key changed since you first shared with them`);
+  }
+}
+
+// Signs and stores a grant for `email` on these terms, after checking their
+// key against the one pinned for them.
+async function signShare(
+  identity: Identity,
+  machineId: string,
+  email: string,
+  terms: ShareTerms,
+  previous: SignedStatement | null,
+): Promise<void> {
+  const target = await lookupUserKey(email);
+  if (target.publicKey === null) {
+    throw new Error("that account hasn't set up its key yet; ask them to log in once, then share again");
+  }
+  const key = fromBase64(target.publicKey);
+  const pin = await checkContact(target.email, key);
+  if (pin.kind === "changed") {
+    throw new KeyChangedError({
+      email: target.email,
+      publicKey: target.publicKey,
+      pinned: await fingerprint(pin.pinned),
+      current: await fingerprint(key),
+    });
+  }
+  const grant = await signGrant(identity, machineId, target.publicKey, terms, previous);
+  await shareMachine(machineId, target.email, terms, grant);
+}
+
+export function SharingPanel({ machine, identity }: { machine: Machine; identity: Identity }): JSX.Element {
   const [shares, setShares] = useState<Share[] | null>(null);
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Share["role"]>("view");
@@ -57,6 +110,9 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
   const [startAt, setStartAt] = useState("");
   const [singleView, setSingleView] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [keyChange, setKeyChange] = useState<KeyChange | null>(null);
+  // Shares from before grants, signed once per panel when the key allows.
+  const signedLegacyRef = useRef(new Set<number>());
 
   const refresh = useCallback(async (): Promise<void> => {
     try {
@@ -80,9 +136,46 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
       await refresh();
       return true;
     } catch (caught) {
+      if (caught instanceof KeyChangedError) setKeyChange(caught.change);
       setError(errorMessage(caught));
       return false;
     }
+  };
+
+  const terms = (share: Share): ShareTerms => ({
+    role: share.role,
+    startsAt: share.startsAt,
+    expiresAt: share.expiresAt,
+    singleView: share.singleView,
+  });
+
+  // Same person, new terms: a new grant, newer than the one it replaces.
+  const reshare = (share: Share, next: ShareTerms): Promise<boolean> =>
+    run(() => signShare(identity, machine.id, share.email, next, share.grant));
+
+  const revoke = (share: Share): Promise<boolean> =>
+    run(async () => {
+      const revocation =
+        share.grant !== null && share.publicKey !== null
+          ? await signRevocation(identity, machine.id, share.publicKey, share.grant)
+          : null;
+      await unshareMachine(machine.id, share.userId, revocation);
+    });
+
+  // Shares from before grants existed: the machine refuses them until the
+  // owner signs one, which happens here as soon as the recipient has a key.
+  useEffect(() => {
+    for (const share of shares ?? []) {
+      if (share.grant !== null || share.publicKey === null || signedLegacyRef.current.has(share.userId)) continue;
+      signedLegacyRef.current.add(share.userId);
+      void reshare(share, terms(share));
+    }
+  }, [shares]);
+
+  const trustNewKey = async (change: KeyChange): Promise<void> => {
+    await trustContact(change.email, fromBase64(change.publicKey), true);
+    setKeyChange(null);
+    setError(null);
   };
 
   const submitShare = async (event: FormEvent): Promise<void> => {
@@ -96,13 +189,15 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
       setError("enter a valid date and time");
       return;
     }
-    if (await run(() => shareMachine(machine.id, email, { role, startsAt, expiresAt, singleView }))) setEmail("");
+    const existing = shares?.find((share) => share.email === email.trim().toLowerCase())?.grant ?? null;
+    const next = { role, startsAt, expiresAt, singleView };
+    if (await run(() => signShare(identity, machine.id, email, next, existing))) setEmail("");
   };
 
   // Pushes a temporary share's end back by an hour (from now if it's close).
   const extend = (share: Share): Promise<boolean> => {
     const from = Math.max(share.expiresAt ?? 0, Math.floor(Date.now() / 1000));
-    return run(() => shareMachine(machine.id, share.email, { ...share, expiresAt: from + 3600 }));
+    return reshare(share, { ...terms(share), expiresAt: from + 3600 });
   };
 
   const now = Date.now() / 1000;
@@ -110,6 +205,28 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
   return (
     <div className="pane-body">
       {error !== null && <Alert>{error}</Alert>}
+      {keyChange !== null && (
+        <div className="block">
+          <Alert>
+            {keyChange.email}'s key isn't the one you first shared with. It may be a new device or a reset account,
+            or someone between you and them. Compare fingerprints with them by another channel before trusting it.
+          </Alert>
+          <div className="keys-compare">
+            <span className="label faint">First seen</span>
+            <code className="mono fingerprint">{keyChange.pinned}</code>
+            <span className="label faint">Now</span>
+            <code className="mono fingerprint">{keyChange.current}</code>
+          </div>
+          <div className="form-row tight">
+            <button type="button" className="btn" onClick={() => void trustNewKey(keyChange)}>
+              They confirmed the new one: trust it
+            </button>
+            <button type="button" className="btn btn-ghost" onClick={() => setKeyChange(null)}>
+              Not now
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="block">
         <div className="block-head">
@@ -121,6 +238,7 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
             <thead>
               <tr>
                 <th>Account</th>
+                <th>Key</th>
                 <th>Access</th>
                 <th>Window</th>
                 <th />
@@ -129,7 +247,7 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
             <tbody>
               {shares !== null && shares.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="muted">
+                  <td colSpan={5} className="muted">
                     Only you. Share it below.
                   </td>
                 </tr>
@@ -143,12 +261,15 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
                     </span>
                   </td>
                   <td>
+                    <RecipientKey share={share} />
+                  </td>
+                  <td>
                     <Segmented
                       small
                       label={`Access for ${share.email}`}
                       options={SHARE_ROLES}
                       value={share.role}
-                      onChange={(next) => void run(() => shareMachine(machine.id, share.email, { ...share, role: next }))}
+                      onChange={(next) => void reshare(share, { ...terms(share), role: next })}
                     />
                   </td>
                   <td className="num muted">{describeShareTerms(share) || "until revoked"}</td>
@@ -161,7 +282,7 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
                     <ConfirmButton
                       small
                       confirmLabel="Confirm"
-                      onConfirm={() => void run(() => unshareMachine(machine.id, share.userId))}
+                      onConfirm={() => void revoke(share)}
                     >
                       Revoke
                     </ConfirmButton>
@@ -240,14 +361,54 @@ export function SharingPanel({ machine }: { machine: Machine }): JSX.Element {
         <p className="prose" style={{ fontSize: 12 }}>
           They need an account on this server first. View only can watch the screen but never send input. A
           temporary share is revoked when it runs out, cutting off a live view; one viewing only ends the share once
-          they stop watching. Sharing again with the same person replaces the terms.
+          they stop watching. Sharing again with the same person replaces the terms. Your browser signs each share,
+          and the machine checks the signature itself.
         </p>
       </form>
     </div>
   );
 }
 
-export function MachineSettings({ machine, onRemoved }: { machine: Machine; onRemoved: () => void }): JSX.Element {
+// A recipient's key, as this browser knows it: its fingerprint, and whether
+// it's the key first seen for them.
+function RecipientKey({ share }: { share: Share }): JSX.Element {
+  const [state, setState] = useState<{ print: string; pin: PinStatus } | null>(null);
+  const { email, publicKey } = share;
+
+  useEffect(() => {
+    if (publicKey === null) return;
+    const key = fromBase64(publicKey);
+    void Promise.all([fingerprint(key), checkContact(email, key)]).then(([print, pin]) => setState({ print, pin }));
+  }, [email, publicKey]);
+
+  if (publicKey === null) return <Tag tone="warn" title="They haven't logged in since keys were introduced">No key yet</Tag>;
+  if (state === null) return <span className="faint">…</span>;
+  const short = state.print.split(" ").slice(0, 2).join(" ");
+  return (
+    <span className="cell" title={`Fingerprint ${state.print}`}>
+      <code className="mono">{short}</code>
+      {state.pin.kind === "changed" ? (
+        <Tag tone="err">Changed</Tag>
+      ) : state.pin.kind === "known" && state.pin.verified ? (
+        <Tag tone="ok">Verified</Tag>
+      ) : share.grant === null ? (
+        <Tag tone="warn">Unsigned</Tag>
+      ) : null}
+    </span>
+  );
+}
+
+export function MachineSettings({
+  machine,
+  identity,
+  enrollmentCheck,
+  onRemoved,
+}: {
+  machine: Machine;
+  identity: Identity;
+  enrollmentCheck: EnrollmentCheck | undefined;
+  onRemoved: () => void;
+}): JSX.Element {
   const [name, setName] = useState(machine.name);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -312,6 +473,8 @@ export function MachineSettings({ machine, onRemoved }: { machine: Machine; onRe
         </div>
       </div>
 
+      <MachineVerification machine={machine} identity={identity} check={enrollmentCheck} />
+
       <div className="block">
         <span className="label">Remove</span>
         <div className="danger-zone" style={{ maxWidth: 720 }}>
@@ -327,6 +490,77 @@ export function MachineSettings({ machine, onRemoved }: { machine: Machine; onRe
           </ConfirmButton>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Whether the owner has vouched for the machine's key. Viewers trust what
+// the machine signs only through that endorsement, so until then nobody can
+// watch it. It happens on its own in the browser that made the enrollment
+// code; anywhere else the owner compares fingerprints with the machine.
+function MachineVerification({
+  machine,
+  identity,
+  check,
+}: {
+  machine: Machine;
+  identity: Identity;
+  check: EnrollmentCheck | undefined;
+}): JSX.Element | null {
+  const [print, setPrint] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (machine.publicKey !== null) void fingerprint(fromBase64(machine.publicKey)).then(setPrint);
+  }, [machine.publicKey]);
+
+  if (machine.publicKey === null) return null;
+
+  const confirm = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await endorse(identity, machine);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="block">
+      <span className="label">End-to-end encryption</span>
+      <div className="keys-compare">
+        <span className="label faint">Machine key</span>
+        <code className="mono fingerprint">{print ?? "…"}</code>
+      </div>
+      {machine.endorsement !== null ? (
+        <span className="cell">
+          <Tag tone="ok">Verified</Tag>
+          <span className="muted">You vouched for this key; viewers check every stream against it.</span>
+        </span>
+      ) : check === "mismatch" ? (
+        <Alert>
+          This key doesn't match the enrollment code you made, so it may not be your machine. Don't trust it: remove
+          the machine and enroll it again with a new code.
+        </Alert>
+      ) : (
+        <>
+          <p className="prose" style={{ fontSize: 12 }}>
+            Not verified yet, so nobody can watch it. The browser that made its enrollment code verifies it on its
+            own. From here, compare this fingerprint with the one on the machine: the line "machine key fingerprint"
+            in C:\ProgramData\HawkService\hawk-service.log.
+          </p>
+          {error !== null && <Alert>{error}</Alert>}
+          <div>
+            <button type="button" className="btn" disabled={busy} onClick={() => void confirm()}>
+              {busy ? "Signing…" : "The fingerprints match"}
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }

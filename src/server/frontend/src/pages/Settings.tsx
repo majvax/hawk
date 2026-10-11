@@ -2,21 +2,23 @@ import { type CSSProperties, type FormEvent, type JSX, useCallback, useEffect, u
 
 import {
   type Session,
-  changePassword,
+  type User,
   describeUserAgent,
   formatTime,
   listSessions,
   revokeOtherSessions,
   revokeSession,
 } from "../api.js";
+import { fingerprint } from "../crypto.js";
+import { type Identity, changePassword } from "../keys.js";
 import { ACCENT_PRESETS, DEFAULT_ACCENT, applyAccent, isAccent, loadAccent, saveAccent } from "../theme.js";
 import { Alert, ConfirmButton, Dot, Tag, errorMessage } from "../ui.js";
 
 const MIN_PASSWORD_LENGTH = 10; // mirrors auth::MIN_PASSWORD_LEN
 
-// Every user's own settings: the look of this dashboard, password and
-// sign-in sessions.
-export function SettingsPage(): JSX.Element {
+// Every user's own settings: the look of this dashboard, identity key,
+// password and sign-in sessions.
+export function SettingsPage({ user, identity }: { user: User; identity: Identity }): JSX.Element {
   const [sessions, setSessions] = useState<Session[] | null>(null);
 
   const refreshSessions = useCallback(async (): Promise<void> => {
@@ -29,8 +31,9 @@ export function SettingsPage(): JSX.Element {
         <h1>Settings</h1>
       </div>
       <AccentSection />
+      <KeySection identity={identity} />
       <SessionsSection sessions={sessions} refresh={refreshSessions} />
-      <PasswordSection onChanged={refreshSessions} />
+      <PasswordSection user={user} onChanged={refreshSessions} />
     </div>
   );
 }
@@ -116,7 +119,37 @@ function AccentSection(): JSX.Element {
   );
 }
 
-function PasswordSection({ onChanged }: { onChanged: () => Promise<void> }): JSX.Element {
+// The account's identity key, which signs everything this user does with
+// their machines: its fingerprint is what others compare to be sure it's
+// theirs.
+function KeySection({ identity }: { identity: Identity }): JSX.Element {
+  const [print, setPrint] = useState<string | null>(null);
+  useEffect(() => {
+    void fingerprint(identity.publicKey).then(setPrint);
+  }, [identity]);
+
+  return (
+    <section className="section">
+      <div className="section-aside">
+        <h2>Identity key</h2>
+        <p>
+          Signs your machines, your shares and every view you open. It's stored on the relay encrypted with your
+          password, which never leaves your browser.
+        </p>
+      </div>
+      <div className="section-main">
+        <span className="label faint">Fingerprint</span>
+        <code className="mono fingerprint">{print ?? "…"}</code>
+        <p className="field-hint">
+          Someone sharing a machine with you sees this fingerprint for your account. If they compare it with you, a
+          relay that swapped your key would be caught.
+        </p>
+      </div>
+    </section>
+  );
+}
+
+function PasswordSection({ user, onChanged }: { user: User; onChanged: () => Promise<void> }): JSX.Element {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -134,7 +167,7 @@ function PasswordSection({ onChanged }: { onChanged: () => Promise<void> }): JSX
     setBusy(true);
     setError(null);
     try {
-      await changePassword(current, next);
+      await changePassword(user, current, next);
       setCurrent("");
       setNext("");
       setConfirm("");
@@ -151,7 +184,10 @@ function PasswordSection({ onChanged }: { onChanged: () => Promise<void> }): JSX
     <section className="section">
       <div className="section-aside">
         <h2>Password</h2>
-        <p>Changing it signs out every other session on this account.</p>
+        <p>
+          Changing it signs out every other session on this account. Your identity key stays the same; it's only
+          re-encrypted under the new password.
+        </p>
       </div>
       <form className="section-main form-grid" onSubmit={(e) => void submit(e)}>
         <label className="field">

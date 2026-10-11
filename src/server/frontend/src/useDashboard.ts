@@ -1,15 +1,10 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
 import { getSession } from "./api.js";
+import { type EnrollmentCheck, type MachineTrust, ViewSession, checkEnrollment, trustMachine } from "./e2e.js";
+import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
-import {
-  type DashboardCommand,
-  type DashboardEvent,
-  type InputEvent,
-  type Machine,
-  type ParsedVideoFrame,
-  parseVideoFrame,
-} from "./protocol.js";
+import type { DashboardCommand, DashboardEvent, InputEvent, Machine, ParsedVideoFrame, Role } from "./protocol.js";
 
 // "reconnecting": the link dropped and the next attempt is scheduled;
 // "closed": the session is over, nothing more will be tried.
@@ -61,6 +56,14 @@ interface StreamDecoder {
   debugInfo?(): string;
 }
 
+// What the machine's answer to a join depends on. A view that was refused
+// or couldn't be trusted is only asked for again on its own once one of
+// these changes, so a refusal (which itself updates the machine) can't
+// turn into a loop of joins.
+function admissionKey(machine: Machine): string {
+  return [machine.publicKey, machine.ownerPublicKey, machine.endorsement, machine.role, machine.granted, machine.accessExpiresAt].join("|");
+}
+
 function sortByName(machines: Machine[]): Machine[] {
   return [...machines].sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -68,6 +71,18 @@ function sortByName(machines: Machine[]): Machine[] {
 // A frame gap this long means the stream has stalled: the host encodes on a
 // fixed clock, so an idle screen still sends frames.
 const STALL_MS = 3000;
+
+// Frames waiting to be decrypted before new deltas are dropped (until the
+// next keyframe): a device too slow to keep up shouldn't build a backlog.
+const MAX_PENDING_FRAMES = 30;
+
+// Where the end-to-end handshake for the open view stands.
+export type ViewSecurity =
+  | { kind: "securing" } // join sent, waiting for the machine's answer
+  | { kind: "secured"; role: Role } // the machine answered and its signature checked out
+  | { kind: "rejected"; reason: string } // the machine refused this viewer
+  | { kind: "untrusted"; reason: Exclude<MachineTrust, { ok: true }>["reason"] }
+  | { kind: "failed"; message: string }; // the answer didn't check out
 
 // ?debug in the URL adds the decoder's readout to the stream stats.
 const DEBUG = new URLSearchParams(window.location.search).has("debug");
@@ -99,6 +114,11 @@ export interface Dashboard {
   // Set when this browser can't decode the stream, or the decoder keeps
   // failing; the view shows it instead of waiting for a picture.
   decodeError: string | null;
+  // The open view's end-to-end handshake; null with no view open.
+  security: ViewSecurity | null;
+  // Owned machines whose enrollment this browser checked: "mismatch" means
+  // the key the machine answered with isn't bound to the code made here.
+  enrollmentChecks: Record<string, EnrollmentCheck>;
   startView: (deviceId: string) => void;
   stopView: () => void;
   // Sends one input event to the machine being watched. The relay drops it
@@ -113,7 +133,7 @@ export interface Dashboard {
 // the link drops (relay restart, network loss) it reconnects with a growing
 // delay, checking first that the session is still valid; `onSessionEnded`
 // runs once it isn't (logged out elsewhere, account disabled).
-export function useDashboard(onSessionEnded: () => void): Dashboard {
+export function useDashboard(identity: Identity, onSessionEnded: () => void): Dashboard {
   const onSessionEndedRef = useRef(onSessionEnded);
   onSessionEndedRef.current = onSessionEnded;
 
@@ -124,6 +144,8 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
   const [picture, setPicture] = useState<Dashboard["picture"]>(null);
   const [stats, setStats] = useState<StreamStats | null>(null);
   const [decodeError, setDecodeError] = useState<string | null>(null);
+  const [security, setSecurity] = useState<ViewSecurity | null>(null);
+  const [enrollmentChecks, setEnrollmentChecks] = useState<Record<string, EnrollmentCheck>>({});
 
   const socketRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -138,6 +160,25 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
   // reconnect until the view is resumed.
   const streamingRef = useRef<string | null>(null);
   const reconnectNowRef = useRef<() => void>(() => {});
+  // The open view's end-to-end session; null until a join has been sent.
+  const sessionRef = useRef<ViewSession | null>(null);
+  // Decryption is asynchronous, but frames must reach the decoder in order,
+  // and input must reach the machine in the order it was sealed.
+  const frameChainRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingFramesRef = useRef(0);
+  const inputChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Machines are read from socket handlers, which are created once.
+  const machinesRef = useRef<Machine[]>([]);
+  machinesRef.current = machines;
+  const checkedEnrollmentsRef = useRef(new Set<string>());
+  // Set when the open view was refused or untrusted: the admissionKey it
+  // was refused under.
+  const blockedRef = useRef<string | null>(null);
+  // Ends the open session, so frames waiting on its answer stop waiting.
+  const dropSession = useRef((): void => {
+    sessionRef.current?.abandon();
+    sessionRef.current = null;
+  }).current;
   // Counted per frame, read and reset by the once-a-second stats sample.
   const framesRef = useRef(0);
   const bytesRef = useRef(0);
@@ -151,11 +192,38 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
     return true;
   }, []);
 
+  // Opens an end-to-end session with the machine: checks its key is the one
+  // its owner vouched for, then sends a signed join for it to answer.
+  // streamingRef is set at once, so the stream isn't asked for twice while
+  // the join is being signed.
   const requestStream = useCallback(
-    (deviceId: string): void => {
-      if (send({ type: "start_view", deviceId })) streamingRef.current = deviceId;
+    (deviceId: string, machine?: Machine): void => {
+      const target = machine ?? machinesRef.current.find((candidate) => candidate.id === deviceId);
+      if (target === undefined || socketRef.current?.readyState !== WebSocket.OPEN) return;
+      if (blockedRef.current !== null && blockedRef.current === admissionKey(target)) return;
+      blockedRef.current = null;
+      streamingRef.current = deviceId;
+      dropSession();
+      setSecurity({ kind: "securing" });
+      void (async () => {
+        const trust = await trustMachine(identity, target);
+        if (viewingRef.current !== deviceId || streamingRef.current !== deviceId) return;
+        if (!trust.ok) {
+          streamingRef.current = null;
+          blockedRef.current = admissionKey(target);
+          setSecurity({ kind: "untrusted", reason: trust.reason });
+          return;
+        }
+        const session = await ViewSession.start(identity, deviceId, trust.machineKey);
+        if (viewingRef.current !== deviceId || streamingRef.current !== deviceId) return;
+        sessionRef.current = session;
+        if (!send({ type: "start_view", deviceId, join: session.join })) streamingRef.current = null;
+      })().catch((error: unknown) => {
+        if (streamingRef.current === deviceId) streamingRef.current = null;
+        setSecurity({ kind: "failed", message: error instanceof Error ? error.message : String(error) });
+      });
     },
-    [send],
+    [identity, send],
   );
 
   const teardownDecoder = useCallback((): void => {
@@ -272,21 +340,45 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
     return decoder;
   }, [drawFrame, sizeToVideo, onDecodeError]);
 
-  const handleFrame = useCallback(
-    (buffer: ArrayBuffer): void => {
-      const frame = parseVideoFrame(buffer);
-      if (frame === null) return;
-      bytesRef.current += buffer.byteLength;
-      receivedRef.current += 1;
-
+  const decodeFrame = useCallback(
+    (frame: ParsedVideoFrame): void => {
       // Decoding can only begin on a keyframe; drop deltas until the first
       // one arrives (e.g. when attaching mid-stream).
       if (!sawKeyframeRef.current && !frame.isKeyframe) return;
       sawKeyframeRef.current = true;
-
       ensureDecoder()?.decode(frame);
     },
     [ensureDecoder],
+  );
+
+  // Decrypts with the open session, in arrival order. Frames from before
+  // the session was accepted, or under a key it doesn't have, are dropped.
+  const handleFrame = useCallback(
+    (buffer: ArrayBuffer): void => {
+      // Frames that come before the machine's answer is checked wait for
+      // it in the chain below; without a session there's nothing to wait for.
+      const session = sessionRef.current;
+      if (session === null) return;
+      bytesRef.current += buffer.byteLength;
+      receivedRef.current += 1;
+      const keyframe = buffer.byteLength > 1 && (new Uint8Array(buffer, 1, 1)[0] ?? 0) & 0x01;
+      if (pendingFramesRef.current >= MAX_PENDING_FRAMES && !keyframe) {
+        sawKeyframeRef.current = false; // a gap: start again at a keyframe
+        return;
+      }
+      pendingFramesRef.current += 1;
+      frameChainRef.current = frameChainRef.current
+        .then(async () => {
+          const frame = await session.openFrame(buffer);
+          if (frame !== null && sessionRef.current === session) decodeFrame(frame);
+          else if (frame === null) sawKeyframeRef.current = false;
+        })
+        .catch((error: unknown) => console.error("frame:", error))
+        .finally(() => {
+          pendingFramesRef.current -= 1;
+        });
+    },
+    [decodeFrame],
   );
 
   // A new view starts with a clean slate, unless the browser can't decode
@@ -311,8 +403,10 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
   // The open view is gone for good: stopped, or the machine was taken away.
   const clearView = useCallback((): void => {
     resetDecodeError();
+    setSecurity(null);
     viewingRef.current = null;
     streamingRef.current = null;
+    dropSession();
     setViewingId(null);
     teardownDecoder();
     clearPicture();
@@ -328,7 +422,7 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
           if (viewing === null) break;
           const machine = payload.machines.find((candidate) => candidate.id === viewing);
           if (machine === undefined) clearView();
-          else if (machine.online) requestStream(viewing);
+          else if (machine.online) requestStream(viewing, machine);
           // Offline: wait for it to come back (machine_updated below).
           break;
         }
@@ -337,7 +431,7 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
             sortByName([...prev.filter((machine) => machine.id !== payload.machine.id), payload.machine]),
           );
           if (viewing === payload.machine.id && payload.machine.online && streamingRef.current === null) {
-            requestStream(viewing);
+            requestStream(viewing, payload.machine);
           }
           break;
         case "machine_removed":
@@ -349,13 +443,73 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
           // back up when it reconnects; the decoder restarts on a keyframe.
           if (viewing === payload.deviceId) {
             streamingRef.current = null;
+            dropSession();
             teardownDecoder();
+          }
+          break;
+        case "view_accepted": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          session.accept(payload).then(
+            () => {
+              if (sessionRef.current === session && session.role !== null) {
+                setSecurity({ kind: "secured", role: session.role });
+              }
+            },
+            (error: unknown) => {
+              if (sessionRef.current !== session) return;
+              // Nothing from this machine can be trusted: stop asking.
+              send({ type: "stop_view", deviceId: payload.deviceId });
+              const machine = machinesRef.current.find((candidate) => candidate.id === payload.deviceId);
+              blockedRef.current = machine === undefined ? "" : admissionKey(machine);
+              streamingRef.current = null;
+              dropSession();
+              teardownDecoder();
+              setSecurity({ kind: "failed", message: error instanceof Error ? error.message : String(error) });
+            },
+          );
+          break;
+        }
+        case "stream_key": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          // Ahead of the frames under it: the relay sends events first.
+          frameChainRef.current = frameChainRef.current
+            .then(() => session.addStreamKey(payload.wrappedKey))
+            .catch((error: unknown) => console.error("stream key:", error));
+          break;
+        }
+        case "view_rejected":
+          if (viewing === payload.deviceId) {
+            const machine = machinesRef.current.find((candidate) => candidate.id === payload.deviceId);
+            blockedRef.current = machine === undefined ? "" : admissionKey(machine);
+            streamingRef.current = null;
+            dropSession();
+            teardownDecoder();
+            setSecurity({ kind: "rejected", reason: payload.reason });
           }
           break;
       }
     },
-    [clearView, requestStream, teardownDecoder],
+    [clearView, requestStream, send, teardownDecoder],
   );
+
+  // Owned machines not vouched for yet: if this browser made the code a
+  // machine enrolled with, check its key against the code and endorse it.
+  useEffect(() => {
+    for (const machine of machines) {
+      if (machine.role !== "owner" || machine.endorsement !== null || machine.enrollCodeHash === null) continue;
+      if (checkedEnrollmentsRef.current.has(machine.id)) continue;
+      checkedEnrollmentsRef.current.add(machine.id);
+      checkEnrollment(identity, machine).then(
+        (result) => setEnrollmentChecks((prev) => ({ ...prev, [machine.id]: result })),
+        (error: unknown) => {
+          console.error("checking enrollment:", error);
+          checkedEnrollmentsRef.current.delete(machine.id);
+        },
+      );
+    }
+  }, [identity, machines]);
 
   useEffect(() => {
     let disposed = false;
@@ -375,6 +529,7 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
         if (socketRef.current === socket) socketRef.current = null;
         if (disposed) return; // our own teardown
         streamingRef.current = null;
+        dropSession();
         teardownDecoder();
         scheduleReconnect();
       });
@@ -453,6 +608,7 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
       resetDecodeError();
 
       viewingRef.current = deviceId;
+      blockedRef.current = null; // asked for by hand: try again
       setViewingId(deviceId);
       requestStream(deviceId); // while disconnected, the snapshot resumes it
     },
@@ -507,11 +663,19 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
 
   const sendInput = useCallback(
     (event: InputEvent): void => {
-      // Only while frames are actually flowing: input to a machine this
-      // socket isn't watching goes nowhere.
+      // Only once the machine has accepted this viewer with a role that
+      // may control it: input to anything else goes nowhere.
       const deviceId = streamingRef.current;
-      if (deviceId === null) return;
-      send({ type: "input", deviceId, event });
+      const session = sessionRef.current;
+      if (deviceId === null || session === null || (session.role !== "owner" && session.role !== "control")) return;
+      const sealed = session.sealInput(event);
+      if (sealed === null) return;
+      inputChainRef.current = inputChainRef.current
+        .then(() => sealed)
+        .then((payload) => {
+          if (sessionRef.current === session) send({ type: "input", deviceId, sealed: payload });
+        })
+        .catch((error: unknown) => console.error("sealing input:", error));
     },
     [send],
   );
@@ -533,6 +697,8 @@ export function useDashboard(onSessionEnded: () => void): Dashboard {
     picture,
     stats,
     decodeError,
+    security,
+    enrollmentChecks,
     startView,
     stopView,
     sendInput,

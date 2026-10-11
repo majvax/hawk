@@ -1749,3 +1749,18 @@ select {
     transition: none !important;
   }
 }
+
+/* Key fingerprints: compared by eye, so spaced and allowed to wrap. */
+.fingerprint {
+  letter-spacing: 0.04em;
+  overflow-wrap: anywhere;
+}
+
+/* Label / fingerprint pairs, e.g. a pinned key next to the current one. */
+.keys-compare {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 14px;
+  align-items: baseline;
+  max-width: 560px;
+}

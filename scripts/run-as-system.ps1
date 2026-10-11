@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Useful for reproducing what hawk-service sees at runtime without installing
-    it as a service — e.g. launching hawk-service.exe under SYSTEM to inspect
+    it as a service - e.g. launching hawk-service.exe under SYSTEM to inspect
     its log, or testing CreateProcessAsUser behaviour from a SYSTEM context.
 
     Note: hawk-service.exe itself expects to be started by the Service Control

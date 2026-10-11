@@ -1,6 +1,7 @@
 import { type FormEvent, type JSX, type ReactNode, useEffect, useState } from "react";
 
-import { ApiError, type InviteInfo, type User, getInvite, login, signup } from "../api.js";
+import { ApiError, type InviteInfo, type User, getInvite } from "../api.js";
+import { type Identity, logIn, logOut, signUp, unlock } from "../keys.js";
 import { Alert, Corners, Logo } from "../ui.js";
 
 const MIN_PASSWORD_LENGTH = 10; // mirrors auth::MIN_PASSWORD_LEN
@@ -49,7 +50,9 @@ function AuthFrame({
   );
 }
 
-export function LoginPage({ onLogin }: { onLogin: (user: User) => void }): JSX.Element {
+type Entered = { user: User; identity: Identity };
+
+export function LoginPage({ onLogin }: { onLogin: (entered: Entered) => void }): JSX.Element {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -60,7 +63,7 @@ export function LoginPage({ onLogin }: { onLogin: (user: User) => void }): JSX.E
     setBusy(true);
     setError(null);
     try {
-      onLogin(await login(email, password));
+      onLogin(await logIn(email, password));
     } catch (caught) {
       setError(caught instanceof ApiError && caught.status === 403 ? "this account is disabled" : errorMessage(caught));
     } finally {
@@ -95,14 +98,74 @@ export function LoginPage({ onLogin }: { onLogin: (user: User) => void }): JSX.E
       </label>
       {error !== null && <Alert>{error}</Alert>}
       <button type="submit" className="btn btn-primary btn-block" disabled={busy}>
-        {busy ? "Logging in…" : "Log in"}
+        {busy ? "Unlocking…" : "Log in"}
       </button>
-      <p className="auth-foot">Accounts are by invitation only. Ask this server's admin for an invite link.</p>
+      <p className="auth-foot">
+        Accounts are by invitation only. Ask this server's admin for an invite link. Your password never leaves this
+        browser: it unlocks the key your screen is encrypted with.
+      </p>
     </AuthFrame>
   );
 }
 
-export function SignupPage({ token, onSignup }: { token: string; onSignup: (user: User) => void }): JSX.Element {
+// Signed in, but this browser doesn't hold the account's key (site data
+// cleared, or signed in before keys existed): the password unlocks it.
+export function UnlockPage({
+  user,
+  onUnlock,
+  onLogOut,
+}: {
+  user: User;
+  onUnlock: (identity: Identity) => void;
+  onLogOut: () => void;
+}): JSX.Element {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event: FormEvent): Promise<void> => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      onUnlock(await unlock(user, password));
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <AuthFrame title="Unlock your key" onSubmit={(e) => void submit(e)}>
+      <p className="prose">
+        Signed in as <span className="mono">{user.email}</span>. Enter your password to unlock the key your machines
+        are encrypted with in this browser.
+      </p>
+      <label className="field">
+        <span className="label">Password</span>
+        <input
+          className="input"
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+          autoFocus
+        />
+      </label>
+      {error !== null && <Alert>{error}</Alert>}
+      <button type="submit" className="btn btn-primary btn-block" disabled={busy}>
+        {busy ? "Unlocking…" : "Unlock"}
+      </button>
+      <button type="button" className="btn btn-ghost btn-block" onClick={() => void logOut().finally(onLogOut)}>
+        Log out
+      </button>
+    </AuthFrame>
+  );
+}
+
+export function SignupPage({ token, onSignup }: { token: string; onSignup: (entered: Entered) => void }): JSX.Element {
   const [invite, setInvite] = useState<InviteInfo | "invalid" | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -123,7 +186,7 @@ export function SignupPage({ token, onSignup }: { token: string; onSignup: (user
     setBusy(true);
     setError(null);
     try {
-      onSignup(await signup(token, email, password));
+      onSignup(await signUp(token, email, password));
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {

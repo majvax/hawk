@@ -1,47 +1,128 @@
-//! Machine management for owners: enrollment codes, rename, removal, and
-//! sharing with other accounts, permanently or temporarily. Every change is
-//! committed to the database first, then mirrored into the registry so open
-//! dashboards follow.
+//! Machine management for owners: enrollment codes, endorsing a machine's
+//! key, rename, removal, and sharing with other accounts, permanently or
+//! temporarily. Every change is committed to the database first, then
+//! mirrored into the registry so open dashboards follow.
+//!
+//! Who may watch a machine is decided by its owner's signatures, which the
+//! machine checks itself (see crate::e2e): sharing stores the grant the
+//! owner's browser signed, and revoking stores a signed revocation the
+//! machine is sent.
 
 use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::AppState;
 use crate::auth::{self, CurrentUser};
-use crate::db::{self, Role, ShareError, ShareTerms};
+use crate::db::{self, Role, ShareError, ShareTerms, Signed};
+use crate::e2e;
 use crate::error::ApiError;
+use crate::protocol::SignedView;
 use crate::registry::ViewEnded;
 
 const MAX_NAME_LEN: usize = 64;
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollmentRequest {
+    /// Base64 SHA-256 of the code's canonical form. The code itself is made
+    /// in the owner's browser and never sent here: it keys the bindings
+    /// that let the machine and the owner trust each other's keys.
+    code_hash: String,
+    /// Base64 HMAC of the owner's identity key under the code.
+    owner_binding: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrollmentCode {
-    /// Shown once; only its hash is stored.
-    code: String,
     expires_at: i64,
     /// What the machine should pin the relay's TLS key to; None without TLS.
     relay_pin: Option<String>,
 }
 
-/// A one-time code that enrolls one machine under the caller's account.
+/// Registers a one-time code that enrolls one machine under the caller's
+/// account.
 pub async fn create_enrollment_code(
     State(state): State<AppState>,
     current: CurrentUser,
+    Json(body): Json<EnrollmentRequest>,
 ) -> Result<Json<EnrollmentCode>, ApiError> {
-    let code = auth::enrollment_code();
-    let hash = auth::enrollment_code_hash(&code);
+    let invalid = || ApiError::bad_request("invalid enrollment code");
+    let hash = BASE64.decode(&body.code_hash).map_err(|_| invalid())?;
+    let binding = BASE64.decode(&body.owner_binding).map_err(|_| invalid())?;
+    if hash.len() != 32 || binding.len() != 32 {
+        return Err(invalid());
+    }
+    let owner_id = current.user.id;
+    if state.db.call(move |conn| db::user_key(conn, owner_id)).await?.is_none() {
+        return Err(ApiError::Conflict("set up your account's key first: log out and in again".into()));
+    }
     let now = auth::now();
     let expires_at = now + auth::ENROLLMENT_TTL.whole_seconds();
+    state.db.call(move |conn| db::create_enrollment_code(conn, &hash, owner_id, &binding, now, expires_at)).await?;
+    Ok(Json(EnrollmentCode { expires_at, relay_pin: state.relay_pin.clone() }))
+}
+
+#[derive(Deserialize)]
+pub struct Endorsement {
+    /// Base64 signature of the owner over e2e::machine_statement.
+    signature: String,
+}
+
+/// Stores the owner's endorsement of their machine's key, which viewers
+/// check before trusting anything the machine signs. The owner's browser
+/// signs it once it has checked the machine's enrollment binding, or the
+/// owner compared fingerprints.
+pub async fn endorse(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Path(machine_id): Path<String>,
+    Json(body): Json<Endorsement>,
+) -> Result<StatusCode, ApiError> {
     let owner_id = current.user.id;
-    state.db.call(move |conn| db::create_enrollment_code(conn, &hash, owner_id, now, expires_at)).await?;
-    Ok(Json(EnrollmentCode { code, expires_at, relay_pin: state.relay_pin.clone() }))
+    let id = machine_id.clone();
+    let (machine_key, owner_key) =
+        state.db.call(move |conn| db::endorsement_keys(conn, &id, owner_id)).await?.ok_or(ApiError::NotFound)?;
+    let signature = BASE64.decode(&body.signature).map_err(|_| ApiError::bad_request("invalid signature"))?;
+    let signed = Signed { statement: e2e::machine_statement(&machine_id, &machine_key), signature };
+    if !e2e::verify(&owner_key, &signed) {
+        return Err(ApiError::bad_request("the signature doesn't match your key"));
+    }
+    let id = machine_id.clone();
+    state.db.call(move |conn| db::set_endorsement(conn, &id, owner_id, &signed.signature)).await?;
+    refresh_everyone(&state, &machine_id, owner_id).await
+}
+
+/// Re-sends the machine to its owner and everyone it's shared with.
+async fn refresh_everyone(state: &AppState, machine_id: &str, owner_id: i64) -> Result<StatusCode, ApiError> {
+    let id = machine_id.to_owned();
+    let now = auth::now();
+    let rows = state
+        .db
+        .call(move |conn| {
+            let mut users = vec![owner_id];
+            users.extend(db::list_shares(conn, &id, owner_id)?.unwrap_or_default().iter().map(|share| share.user_id));
+            let mut rows = Vec::new();
+            for user_id in users {
+                if let Some(row) = db::machine_for_user(conn, &id, user_id, now)? {
+                    rows.push((user_id, row));
+                }
+            }
+            Ok(rows)
+        })
+        .await?;
+    for (user_id, row) in rows {
+        state.registry.grant(user_id, &row);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -95,6 +176,11 @@ pub struct ShareView {
     starts_at: Option<i64>,
     expires_at: Option<i64>,
     single_view: bool,
+    /// The recipient's identity key; None until they've set one up.
+    public_key: Option<String>,
+    /// What the owner signed for this share; None for a share from before
+    /// grants existed, which the owner's browser signs when it next can.
+    grant: Option<SignedView>,
 }
 
 pub async fn list_shares(
@@ -118,6 +204,8 @@ pub async fn list_shares(
                 starts_at: share.terms.starts_at,
                 expires_at: share.terms.expires_at,
                 single_view: share.terms.single_view,
+                public_key: share.public_key.map(|key| BASE64.encode(key)),
+                grant: share.grant.as_ref().map(SignedView::from),
             })
             .collect(),
     ))
@@ -139,6 +227,9 @@ pub struct ShareRequest {
     expires_at: Option<i64>,
     #[serde(default)]
     single_view: bool,
+    /// The owner's signature over exactly these terms, for the recipient's
+    /// current identity key (see e2e::check_grant).
+    grant: SignedView,
 }
 
 impl ShareRequest {
@@ -174,23 +265,34 @@ pub async fn share(
     let now = auth::now();
     let terms = body.terms(now)?;
     let email = auth::normalize_email(&body.email).ok_or_else(|| ApiError::bad_request("invalid email address"))?;
+    let grant = body.grant.decode().ok_or_else(|| ApiError::bad_request("invalid grant"))?;
     let owner_id = current.user.id;
+
+    let lookup = email.clone();
+    let (user_id, viewer_key) = state
+        .db
+        .call(move |conn| db::public_key_by_email(conn, &lookup))
+        .await?
+        .ok_or_else(|| ApiError::bad_request("no account with that email; ask the admin to invite them first"))?;
+    let viewer_key = viewer_key.ok_or_else(|| {
+        ApiError::bad_request("that account hasn't set up its key yet; ask them to log in once, then share again")
+    })?;
+    let owner_key = state.db.call(move |conn| db::user_key(conn, owner_id)).await?.ok_or(ApiError::Forbidden)?.public_key;
+    e2e::check_grant(&grant, &owner_key, &machine_id, &viewer_key, &terms)
+        .map_err(|mismatch| ApiError::bad_request(mismatch.message()))?;
+
     let id = machine_id.clone();
     let granted = state
         .db
         .call(move |conn| {
-            let user_id = match db::upsert_share(conn, &id, owner_id, &email, terms, now) {
-                Ok(user_id) => user_id,
-                Err(error) => return Ok(Err(error)),
-            };
+            if let Err(error) = db::upsert_share(conn, &id, owner_id, user_id, terms, &grant, now) {
+                return Ok(Err(error));
+            }
             Ok(Ok((user_id, db::machine_for_user(conn, &id, user_id, now)?)))
         })
         .await?
         .map_err(|error| match error {
             ShareError::NotOwner => ApiError::NotFound,
-            ShareError::NoSuchUser => {
-                ApiError::bad_request("no account with that email; ask the admin to invite them first")
-            }
             ShareError::SelfShare => ApiError::bad_request("you already own this machine"),
             ShareError::Db(error) => error.into(),
         })?;
@@ -203,18 +305,51 @@ pub async fn share(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Revokes a share; the user's live view of the machine stops immediately.
+#[derive(Deserialize)]
+pub struct UnshareRequest {
+    /// The owner's signed revocation; required once the share has a grant,
+    /// since the machine would otherwise keep honouring it.
+    #[serde(default)]
+    revocation: Option<SignedView>,
+}
+
+/// Revokes a share; the user's live view of the machine stops immediately,
+/// and the machine is handed the signed revocation.
 pub async fn unshare(
     State(state): State<AppState>,
     current: CurrentUser,
     Path((machine_id, user_id)): Path<(String, i64)>,
+    Json(body): Json<UnshareRequest>,
 ) -> Result<StatusCode, ApiError> {
     let owner_id = current.user.id;
     let id = machine_id.clone();
-    if !state.db.call(move |conn| db::delete_share(conn, &id, owner_id, user_id)).await? {
+    let share = state
+        .db
+        .call(move |conn| db::share_for(conn, &id, owner_id, user_id))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let revocation = match (&share.grant, &share.public_key, body.revocation) {
+        (None, _, _) => None,
+        (Some(grant), Some(viewer_key), Some(revocation)) => {
+            let revocation = revocation.decode().ok_or_else(|| ApiError::bad_request("invalid revocation"))?;
+            let owner_key =
+                state.db.call(move |conn| db::user_key(conn, owner_id)).await?.ok_or(ApiError::Forbidden)?.public_key;
+            e2e::check_revocation(&revocation, &owner_key, &machine_id, viewer_key, Some(grant))
+                .map_err(|mismatch| ApiError::bad_request(mismatch.message()))?;
+            Some(revocation)
+        }
+        (Some(_), _, _) => return Err(ApiError::bad_request("a signed revocation is required")),
+    };
+
+    let id = machine_id.clone();
+    let now = auth::now();
+    if !state.db.call(move |conn| db::delete_share(conn, &id, owner_id, user_id, revocation.as_ref(), now)).await? {
         return Err(ApiError::NotFound);
     }
     state.registry.revoke(user_id, &machine_id);
+    let id = machine_id.clone();
+    let revocations = state.db.call(move |conn| db::revocations(conn, &id)).await?;
+    state.registry.send_revocations(&machine_id, &revocations);
     Ok(StatusCode::NO_CONTENT)
 }
 

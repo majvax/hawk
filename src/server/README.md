@@ -74,14 +74,21 @@ Accounts are invite-only; there is no open sign-up.
   machines they own, immediately. Being admin does not grant access to
   other people's machines.
 - **Settings:** every user's Settings tab picks the dashboard's accent
-  color (kept in that browser), changes their password (the
-  current one is checked first; wrong guesses count toward the login
-  throttle) and lists their sessions with the browser and IP each signed in
-  from. A session can be revoked on its own, or all but the current one at
-  once. Changing the password also ends every other session. Revoking
-  closes that session's open dashboards immediately.
-- Passwords: argon2id, at least 10 characters. Session and invite tokens are
-  32 random bytes; the database stores only their SHA-256.
+  color (kept in that browser), shows their identity key's fingerprint,
+  changes their password (the current one is checked first; wrong guesses
+  count toward the login throttle) and lists their sessions with the
+  browser and IP each signed in from. A session can be revoked on its own,
+  or all but the current one at once. Changing the password also ends every
+  other session. Revoking closes that session's open dashboards immediately.
+- Passwords never reach the relay. The browser stretches the password
+  (PBKDF2-SHA256, 600,000 iterations, salted with the email) and derives
+  two keys from it: an auth key, which is what login sends and what the
+  relay hashes with argon2id, and a wrapping key, which encrypts the
+  account's identity key before the relay stores it. At least 10 characters,
+  checked by the dashboard. Accounts made before this send their password
+  itself one last time on their next login, which upgrades them. Session
+  and invite tokens are 32 random bytes; the database stores only their
+  SHA-256.
 - Sessions: `hawk_session` cookie, `HttpOnly`, `SameSite=Strict`, `Secure`
   under TLS, valid 30 days. Every `/api/*` route except login, signup and
   invite lookup requires one, as does the `/v1/dashboard` socket, which also
@@ -93,13 +100,16 @@ Accounts are invite-only; there is no open sign-up.
 
 Every machine has exactly one owner and its own key pair.
 
-- **Enrolling:** in the dashboard, **Machines > Add machine** issues a
-  one-time enrollment code (like `7K3QD-WX2MP`, valid 1 hour) and the exact
+- **Enrolling:** in the dashboard, **Machines > Add machine** makes a
+  one-time enrollment code (25 characters, valid 1 hour) and shows the exact
   install command, `install-service.ps1 -EnrollCode <code> -RelayPin <pin>`
-  (see `scripts/README.md`). The service creates an ECDSA P-256 key in the
-  machine's TPM (or the software key store without one) and sends the
-  public key with the code. The relay stores the public key, and consumes
-  the code only once the machine has proven it holds the private key.
+  (see `scripts/README.md`). The code is made in the browser, and the relay
+  only ever gets its hash: it keys the bindings that let the machine and its
+  owner trust each other's keys (see "End-to-end encryption" below). The
+  service creates an ECDSA P-256 key in the machine's TPM (or the software
+  key store without one) and sends the public key with the code's hash. The
+  relay stores the public key, and consumes the code only once the machine
+  has proven it holds the private key.
 - **Connecting:** hello, then the relay sends a fresh 32-byte challenge and
   the machine signs it (`hawk-machine-auth-v1\0 || nonce`, verified with
   `ring`). An unknown or removed machine, a failed proof, a spent or expired
@@ -125,11 +135,20 @@ invites them first if they have none), with one of two roles:
 - **control** - can watch and use the machine's mouse and keyboard.
 
 The owner always has full access and sees, live, who is watching each of
-their machines. Access is enforced by the relay, not the dashboard: a
-dashboard only ever learns about machines its user can access, and every
-`start_view` is checked. Granting, changing or revoking a share, renaming
-or removing a machine all apply to open dashboards immediately; a revoked
-viewer's stream stops at once.
+their machines. Access is enforced twice. The relay only tells a dashboard
+about machines its user can access and checks every `start_view`. The
+machine checks again, from the owner's own signatures: every share is a
+grant the owner's browser signs, every revoke a signed revocation, and the
+machine refuses anyone without a valid grant, so not even the relay can add
+a viewer. Granting, changing or revoking a share, renaming or removing a
+machine all apply to open dashboards immediately; a revoked viewer's stream
+stops at once.
+
+Sharing needs the recipient's identity key, so they must have logged in
+once. The owner's browser pins each recipient's key the first time it's
+seen and shows its fingerprint; a different key later is refused until the
+owner confirms it with them. Shares from before grants existed are signed
+automatically the next time the owner opens the machine's Sharing tab.
 
 A share can also be temporary. These combine freely:
 
@@ -160,15 +179,20 @@ machine too; holding `Esc` leaves full screen.
 - The dashboard sends pointer positions as a fraction of the screen, button
   presses, wheel notches and physical keys (`KeyboardEvent.code`). Pointer
   moves are coalesced to one per repaint.
-- The relay checks the sender's role on **every** input message, not just at
-  `start_view`: input from a `view` share, or from a dashboard that isn't
-  watching that machine at that moment, is dropped without an answer. It
-  also clamps positions and wheel deltas, rejects unusable ones, and caps
-  each dashboard at 500 events a second.
-- When a viewer stops watching, or their share drops to `view` mid-session,
-  the relay tells the machine to release whatever that viewer's input was
-  holding down. The dashboard releases it too when the screen loses focus,
-  so nothing stays pressed on the machine with nobody pressing it.
+- Input is sealed for the machine, so the relay can't read it. The relay
+  still checks the sender's role on **every** input message: input from a
+  `view` share, or from a dashboard that isn't watching that machine at that
+  moment, is dropped without an answer, and each dashboard is capped at 500
+  events a second.
+- The machine opens each event with that viewer's session key, refuses any
+  it has already seen (so input can't be replayed), checks the role its
+  owner granted, clamps positions and wheel deltas, and rejects unusable
+  events.
+- When a viewer stops watching, or their share changes mid-session (which
+  restarts their view), the machine releases whatever that viewer's input
+  was holding down, unless another viewer holds it too. The dashboard
+  releases it as well when the screen loses focus, so nothing stays pressed
+  on the machine with nobody pressing it.
 - The machine replays events with `SendInput`, as physical scancodes and
   absolute desktop positions — see "Input Injection" in the top-level
   README for what that reaches and what it can't (`Ctrl+Alt+Del` and the
@@ -176,6 +200,43 @@ machine too; holding `Esc` leaves full screen.
 - Desktop Duplication doesn't put the machine's own mouse cursor in the
   captured frames, so while controlling, the viewer's own pointer stands in
   for it; someone only watching sees no pointer at all.
+
+### End-to-end encryption
+
+The relay carries the stream and input but can read neither, and nothing
+it says is taken on trust. Formats are in `relay/src/e2e.rs`,
+`frontend/src/e2e.ts` and `src/service/e2e.cpp`.
+
+- **Identity keys:** every account has an ECDSA P-256 key. Its private half
+  is stored on the relay encrypted under the password-derived wrapping key,
+  and kept in each signed-in browser as a non-extractable WebCrypto key.
+- **Enrollment:** the machine and the owner's browser each MAC their own
+  public key with the enrollment code, which the relay never sees. The
+  machine pins the owner's key only if its MAC checks out; the browser that
+  made the code checks the machine's MAC, then signs the machine's key (an
+  endorsement). From another browser, the owner can compare the machine's
+  fingerprint (logged by the service as `machine key fingerprint`) instead.
+- **Trust:** viewers trust the machine's key through the owner's
+  endorsement. The owner trusts their own key; everyone else pins the
+  owner's key the first time they see it.
+- **Each view:** the browser sends a join signed with its identity key and a
+  fresh ECDH key. The machine checks the owner's grant for that key,
+  answers with its own ECDH key signed by its machine key, and sends the
+  stream key wrapped for that viewer alone. Keys come from HKDF over the
+  shared secret.
+- **Frames:** AES-256-GCM under the stream key, with a counter nonce. The
+  header (keyframe flag, timestamp, key id) stays readable, so the relay can
+  still start a viewer on a keyframe, and is authenticated. When a viewer
+  leaves, everyone else moves to a new stream key.
+- **Input:** AES-256-GCM under a key only that viewer and the machine
+  share, with a counter the machine requires to keep increasing.
+- **Limits:** the relay can still refuse service, see who watches what and
+  when, and delay a revocation it should pass on, though not past the
+  share's expiry. A dashboard served by a compromised relay could be
+  modified to leak keys; a separately hosted dashboard (see the top-level
+  README) closes that.
+- Machines enrolled before end-to-end encryption have no pinned owner key
+  and refuse every viewer until they're enrolled again.
 
 ### Dashboard connection
 
@@ -225,6 +286,4 @@ Planned work on the server. Nothing below is implemented yet.
 
 - **On-machine indicator.** Show something on the shared PC itself while
   anyone is watching it.
-- **The machine's cursor in the stream.** Desktop Duplication reports the
-  mouse pointer separately from the frame; compositing it in would let a
-  watcher see it too.
+

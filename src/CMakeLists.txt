@@ -12,6 +12,8 @@ enable_language(RC)
 add_executable(hawk-service
     service/main.cpp
     service/capture_host.cpp
+    service/crypto.cpp
+    service/e2e.cpp
     service/machine_identity.cpp
     service/machine_key.cpp
     service/websocket/websocket.cpp

@@ -1,10 +1,11 @@
 #include "capture_host.hpp"
+#include "crypto.hpp"
+#include "e2e.hpp"
 #include "machine_identity.hpp"
 #include "machine_key.hpp"
 #include "websocket/websocket.hpp"
 
 #include <windows.h>
-#include <wincrypt.h>
 
 #include <glaze/glaze.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
@@ -17,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -49,20 +51,24 @@ constexpr std::chrono::seconds kRejectedRetryDelay{30};
 constexpr std::uint16_t kPolicyViolationCode = 1008;
 constexpr std::wstring_view kServiceName = L"HawkService";
 
+namespace crypto = hawk::crypto;
+
 // What the machine signs to answer the relay's challenge; must match
 // machine_auth_message() in src/server/relay/src/protocol.rs.
 constexpr std::string_view kMachineAuthContext{"hawk-machine-auth-v1\0", 21};
 
 // Opens every connection. An enrolled machine sends `machine`; a new one
-// sends `enroll_code`, `public_key` and `key_storage`. Unset members are
+// sends the hash of its enrollment code (never the code, which keys the
+// bindings), `public_key`, `key_storage` and `binding`. Unset members are
 // left out of the JSON.
 struct HelloMessage {
     std::string                type = "hello";
     std::string                machine_id;  // the hostname, shown to the owner
     std::optional<std::string> machine;
-    std::optional<std::string> enroll_code;
+    std::optional<std::string> enroll_code_hash;
     std::optional<std::string> public_key;  // base64 uncompressed P-256 point
     std::optional<std::string> key_storage;  // "tpm" or "software"
+    std::optional<std::string> binding;      // base64 HMAC of public_key under the code
 };
 
 // Answers the relay's challenge.
@@ -72,33 +78,23 @@ struct ProofMessage {
 };
 
 // A message from the relay. Unknown fields are ignored, so commands can grow
-// parameters without breaking this parser. `nonce` is only set on
-// "challenge", `machine_id` only on "enrolled", and the rest only on
-// "input", whose shape is flat: {"type":"input","kind":"key",...}. See
-// InputEvent in relay/src/protocol.rs; the relay has already clamped the
-// positions and deltas and rejected unusable ones.
+// parameters without breaking this parser. See DeviceCommand in
+// relay/src/protocol.rs for which command carries what. Viewers' requests
+// and input arrive signed or sealed for this machine; the relay can't read
+// or forge them, and ViewerHub checks them.
 struct RelayCommand {
-    std::string  type;
-    std::string  nonce;
-    std::string  machine_id;
-    std::string  kind;          // input: "mouse_move", "mouse_button", "wheel", "key"
-    double       x = 0.0;       // input/mouse_move: fraction of the screen, 0..=1
-    double       y = 0.0;
-    std::string  button;        // input/mouse_button: "left", "right", "middle"
-    bool         down = false;  // input/mouse_button, input/key
-    std::int32_t dx = 0;        // input/wheel: WHEEL_DELTA units, positive is up / right
-    std::int32_t dy = 0;
-    std::string  code;          // input/key: a KeyboardEvent.code, e.g. "ShiftLeft"
+    std::string                                  type;
+    std::string                                  nonce;          // challenge
+    std::string                                  machine_id;     // enrolled
+    std::string                                  owner_key;      // enrolled: base64 identity key
+    std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input
+    std::string                                  statement;      // viewer_join
+    std::string                                  signature;      // viewer_join
+    std::optional<svc::SignedStatement>          grant;          // viewer_join
+    std::string                                  sealed;         // input
+    std::vector<svc::SignedStatement>            revocations;    // revocations
 };
-
-// Binary frame carrying one H.264 access unit to the relay:
-//   [0]      u8   kind, kVideoFrameKind = H.264 Annex B
-//   [1]      u8   flags, bit 0 = keyframe
-//   [2..9]   i64  timestamp in microseconds since the stream started, little-endian
-//   [10..]        the access unit
-constexpr std::byte   kVideoFrameKind{0x01};
-constexpr std::byte   kVideoFrameKeyframeFlag{0x01};
-constexpr std::size_t kVideoFrameHeaderSize = 10;
 
 }  // namespace
 
@@ -106,8 +102,15 @@ template <>
 struct glz::meta<HelloMessage> {
     using T                     = HelloMessage;
     static constexpr auto value =
-        object("type", &T::type, "machine_id", &T::machine_id, "machine", &T::machine, "enroll_code",
-               &T::enroll_code, "public_key", &T::public_key, "key_storage", &T::key_storage);
+        object("type", &T::type, "machine_id", &T::machine_id, "machine", &T::machine, "enroll_code_hash",
+               &T::enroll_code_hash, "public_key", &T::public_key, "key_storage", &T::key_storage, "binding",
+               &T::binding);
+};
+
+template <>
+struct glz::meta<hawk::service::SignedStatement> {
+    using T                     = hawk::service::SignedStatement;
+    static constexpr auto value = object("statement", &T::statement, "signature", &T::signature);
 };
 
 template <>
@@ -119,9 +122,10 @@ struct glz::meta<ProofMessage> {
 template <>
 struct glz::meta<RelayCommand> {
     using T                     = RelayCommand;
-    static constexpr auto value = object("type", &T::type, "nonce", &T::nonce, "machine_id", &T::machine_id, "kind",
-                                         &T::kind, "x", &T::x, "y", &T::y, "button", &T::button, "down", &T::down,
-                                         "dx", &T::dx, "dy", &T::dy, "code", &T::code);
+    static constexpr auto value =
+        object("type", &T::type, "nonce", &T::nonce, "machine_id", &T::machine_id, "owner_key", &T::owner_key,
+               "owner_binding", &T::owner_binding, "viewer", &T::viewer, "statement", &T::statement, "signature",
+               &T::signature, "grant", &T::grant, "sealed", &T::sealed, "revocations", &T::revocations);
 };
 
 namespace {
@@ -158,36 +162,6 @@ void InitLogging() {
         // the failure to a debugger/DebugView instead of swallowing it.
         OutputDebugStringA(ex.what());
     }
-}
-
-[[nodiscard]] std::string Base64Encode(std::span<const std::byte> data) {
-    const auto* bytes = reinterpret_cast<const BYTE*>(data.data());
-    const auto  flags = CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF;
-    DWORD       length = 0;
-    if (CryptBinaryToStringA(bytes, static_cast<DWORD>(data.size()), flags, nullptr, &length) == FALSE) {
-        return {};
-    }
-    std::string text(length, '\0');
-    if (CryptBinaryToStringA(bytes, static_cast<DWORD>(data.size()), flags, text.data(), &length) == FALSE) {
-        return {};
-    }
-    text.resize(length);  // drop the terminator the size query counted
-    return text;
-}
-
-[[nodiscard]] std::optional<std::vector<std::byte>> Base64Decode(std::string_view text) {
-    DWORD length = 0;
-    if (CryptStringToBinaryA(text.data(), static_cast<DWORD>(text.size()), CRYPT_STRING_BASE64, nullptr, &length,
-                             nullptr, nullptr) == FALSE) {
-        return std::nullopt;
-    }
-    std::vector<std::byte> data(length);
-    if (CryptStringToBinaryA(text.data(), static_cast<DWORD>(text.size()), CRYPT_STRING_BASE64,
-                             reinterpret_cast<BYTE*>(data.data()), &length, nullptr, nullptr) == FALSE) {
-        return std::nullopt;
-    }
-    data.resize(length);
-    return data;
 }
 
 // What one connection authenticates with. A pending enrollment code wins
@@ -259,9 +233,10 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
     HelloMessage hello{
         .machine_id = std::string(name_buffer.data(), name_length),
         .machine = session.machine_id,
-        .enroll_code = session.enroll_code,
+        .enroll_code_hash = std::nullopt,
         .public_key = std::nullopt,
         .key_storage = std::nullopt,
+        .binding = std::nullopt,
     };
     if (session.enroll_code.has_value()) {
         auto public_key = session.key.public_key();
@@ -269,8 +244,11 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
             spdlog::error("relay: exporting the public key failed: {}", public_key.error());
             return {};
         }
-        hello.public_key = Base64Encode(*public_key);
+        const auto binding = svc::enroll_binding(*session.enroll_code, "hawk-enroll-machine-v1", *public_key);
+        hello.enroll_code_hash = svc::enroll_code_hash(*session.enroll_code);
+        hello.public_key = crypto::base64_encode(*public_key);
         hello.key_storage = std::string(session.key.storage());
+        hello.binding = crypto::base64_encode(binding);
     }
     if (auto json = glz::write_json(hello); json.has_value()) {
         return *json;
@@ -281,7 +259,7 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
 
 // Signs the relay's challenge with the machine key.
 [[nodiscard]] std::string BuildProofMessage(const Session& session, std::string_view nonce_base64) {
-    const auto nonce = Base64Decode(nonce_base64);
+    const auto nonce = crypto::base64_decode(nonce_base64);
     if (!nonce.has_value()) {
         spdlog::error("relay: received an unreadable challenge");
         return {};
@@ -295,34 +273,29 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
         spdlog::error("relay: signing the challenge failed: {}", signature.error());
         return {};
     }
-    if (auto json = glz::write_json(ProofMessage{.signature = Base64Encode(*signature)}); json.has_value()) {
+    if (auto json = glz::write_json(ProofMessage{.signature = crypto::base64_encode(*signature)}); json.has_value()) {
         return *json;
     }
     return {};
 }
 
-[[nodiscard]] std::vector<std::byte> BuildVideoFrame(const svc::CapturePacket& packet) {
-    std::vector<std::byte> frame(kVideoFrameHeaderSize + packet.data.size());
-    frame[0] = kVideoFrameKind;
-    frame[1] = packet.is_keyframe ? kVideoFrameKeyframeFlag : std::byte{0};
-    const auto timestamp = static_cast<std::uint64_t>(packet.timestamp.count());
-    for (std::size_t i = 0; i < sizeof(timestamp); ++i) {
-        frame[2 + i] = static_cast<std::byte>((timestamp >> (8 * i)) & 0xFFU);
-    }
-    std::ranges::copy(packet.data, frame.begin() + kVideoFrameHeaderSize);
-    return frame;
-}
-
 // Launches hawk-capture in the logged-on user's session and forwards every
-// packet it produces to the relay as a binary frame.
-void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture) {
+// packet it produces to the relay, sealed for the machine's viewers.
+void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::ViewerHub& hub) {
     if (capture.is_running()) {
         spdlog::info("relay: start_capture ignored, capture already running");
         return;
     }
 
-    auto started = capture.start([&client](const svc::CapturePacket& packet) {
-        if (auto sent = client.send_binary(BuildVideoFrame(packet)); !sent.has_value()) {
+    auto started = capture.start([&client, &hub](const svc::CapturePacket& packet) {
+        // Frames come steadily, so this is where shares that ran out are
+        // noticed and their viewers cut off.
+        hub.check_expiry();
+        const auto frame = hub.seal_frame(packet.data, packet.is_keyframe, packet.timestamp);
+        if (frame.empty()) {
+            return;
+        }
+        if (auto sent = client.send_binary(frame); !sent.has_value()) {
             spdlog::warn("relay: failed to forward video packet: {}", net::to_string(sent.error()));
         }
     });
@@ -331,83 +304,42 @@ void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture) {
     }
 }
 
-[[nodiscard]] std::optional<ipc::InputButton> ParseMouseButton(std::string_view name) {
-    if (name == "left") {
-        return ipc::InputButton::left;
+// Hands input to hawk-capture, which replays it in the user's session.
+// Whether it landed is CaptureHost's business to log: one lost input event
+// is never worth more than a line in the log.
+void ForwardInput(svc::CaptureHost& capture, const ipc::InputPacket& packet) {
+    if (capture.is_running()) {
+        static_cast<void>(capture.send_input(packet));
     }
-    if (name == "right") {
-        return ipc::InputButton::right;
-    }
-    if (name == "middle") {
-        return ipc::InputButton::middle;
-    }
-    return std::nullopt;
 }
 
-// Translates one relay "input" command into a packet for hawk-capture.
-// Returns nullopt for anything this build doesn't understand — an older
-// service against a newer relay — rather than guessing at it.
-[[nodiscard]] std::optional<ipc::InputPacket> BuildInputPacket(const RelayCommand& command) {
-    ipc::InputPacket packet{};
-    if (command.kind == "mouse_move") {
-        packet.kind = static_cast<std::uint8_t>(ipc::InputKind::mouse_move);
-        packet.x = command.x;
-        packet.y = command.y;
-    } else if (command.kind == "mouse_button") {
-        const auto button = ParseMouseButton(command.button);
-        if (!button.has_value()) {
-            return std::nullopt;
-        }
-        packet.kind = static_cast<std::uint8_t>(ipc::InputKind::mouse_button);
-        packet.button = static_cast<std::uint8_t>(*button);
-        packet.down = command.down ? 1 : 0;
-    } else if (command.kind == "wheel") {
-        packet.kind = static_cast<std::uint8_t>(ipc::InputKind::wheel);
-        packet.wheel_dx = command.dx;
-        packet.wheel_dy = command.dy;
-    } else if (command.kind == "key") {
-        // The packet holds the name and its terminator. A longer name is no
-        // key on any keyboard, so there's nothing to truncate it to.
-        if (command.code.empty() || command.code.size() >= packet.code.size()) {
-            return std::nullopt;
-        }
-        packet.kind = static_cast<std::uint8_t>(ipc::InputKind::key);
-        packet.down = command.down ? 1 : 0;
-        std::ranges::copy(command.code, packet.code.begin());
-    } else {
-        return std::nullopt;
+// The relay accepted this connection's enrollment: check the owner key it
+// names against the enrollment code, pin it, then make the new key and
+// machine id this PC's identity and retire what it had before. Returns
+// false if the owner key doesn't check out, leaving everything as it was.
+bool CompleteEnrollment(Session& session, const RelayCommand& command) {
+    const auto& machine_id = command.machine_id;
+    const auto  owner_key = crypto::base64_decode(command.owner_key);
+    const auto  owner_binding = crypto::base64_decode(command.owner_binding);
+    if (!session.enroll_code.has_value() || !owner_key.has_value() || !owner_binding.has_value() ||
+        !crypto::is_public_key(*owner_key) ||
+        !crypto::equal(svc::enroll_binding(*session.enroll_code, "hawk-enroll-owner-v1", *owner_key),
+                       *owner_binding)) {
+        // Whoever answered doesn't know the code: not the owner who made it.
+        spdlog::error("relay: the owner key the relay sent doesn't match the enrollment code; refusing to enroll. "
+                      "Remove the machine in the dashboard and enroll it again with a new code");
+        return false;
     }
-    return packet;
-}
-
-// Hands one input event to hawk-capture, which replays it in the user's
-// session. The relay only sends these on behalf of a viewer who is watching
-// with a control role, and has already clamped the values.
-void ForwardInput(const RelayCommand& command, svc::CaptureHost& capture) {
-    if (!capture.is_running()) {
-        return;  // nobody is watching, so nobody is controlling either
+    if (!svc::save_owner_key(*owner_key)) {
+        spdlog::error("relay: couldn't save the owner's key; enroll this machine again");
+        return false;
     }
-    const auto packet = BuildInputPacket(command);
-    if (!packet.has_value()) {
-        // Debug, not info: a newer relay sending a kind this build doesn't
-        // know would send it as often as a mouse moves.
-        spdlog::debug("relay: ignoring an input event this build doesn't understand (kind \"{}\")", command.kind);
-        return;
-    }
-    // Whether it landed is CaptureHost's business to log: one lost input
-    // event is never worth more than a line in the log.
-    static_cast<void>(capture.send_input(*packet));
-}
-
-// The relay accepted this connection's enrollment: make the new key and
-// machine id this PC's identity, and retire what it had before.
-void CompleteEnrollment(Session& session, const std::string& machine_id) {
     const auto previous = svc::load_machine_identity();
     if (!svc::save_machine_identity({.machine_id = machine_id, .key_name = session.key_name})) {
         spdlog::error("relay: enrolled as machine {}, but couldn't save that; remove the machine in the dashboard "
                       "and enroll it again",
                       machine_id);
-        return;
+        return false;
     }
     svc::delete_enroll_code();
     if (previous.has_value() && previous->key_name != session.key_name) {
@@ -418,36 +350,76 @@ void CompleteEnrollment(Session& session, const std::string& machine_id) {
     svc::delete_legacy_credential();
     session.machine_id = machine_id;
     session.enroll_code.reset();
-    spdlog::info("relay: enrolled as machine {} ({} key)", machine_id, session.key.storage());
+    spdlog::info("relay: enrolled as machine {} ({} key); owner key {}", machine_id, session.key.storage(),
+                 svc::fingerprint(*owner_key));
+    return true;
 }
 
-void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc::CaptureHost& capture,
-                        Session& session) {
+// Everything one relay connection works with.
+struct Connection {
+    net::WebSocketClient&          client;
+    svc::CaptureHost&              capture;
+    Session&                       session;
+    std::unique_ptr<svc::ViewerHub>& hub;
+};
+
+// The connection's viewers, once the machine knows its id.
+void OpenViewerHub(Connection& connection) {
+    if (connection.hub != nullptr || !connection.session.machine_id.has_value()) {
+        return;
+    }
+    auto owner_key = svc::load_owner_key();
+    if (!owner_key.has_value()) {
+        spdlog::warn("relay: no owner key pinned; viewers are refused until this machine is enrolled again");
+    }
+    auto& client = connection.client;
+    connection.hub = std::make_unique<svc::ViewerHub>(
+        connection.session.key, *connection.session.machine_id, std::move(owner_key), [&client](const std::string& text) {
+            if (text.empty()) {
+                return;
+            }
+            if (auto sent = client.send_text(text); !sent.has_value()) {
+                spdlog::warn("relay: failed to answer a viewer: {}", net::to_string(sent.error()));
+            }
+        });
+}
+
+void HandleRelayCommand(std::string_view text, Connection& connection) {
     RelayCommand command;
     if (auto error = glz::read<glz::opts{.error_on_unknown_keys = false}>(command, text); error) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
+    auto& [client, capture, session, hub] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
             spdlog::warn("relay: failed to send key proof: {}", net::to_string(sent.error()));
         }
     } else if (command.type == "enrolled") {
-        CompleteEnrollment(session, command.machine_id);
+        if (CompleteEnrollment(session, command)) {
+            OpenViewerHub(connection);
+        }
+    } else if (hub == nullptr) {
+        // Not enrolled, or the owner key didn't check out: nothing to serve.
+        spdlog::debug("relay: ignoring \"{}\" before enrollment", command.type);
     } else if (command.type == "start_capture") {
-        StartCapture(client, capture);
+        StartCapture(client, capture, *hub);
     } else if (command.type == "stop_capture") {
         capture.stop();
-    } else if (command.type == "input") {
-        ForwardInput(command, capture);
-    } else if (command.type == "release_input") {
-        // The viewer who was controlling stopped, or lost the right to:
-        // hawk-capture lets go of every key and button it pressed for them.
-        if (capture.is_running()) {
-            static_cast<void>(
-                capture.send_input(ipc::InputPacket{.kind = static_cast<std::uint8_t>(ipc::InputKind::release_all)}));
+    } else if (command.type == "viewer_join") {
+        hub->join(command.viewer, {.statement = command.statement, .signature = command.signature}, command.grant);
+    } else if (command.type == "viewer_left") {
+        // It may have keys or buttons held down: let go of them.
+        for (const auto& release : hub->leave(command.viewer)) {
+            ForwardInput(capture, release);
         }
+    } else if (command.type == "input") {
+        if (const auto packet = hub->input(command.viewer, command.sealed); packet.has_value()) {
+            ForwardInput(capture, *packet);
+        }
+    } else if (command.type == "revocations") {
+        hub->apply_revocations(command.revocations);
     } else {
         spdlog::info("relay: ignoring unknown command \"{}\"", command.type);
     }
@@ -456,12 +428,11 @@ void HandleRelayCommand(std::string_view text, net::WebSocketClient& client, svc
 // Handles one received message. Returns the close code once the relay has
 // closed the connection, nullopt while it stays open.
 [[nodiscard]] std::optional<std::uint16_t> HandleRelayMessage(const net::WebSocketMessage& message,
-                                                              net::WebSocketClient& client, svc::CaptureHost& capture,
-                                                              Session& session) {
+                                                              Connection& connection) {
     return std::visit(
         [&]<typename T>(const T& payload) -> std::optional<std::uint16_t> {
             if constexpr (std::is_same_v<T, std::string>) {
-                HandleRelayCommand(payload, client, capture, session);
+                HandleRelayCommand(payload, connection);
                 return std::nullopt;
             } else if constexpr (std::is_same_v<T, std::vector<std::byte>>) {
                 spdlog::info("relay: received binary message ({} bytes)", payload.size());
@@ -530,10 +501,19 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
 
         spdlog::info("relay: connected to {}", kRelayServerUrl);
         active_client.store(&client);
+        // For the owner to compare with the dashboard when verifying the
+        // machine from a browser that didn't make its enrollment code.
+        if (auto public_key = session->key.public_key(); public_key.has_value()) {
+            spdlog::info("relay: machine key fingerprint {}", svc::fingerprint(*public_key));
+        }
 
         if (auto sent = client.send_text(BuildHelloMessage(*session)); !sent.has_value()) {
             spdlog::warn("relay: failed to send hello message: {}", net::to_string(sent.error()));
         }
+
+        std::unique_ptr<svc::ViewerHub> hub;
+        Connection                      connection{.client = client, .capture = capture, .session = *session, .hub = hub};
+        OpenViewerHub(connection);
 
         std::optional<std::uint16_t> close_code;
         while (!stop_token.stop_requested()) {
@@ -542,15 +522,17 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
                 spdlog::warn("relay: receive failed: {}", net::to_string(message.error()));
                 break;
             }
-            close_code = HandleRelayMessage(*message, client, capture, *session);
+            close_code = HandleRelayMessage(*message, connection);
             if (close_code.has_value()) {
                 break;
             }
         }
 
         // Capture only runs on behalf of a viewer reached through this
-        // connection; stop it before the socket it forwards to goes away.
+        // connection; stop it before the socket it forwards to goes away,
+        // and before the viewers it seals frames for.
         capture.stop();
+        hub.reset();
         active_client.store(nullptr);
         client.close();
 

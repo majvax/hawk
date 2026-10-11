@@ -81,6 +81,38 @@ const MIGRATIONS: &[&str] = &["
     ALTER TABLE machine_shares ADD COLUMN single_view INTEGER NOT NULL DEFAULT 0;
     CREATE INDEX machine_shares_expires_at ON machine_shares (expires_at) WHERE expires_at IS NOT NULL;
     CREATE INDEX machine_shares_starts_at ON machine_shares (starts_at) WHERE starts_at IS NOT NULL;
+", "
+    -- End-to-end encryption. Passwords never reach the relay any more: the
+    -- browser derives an auth key from the password (that's what
+    -- password_hash now hashes) and a wrapping key, under which it stores
+    -- the user's identity key here. 'legacy' accounts still hash the
+    -- password itself until their next login upgrades them.
+    ALTER TABLE users ADD COLUMN kdf TEXT NOT NULL DEFAULT 'legacy';  -- 'legacy' or 'pbkdf2-sha256'
+    ALTER TABLE users ADD COLUMN kdf_iterations INTEGER;
+    ALTER TABLE users ADD COLUMN public_key BLOB;   -- identity key, uncompressed P-256 point
+    ALTER TABLE users ADD COLUMN wrapped_key BLOB;  -- its private half, encrypted in the browser
+
+    -- The owner's key, MACed with the enrollment code, which the relay never
+    -- sees: the machine checks it to pin its owner. The machine answers with
+    -- its own MACed key, which the owner's browser checks before endorsing it.
+    ALTER TABLE enrollment_codes ADD COLUMN owner_binding BLOB;
+    ALTER TABLE machines ADD COLUMN enroll_code_hash BLOB;
+    ALTER TABLE machines ADD COLUMN enroll_binding BLOB;
+    ALTER TABLE machines ADD COLUMN endorsement BLOB;  -- owner's signature over the machine's key
+
+    -- What the owner signed for each share, which the machine checks itself.
+    ALTER TABLE machine_shares ADD COLUMN grant_statement TEXT;
+    ALTER TABLE machine_shares ADD COLUMN grant_signature BLOB;
+
+    -- Signed by the owner when access is taken away; the machine is sent
+    -- every one for it each time it connects.
+    CREATE TABLE machine_revocations (
+        id         INTEGER PRIMARY KEY,
+        machine_id INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+        statement  TEXT    NOT NULL,
+        signature  BLOB    NOT NULL,
+        created_at INTEGER NOT NULL
+    );
 "];
 
 #[derive(Clone)]
@@ -141,6 +173,28 @@ pub struct UserWithPassword {
     pub disabled: bool,
 }
 
+/// How the browser turns this account's password into its auth and
+/// wrapping keys.
+pub struct LoginParams {
+    pub kdf: String,
+    pub iterations: Option<i64>,
+}
+
+/// The account's identity key, as the browser stored it.
+pub struct UserKey {
+    pub public_key: Vec<u8>,
+    pub wrapped_key: Vec<u8>,
+}
+
+/// An account's derived credentials: the hash of its auth key, and its
+/// identity key.
+pub struct NewCredentials<'a> {
+    pub password_hash: &'a str,
+    pub iterations: i64,
+    pub public_key: &'a [u8],
+    pub wrapped_key: &'a [u8],
+}
+
 pub struct UserRow {
     pub user: User,
     pub disabled: bool,
@@ -183,6 +237,55 @@ pub fn find_user_by_email(conn: &Connection, email: &str) -> rusqlite::Result<Op
         },
     )
     .optional()
+}
+
+pub fn login_params(conn: &Connection, email: &str) -> rusqlite::Result<Option<LoginParams>> {
+    conn.query_row("SELECT kdf, kdf_iterations FROM users WHERE email = ?1", [email], |row| {
+        Ok(LoginParams { kdf: row.get(0)?, iterations: row.get(1)? })
+    })
+    .optional()
+}
+
+pub fn user_key(conn: &Connection, user_id: i64) -> rusqlite::Result<Option<UserKey>> {
+    conn.query_row(
+        "SELECT public_key, wrapped_key FROM users
+          WHERE id = ?1 AND public_key IS NOT NULL AND wrapped_key IS NOT NULL",
+        [user_id],
+        |row| Ok(UserKey { public_key: row.get(0)?, wrapped_key: row.get(1)? }),
+    )
+    .optional()
+}
+
+/// The identity key of the account with `email`: (user id, public key).
+/// The key is None for an account that hasn't set one up yet.
+pub fn public_key_by_email(conn: &Connection, email: &str) -> rusqlite::Result<Option<(i64, Option<Vec<u8>>)>> {
+    conn.query_row("SELECT id, public_key FROM users WHERE email = ?1", [email], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+}
+
+/// Moves a legacy account to derived credentials and gives it its identity
+/// key. Only replaces `old_hash` on a legacy account: returns false if it
+/// changed or was upgraded since it was read.
+pub fn upgrade_account(
+    conn: &Connection,
+    user_id: i64,
+    old_hash: &str,
+    credentials: &NewCredentials<'_>,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE users SET password_hash = ?1, kdf = 'pbkdf2-sha256', kdf_iterations = ?2,
+                          public_key = ?3, wrapped_key = ?4
+          WHERE id = ?5 AND password_hash = ?6 AND kdf = 'legacy'",
+        params![
+            credentials.password_hash,
+            credentials.iterations,
+            credentials.public_key,
+            credentials.wrapped_key,
+            user_id,
+            old_hash
+        ],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn list_users(conn: &Connection) -> rusqlite::Result<Vec<UserRow>> {
@@ -300,12 +403,16 @@ pub fn change_password(
     user_id: i64,
     old_hash: &str,
     new_hash: &str,
+    wrapped_key: &[u8],
     keep_session: i64,
 ) -> rusqlite::Result<bool> {
     let tx = conn.unchecked_transaction()?;
+    // The identity key is re-wrapped under the new password in the same
+    // step, so the two never disagree.
     let changed = tx.execute(
-        "UPDATE users SET password_hash = ?1 WHERE id = ?2 AND password_hash = ?3",
-        params![new_hash, user_id, old_hash],
+        "UPDATE users SET password_hash = ?1, wrapped_key = ?2
+          WHERE id = ?3 AND password_hash = ?4 AND kdf <> 'legacy' AND public_key IS NOT NULL",
+        params![new_hash, wrapped_key, user_id, old_hash],
     )?;
     if changed == 0 {
         return Ok(false);
@@ -370,14 +477,23 @@ pub fn redeem_invite(
     conn: &Connection,
     token_hash: &[u8],
     email: &str,
-    password_hash: &str,
+    credentials: &NewCredentials<'_>,
     now: i64,
 ) -> Result<User, SignupError> {
     let tx = conn.unchecked_transaction()?;
     let invite = find_invite(&tx, token_hash, now)?.ok_or(SignupError::InvalidInvite)?;
     let inserted = tx.execute(
-        "INSERT INTO users (email, password_hash, is_admin, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![email, password_hash, invite.grants_admin, now],
+        "INSERT INTO users (email, password_hash, is_admin, created_at, kdf, kdf_iterations, public_key, wrapped_key)
+         VALUES (?1, ?2, ?3, ?4, 'pbkdf2-sha256', ?5, ?6, ?7)",
+        params![
+            email,
+            credentials.password_hash,
+            invite.grants_admin,
+            now,
+            credentials.iterations,
+            credentials.public_key,
+            credentials.wrapped_key
+        ],
     );
     match inserted {
         Err(rusqlite::Error::SqliteFailure(failure, _))
@@ -400,10 +516,6 @@ pub fn purge_expired(conn: &Connection, now: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM invites WHERE used_by IS NULL AND expires_at <= ?1", [now])?;
     conn.execute("DELETE FROM enrollment_codes WHERE expires_at <= ?1", [now])?;
     Ok(())
-}
-
-pub fn find_user_id_by_email(conn: &Connection, email: &str) -> rusqlite::Result<Option<i64>> {
-    conn.query_row("SELECT id FROM users WHERE email = ?1", [email], |row| row.get(0)).optional()
 }
 
 // ---- machines -------------------------------------------------------------
@@ -436,6 +548,17 @@ impl Role {
     }
 }
 
+/// A statement and someone's signature over it (see crate::e2e).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed {
+    pub statement: String,
+    pub signature: Vec<u8>,
+}
+
+fn signed_from(statement: Option<String>, signature: Option<Vec<u8>>) -> Option<Signed> {
+    Some(Signed { statement: statement?, signature: signature? })
+}
+
 /// A machine as one particular user sees it.
 #[derive(Debug, Clone)]
 pub struct MachineRow {
@@ -452,6 +575,17 @@ pub struct MachineRow {
     pub share_expires_at: Option<i64>,
     /// A share that one viewing uses up.
     pub single_view: bool,
+    /// The machine's key; None for a machine that must be re-enrolled.
+    pub public_key: Option<Vec<u8>>,
+    pub owner_public_key: Option<Vec<u8>>,
+    /// The owner's signature over the machine's key, once they've checked it.
+    pub endorsement: Option<Vec<u8>>,
+    /// Owner only, until endorsed: which enrollment code the machine used
+    /// and the key binding it answered with, for the browser to check.
+    pub enroll_code_hash: Option<Vec<u8>>,
+    pub enroll_binding: Option<Vec<u8>>,
+    /// Shares only: what the owner signed for this user.
+    pub grant: Option<Signed>,
 }
 
 /// The machine behind an authenticated device connection.
@@ -471,6 +605,9 @@ pub struct ShareRow {
     pub user_id: i64,
     pub email: String,
     pub terms: ShareTerms,
+    /// The recipient's identity key, if they have one yet.
+    pub public_key: Option<Vec<u8>>,
+    pub grant: Option<Signed>,
 }
 
 /// What a share grants, and for how long.
@@ -495,24 +632,41 @@ pub fn create_enrollment_code(
     conn: &Connection,
     code_hash: &[u8],
     owner_id: i64,
+    owner_binding: &[u8],
     now: i64,
     expires_at: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO enrollment_codes (code_hash, owner_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-        params![code_hash, owner_id, now, expires_at],
+        "INSERT INTO enrollment_codes (code_hash, owner_id, owner_binding, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![code_hash, owner_id, owner_binding, now, expires_at],
     )?;
     Ok(())
 }
 
-/// The owner of a usable enrollment code: unknown, used, expired codes and
-/// disabled owners give None. Doesn't consume it.
-pub fn enrollment_code_owner(conn: &Connection, code_hash: &[u8], now: i64) -> rusqlite::Result<Option<i64>> {
+/// Who a usable enrollment code enrolls a machine for, and what the machine
+/// needs to pin them.
+#[derive(Debug, Clone)]
+pub struct EnrollmentOwner {
+    pub owner_id: i64,
+    pub owner_public_key: Vec<u8>,
+    pub owner_binding: Vec<u8>,
+}
+
+/// The owner of a usable enrollment code: unknown, used, expired codes,
+/// disabled owners and codes made before keys existed give None. Doesn't
+/// consume it.
+pub fn enrollment_code_owner(
+    conn: &Connection,
+    code_hash: &[u8],
+    now: i64,
+) -> rusqlite::Result<Option<EnrollmentOwner>> {
     conn.query_row(
-        "SELECT c.owner_id FROM enrollment_codes c JOIN users u ON u.id = c.owner_id
-          WHERE c.code_hash = ?1 AND c.expires_at > ?2 AND u.disabled = 0",
+        "SELECT c.owner_id, u.public_key, c.owner_binding FROM enrollment_codes c JOIN users u ON u.id = c.owner_id
+          WHERE c.code_hash = ?1 AND c.expires_at > ?2 AND u.disabled = 0
+            AND u.public_key IS NOT NULL AND c.owner_binding IS NOT NULL",
         params![code_hash, now],
-        |row| row.get(0),
+        |row| Ok(EnrollmentOwner { owner_id: row.get(0)?, owner_public_key: row.get(1)?, owner_binding: row.get(2)? }),
     )
     .optional()
 }
@@ -523,24 +677,69 @@ pub struct NewMachine<'a> {
     pub hostname: &'a str,
     pub public_key: &'a [u8],
     pub key_storage: &'a str,
+    /// The machine's key, MACed with the enrollment code.
+    pub binding: &'a [u8],
 }
 
 /// Consumes an enrollment code and registers the machine under the code's
 /// owner, in one transaction, so a code can only ever enroll one machine.
 /// None if the code is no longer usable.
-pub fn enroll_machine(conn: &Connection, machine: &NewMachine<'_>, now: i64) -> rusqlite::Result<Option<MachineAuth>> {
+pub fn enroll_machine(
+    conn: &Connection,
+    machine: &NewMachine<'_>,
+    now: i64,
+) -> rusqlite::Result<Option<(MachineAuth, EnrollmentOwner)>> {
     let tx = conn.unchecked_transaction()?;
-    let Some(owner_id) = enrollment_code_owner(&tx, machine.code_hash, now)? else { return Ok(None) };
+    let Some(owner) = enrollment_code_owner(&tx, machine.code_hash, now)? else { return Ok(None) };
     tx.execute("DELETE FROM enrollment_codes WHERE code_hash = ?1", [machine.code_hash])?;
     let fingerprint = crate::auth::token_hash_bytes(machine.public_key);
     tx.execute(
         "INSERT INTO machines
-             (public_id, owner_id, name, hostname, key_fingerprint, public_key, key_storage, created_at, last_seen_at)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?7)",
-        params![machine.public_id, owner_id, machine.hostname, fingerprint, machine.public_key, machine.key_storage, now],
+             (public_id, owner_id, name, hostname, key_fingerprint, public_key, key_storage, created_at, last_seen_at,
+              enroll_code_hash, enroll_binding)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
+        params![
+            machine.public_id,
+            owner.owner_id,
+            machine.hostname,
+            fingerprint,
+            machine.public_key,
+            machine.key_storage,
+            now,
+            machine.code_hash,
+            machine.binding
+        ],
     )?;
     tx.commit()?;
-    Ok(Some(MachineAuth { public_id: machine.public_id.to_owned(), owner_id }))
+    Ok(Some((MachineAuth { public_id: machine.public_id.to_owned(), owner_id: owner.owner_id }, owner)))
+}
+
+/// The keys an endorsement of an owned machine is checked against:
+/// (machine key, owner key). None if `owner_id` doesn't own it or either
+/// key is missing.
+pub fn endorsement_keys(
+    conn: &Connection,
+    public_id: &str,
+    owner_id: i64,
+) -> rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    conn.query_row(
+        "SELECT m.public_key, u.public_key FROM machines m JOIN users u ON u.id = m.owner_id
+          WHERE m.public_id = ?1 AND m.owner_id = ?2 AND m.public_key IS NOT NULL AND u.public_key IS NOT NULL",
+        params![public_id, owner_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Stores the owner's endorsement of the machine's key. The enrollment
+/// details it was checked with are no longer needed.
+pub fn set_endorsement(conn: &Connection, public_id: &str, owner_id: i64, signature: &[u8]) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE machines SET endorsement = ?1, enroll_code_hash = NULL, enroll_binding = NULL
+          WHERE public_id = ?2 AND owner_id = ?3",
+        params![signature, public_id, owner_id],
+    )?;
+    Ok(changed > 0)
 }
 
 /// The public key a machine must prove it holds. None if the machine is
@@ -581,6 +780,12 @@ fn machine_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRow> {
         role: Role::from_sql(&row.get::<_, String>(7)?),
         share_expires_at: row.get(8)?,
         single_view: row.get(9)?,
+        public_key: row.get(10)?,
+        owner_public_key: row.get(11)?,
+        endorsement: row.get(12)?,
+        enroll_code_hash: row.get(13)?,
+        enroll_binding: row.get(14)?,
+        grant: signed_from(row.get(15)?, row.get(16)?),
     })
 }
 
@@ -590,12 +795,13 @@ fn machine_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRow> {
 pub fn accessible_machines(conn: &Connection, user_id: i64, now: i64) -> rusqlite::Result<Vec<MachineRow>> {
     let mut statement = conn.prepare(
         "SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, 'owner',
-                NULL, 0
+                NULL, 0, m.public_key, o.public_key, m.endorsement, m.enroll_code_hash, m.enroll_binding, NULL, NULL
            FROM machines m JOIN users o ON o.id = m.owner_id
           WHERE m.owner_id = ?1
          UNION ALL
          SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, s.role,
-                s.expires_at, s.single_view
+                s.expires_at, s.single_view, m.public_key, o.public_key, m.endorsement, NULL, NULL,
+                s.grant_statement, s.grant_signature
            FROM machine_shares s
            JOIN machines m ON m.id = s.machine_id
            JOIN users o ON o.id = m.owner_id
@@ -657,7 +863,8 @@ pub fn delete_machine(conn: &Connection, public_id: &str, owner_id: i64) -> rusq
 pub fn list_shares(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlite::Result<Option<Vec<ShareRow>>> {
     let Some(machine_id) = owned_machine_id(conn, public_id, owner_id)? else { return Ok(None) };
     let mut statement = conn.prepare(
-        "SELECT u.id, u.email, s.role, s.starts_at, s.expires_at, s.single_view
+        "SELECT u.id, u.email, s.role, s.starts_at, s.expires_at, s.single_view, u.public_key,
+                s.grant_statement, s.grant_signature
            FROM machine_shares s JOIN users u ON u.id = s.user_id
           WHERE s.machine_id = ?1 ORDER BY u.email",
     )?;
@@ -672,6 +879,8 @@ pub fn list_shares(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlit
                     expires_at: row.get(4)?,
                     single_view: row.get(5)?,
                 },
+                public_key: row.get(6)?,
+                grant: signed_from(row.get(7)?, row.get(8)?),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -680,7 +889,6 @@ pub fn list_shares(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlit
 
 pub enum ShareError {
     NotOwner,
-    NoSuchUser,
     SelfShare,
     Db(rusqlite::Error),
 }
@@ -691,27 +899,29 @@ impl From<rusqlite::Error> for ShareError {
     }
 }
 
-/// Shares an owned machine with the account with `email`, or replaces the
-/// terms of an existing share. Returns that account's user id.
+/// Shares an owned machine with `user_id`, or replaces the terms of an
+/// existing share, along with the grant the owner signed for it.
 pub fn upsert_share(
     conn: &Connection,
     public_id: &str,
     owner_id: i64,
-    email: &str,
+    user_id: i64,
     terms: ShareTerms,
+    grant: &Signed,
     now: i64,
-) -> Result<i64, ShareError> {
+) -> Result<(), ShareError> {
     let machine_id = owned_machine_id(conn, public_id, owner_id)?.ok_or(ShareError::NotOwner)?;
-    let user_id = find_user_id_by_email(conn, email)?.ok_or(ShareError::NoSuchUser)?;
     if user_id == owner_id {
         return Err(ShareError::SelfShare);
     }
     conn.execute(
-        "INSERT INTO machine_shares (machine_id, user_id, role, created_at, starts_at, expires_at, single_view)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO machine_shares
+             (machine_id, user_id, role, created_at, starts_at, expires_at, single_view, grant_statement, grant_signature)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (machine_id, user_id) DO UPDATE SET
              role = excluded.role, starts_at = excluded.starts_at,
-             expires_at = excluded.expires_at, single_view = excluded.single_view",
+             expires_at = excluded.expires_at, single_view = excluded.single_view,
+             grant_statement = excluded.grant_statement, grant_signature = excluded.grant_signature",
         params![
             machine_id,
             user_id,
@@ -719,10 +929,12 @@ pub fn upsert_share(
             now,
             terms.starts_at,
             terms.expires_at,
-            terms.single_view
+            terms.single_view,
+            grant.statement,
+            grant.signature
         ],
     )?;
-    Ok(user_id)
+    Ok(())
 }
 
 /// Deletes the user's share of the machine if it's a single-view one.
@@ -776,11 +988,45 @@ pub fn next_share_deadline(conn: &Connection, now: i64) -> rusqlite::Result<Opti
     )
 }
 
-/// Returns false if `owner_id` doesn't own the machine or it wasn't shared
-/// with `user_id`.
-pub fn delete_share(conn: &Connection, public_id: &str, owner_id: i64, user_id: i64) -> rusqlite::Result<bool> {
-    let Some(machine_id) = owned_machine_id(conn, public_id, owner_id)? else { return Ok(false) };
+/// Deletes a share and keeps the owner's signed revocation of it, in one
+/// transaction. Returns false if `owner_id` doesn't own the machine or it
+/// wasn't shared with `user_id`.
+pub fn delete_share(
+    conn: &Connection,
+    public_id: &str,
+    owner_id: i64,
+    user_id: i64,
+    revocation: Option<&Signed>,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let Some(machine_id) = owned_machine_id(&tx, public_id, owner_id)? else { return Ok(false) };
     let deleted =
-        conn.execute("DELETE FROM machine_shares WHERE machine_id = ?1 AND user_id = ?2", params![machine_id, user_id])?;
-    Ok(deleted > 0)
+        tx.execute("DELETE FROM machine_shares WHERE machine_id = ?1 AND user_id = ?2", params![machine_id, user_id])?;
+    if deleted == 0 {
+        return Ok(false);
+    }
+    if let Some(revocation) = revocation {
+        tx.execute(
+            "INSERT INTO machine_revocations (machine_id, statement, signature, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![machine_id, revocation.statement, revocation.signature, now],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Every revocation the owner signed for the machine, oldest first.
+pub fn revocations(conn: &Connection, public_id: &str) -> rusqlite::Result<Vec<Signed>> {
+    conn.prepare(
+        "SELECT r.statement, r.signature FROM machine_revocations r JOIN machines m ON m.id = r.machine_id
+          WHERE m.public_id = ?1 ORDER BY r.id",
+    )?
+    .query_map([public_id], |row| Ok(Signed { statement: row.get(0)?, signature: row.get(1)? }))?
+    .collect()
+}
+
+/// `user_id`'s share of an owned machine, if there is one.
+pub fn share_for(conn: &Connection, public_id: &str, owner_id: i64, user_id: i64) -> rusqlite::Result<Option<ShareRow>> {
+    Ok(list_shares(conn, public_id, owner_id)?.and_then(|shares| shares.into_iter().find(|s| s.user_id == user_id)))
 }

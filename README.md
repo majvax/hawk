@@ -78,7 +78,7 @@ Instead of opening firewall ports or port-forwarding a home router, both the bro
 
 ## Security Mitigations
 * **Relay Authentication:** The cloud relay acts as the primary gatekeeper. Access requires strong authentication to prevent unauthorized remote sessions.
-* **End-to-End Encryption (E2EE):** Video frames and input events are encrypted end-to-end between the interactive capture helper and your browser using a pre-shared or session-derived key. The relay server only routes opaque ciphertext payloads.
+* **End-to-End Encryption (E2EE):** Video frames and input events are encrypted end-to-end between `hawk-service` and your browser, and the relay only routes ciphertext. The relay is also not trusted to decide who may watch: the owner's browser signs every share, and the machine checks those signatures against the owner key it pinned at enrollment. Each view is an ECDH exchange signed by the viewer's identity key and by the machine's TPM key; frames use AES-256-GCM under a stream key that rotates when a viewer leaves. Passwords never reach the relay; the browser derives what it sends from them. Details in `src/server/README.md`, "End-to-end encryption".
 * **Granular IPC & Shared Memory Hardening:**
   * **Strict DACLs (No Broad `AU` Grants):** Cross-session shared memory objects (`Global\`) and synchronization events (`CreateEvent`) created by the SYSTEM service must not grant blanket `Authenticated Users` (`AU`) access. Instead, construct explicit SDDL strings or programmatic DACLs granting permissions strictly to `NT AUTHORITY\SYSTEM` and the specific logged-on user's SID retrieved via `WTSQueryUserToken`.
   * **Double-Buffering & State Validation:** Use double-buffered (ping-pong) shared memory paired with named Win32 events (`SetEvent` / `WaitForSingleObject`) with reasonable timeouts (e.g., 50–100ms) to prevent deadlock or race conditions if one process crashes or hangs mid-write.
@@ -89,6 +89,40 @@ Instead of opening firewall ports or port-forwarding a home router, both the bro
 * **TLS Public Key Pinning (Anti-MITM):** The background service and capture helper do not rely solely on the Windows root trust store. They implement **SPKI (Subject Public Key Info) SHA-256 pinning** on outbound TLS/WSS connections to the relay server. Any connection where the server's public key hash does not match the embedded pin is immediately dropped, thwarting DNS hijacking, malicious proxies, and compromised root Certificate Authorities.
 * **Hardware-Bound Identity via TPM 2.0:** The SYSTEM service leverages the **Microsoft Platform Crypto Provider** (ncrypt) to generate an asymmetric device identity key directly inside the motherboard's physical TPM. The private key is non-exportable and never enters system RAM or disk storage. During relay connection handshakes, the service signs authentication challenges entirely within the secure cryptoprocessor, preventing device spoofing even in the event of local disk imaging or storage theft.
 
+
+---
+
+## Frontend Hosting (planned)
+
+The dashboard is a static bundle, so it doesn't have to be served by the relay. Two modes are planned, side by side, and a relay owner picks which ones their relay accepts:
+
+* **Same origin (default, what exists today):** the relay serves the dashboard itself. Sessions are an `HttpOnly`, `SameSite=Strict` cookie and the dashboard socket is refused from any other `Origin`. Nothing cross-site is possible, and nothing changes for existing setups.
+* **Separate origin (opt-in):** the dashboard is hosted anywhere static (GitHub Pages, a CDN, another server) and the user enters their relay's address, which is kept in their browser only, along with their session. Cross-site cookies are unreliable (third-party cookie blocking and partitioning), so this mode uses bearer tokens instead:
+  * Login returns a session token that the page keeps in `localStorage` and sends as `Authorization: Bearer …`. A WebSocket can't carry headers, so the dashboard socket authenticates with its first message.
+  * The relay only answers origins its owner lists (e.g. `HAWK_ALLOWED_ORIGINS=https://you.github.io`), through CORS for the API and an `Origin` allow-list for the socket. With the list empty, the relay behaves exactly as in same-origin mode.
+  * The relay needs a certificate browsers trust (a domain with Let's Encrypt, or an IP certificate): a page on HTTPS can't reach a self-signed relay without the user first accepting it by hand, which mobile browsers make impractical. A relay on a private address (`192.168.x.x`) also triggers the browser's local-network permission prompt.
+  * Frontend and relay can be on different versions, so the dashboard handshake carries a protocol version and the dashboard says so plainly when a relay is too old or too new.
+
+**Trust:** whoever serves the dashboard serves the code that sees the password, holds the session and handles every frame and keystroke. Same-origin keeps that with the relay owner. A separately hosted dashboard moves it to whoever controls that host. Anyone can host their own copy, so no third party has to be trusted. Since the stream is end-to-end encrypted, a dashboard the relay doesn't serve is also the stronger setup: a compromised relay can't hand out modified code to read the stream it relays.
+
+---
+
+## Installation (planned)
+
+One installer per side, interactive by default and scriptable with flags, so the options above don't turn into a page of manual steps:
+
+* **Relay (Linux VPS):**
+  * Installs the relay binary and the built dashboard, and sets it up as a `systemd` service with its own user, data directory and log rotation.
+  * TLS: obtains and renews a Let's Encrypt certificate for a domain (or an IP certificate), or generates a self-signed one for LAN use. It reuses the existing key on renewal, so the pin that enrolled machines check stays valid, and it prints the pin.
+  * Asks which frontend modes to allow, and for separate origin, which origins (`HAWK_ALLOWED_ORIGINS`).
+  * Opens the firewall port, creates the first admin and prints their invite link.
+  * Update and uninstall commands that keep the database and key.
+* **Machine (Windows):**
+  * Installs `hawk-service` and `hawk-capture`, registers the service to start at boot, and points it at the relay with its address and pinned key.
+  * Generates the TPM-backed machine key, falling back to a software key with a warning, and walks through enrollment on the dashboard.
+  * Self-signed certificate automation: creates the local signing certificate, keeps it in the machine's own `Root`/`TrustedPublisher` stores only, and signs the binaries.
+  * Update and uninstall commands that remove the service, the certificate and the key.
+* **Separately hosted dashboard:** a build that ships without a relay address (the user enters it), plus a ready-made GitHub Pages workflow for anyone who wants to host their own copy.
 
 ---
 
@@ -107,6 +141,7 @@ TODO
 - [x] Self-hosted web relay server
 - [x] Web browser client (Canvas/WebGL stream player + input listener)
 - [x] Secure-desktop (UAC / lock screen) capture and control: hawk-capture runs as SYSTEM in-session and follows the input desktop
+- [x] End-to-end encryption of video and input, with viewer access decided by the owner's signatures rather than the relay
 - [ ] Self-signed certificate automation
 - [ ] Multi-factor authentication (TOTP, WebAuthn/passkeys, recovery codes)
 - [ ] Trusted-proxy address resolution, with IP allow/deny lists
@@ -120,6 +155,9 @@ TODO
 - [ ] Remote power actions, reboot-and-reconnect, Wake-on-LAN via a LAN peer
 - [ ] Relay operations: container image, health endpoints, metrics, backups
 - [ ] Trusted devices (remember a browser after MFA)
+- [ ] Separately hosted dashboard: bearer-token sessions, `HAWK_ALLOWED_ORIGINS` (CORS + socket `Origin` allow-list), relay address entered in the browser, protocol version in the handshake
+- [ ] Relay installer (Linux): `systemd` service, Let's Encrypt or self-signed TLS with a stable pinned key, frontend modes, first admin
+- [ ] GitHub Pages workflow for hosting the dashboard on its own
 
 Each of the unchecked items is described under [Planned Features](#planned-features).
 

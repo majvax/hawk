@@ -18,7 +18,7 @@ enrollment code (valid for an hour), then on the PC:
 ```powershell
 # from the repo root, after building into bin\ (copy the exact command the
 # dashboard shows; it includes your relay's pin)
-powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1 -EnrollCode 7K3QD-WX2MP -RelayPin wqsPIpg8...xW0=
+powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1 -EnrollCode 7K3QD-WX2MP-4HZ8R-QN1CV-B6T2J -RelayPin wqsPIpg8...xW0=
 ```
 
 The service connects to the relay (`wss://127.0.0.1:8080/v1/ws` by
@@ -33,10 +33,18 @@ default — see `kRelayServerUrl` in `src/service/main.cpp`) and enrolls:
   by signing a challenge from the relay. From then on, every connection is
   a fresh challenge signed in the TPM. There's no secret on disk or on the
   wire to steal or replay.
+- The code itself never leaves the PC: the relay gets its hash. The service
+  MACs its public key with the code, and checks the owner key the relay
+  answers with against the owner's own MAC under the same code. Only if that
+  matches does it pin the owner's key in `owner-key.txt`; from then on it
+  admits only viewers the owner has signed a grant for (see "End-to-end
+  encryption" in `src/server/README.md`). It logs its own key's fingerprint
+  (`machine key fingerprint`) on every connect, for the owner to compare.
 - `C:\ProgramData\HawkService\machine.txt` records which machine it enrolled
   as and the key's name (neither is secret). The code file is deleted once
   used; a rejected code is deleted too, and leaves the existing enrollment
-  and key untouched.
+  and key untouched. `access-state.txt` remembers the newest grant and
+  revocation seen per viewer, so an old grant can't be replayed.
 
 `-RelayPin` pins the relay's TLS key (`relay-pins.txt`): the service then
 refuses any relay whose certificate doesn't carry that key, even one that

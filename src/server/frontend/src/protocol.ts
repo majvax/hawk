@@ -17,13 +17,30 @@ export interface Machine {
   accessExpiresAt: number | null; // unix seconds; when a temporary share ends
   singleView: boolean; // the share is used up by one viewing
   viewers: string[] | null; // who's watching; owner only
+  // Base64 keys: the machine's and its owner's identity key; null for a
+  // machine that must be re-enrolled.
+  publicKey: string | null;
+  ownerPublicKey: string | null;
+  // The owner's signature over the machine's key, once they've checked it.
+  endorsement: string | null;
+  // Owner only, until endorsed: which enrollment code the machine used and
+  // the HMAC of its key under that code, for the browser that made the code.
+  enrollCodeHash: string | null;
+  enrollBinding: string | null;
+  // Whether the owner has signed a grant for this user (always for the owner).
+  granted: boolean;
 }
 
 export type DashboardEvent =
   | { type: "snapshot"; machines: Machine[] }
   | { type: "machine_updated"; machine: Machine }
   | { type: "machine_removed"; id: string }
-  | { type: "capture_ended"; deviceId: string };
+  | { type: "capture_ended"; deviceId: string }
+  // The machine's signed answer to this dashboard's join, and the stream
+  // key wrapped for it (see e2e.ts).
+  | { type: "view_accepted"; deviceId: string; statement: string; signature: string; wrappedKey: string }
+  | { type: "view_rejected"; deviceId: string; reason: string }
+  | { type: "stream_key"; deviceId: string; wrappedKey: string };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -44,34 +61,15 @@ export const WHEEL_DELTA = 120;
 // Only acted on while watching the machine with a control (or owner) role;
 // the relay drops anything else without a word.
 export type DashboardCommand =
-  | { type: "start_view"; deviceId: string }
+  | { type: "start_view"; deviceId: string; join: { statement: string; signature: string } }
   | { type: "stop_view"; deviceId: string }
-  | { type: "input"; deviceId: string; event: InputEvent };
+  // Sealed for the machine (ViewSession.sealInput); the relay can't read it.
+  | { type: "input"; deviceId: string; sealed: string };
 
-// Binary video frame layout produced by src/service/main.cpp (BuildVideoFrame):
-//   [0]     u8  kind (VIDEO_FRAME_KIND = H.264 Annex B)
-//   [1]     u8  flags (bit 0 = keyframe)
-//   [2..9]  i64 timestamp, microseconds, little-endian
-//   [10..]      the H.264 access unit
-export const VIDEO_FRAME_KIND = 0x01;
-export const VIDEO_FRAME_KEYFRAME_FLAG = 0x01;
-export const VIDEO_FRAME_HEADER_SIZE = 10;
-
+// One H.264 access unit, once the frame carrying it has been decrypted
+// (ViewSession.openFrame has the frame layout).
 export interface ParsedVideoFrame {
   isKeyframe: boolean;
   timestamp: number; // microseconds
-  data: Uint8Array; // the H.264 access unit
-}
-
-// Returns null for anything that isn't a well-formed video frame.
-export function parseVideoFrame(buffer: ArrayBuffer): ParsedVideoFrame | null {
-  if (buffer.byteLength < VIDEO_FRAME_HEADER_SIZE) return null;
-  const view = new DataView(buffer);
-  if (view.getUint8(0) !== VIDEO_FRAME_KIND) return null;
-
-  return {
-    isKeyframe: (view.getUint8(1) & VIDEO_FRAME_KEYFRAME_FLAG) !== 0,
-    timestamp: Number(view.getBigInt64(2, true)),
-    data: new Uint8Array(buffer, VIDEO_FRAME_HEADER_SIZE),
-  };
+  data: Uint8Array<ArrayBuffer>; // the H.264 access unit
 }

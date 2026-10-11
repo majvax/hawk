@@ -1,8 +1,9 @@
 import { type JSX, useCallback, useEffect, useState } from "react";
 
-import { type User, getSession, logout } from "./api.js";
+import { type User, getSession } from "./api.js";
+import { type Identity, currentIdentity, logOut } from "./keys.js";
 import { AdminPage } from "./pages/Admin.js";
-import { LoginPage, SignupPage } from "./pages/Auth.js";
+import { LoginPage, SignupPage, UnlockPage } from "./pages/Auth.js";
 import { MachinesPage, formatBitrate } from "./pages/Machines.js";
 import { SettingsPage } from "./pages/Settings.js";
 import { Dot, Logo, type Tone } from "./ui.js";
@@ -18,25 +19,40 @@ function inviteTokenFromPath(): string | null {
 export function App(): JSX.Element {
   // undefined: still checking; null: logged out.
   const [user, setUser] = useState<User | null | undefined>(undefined);
+  // The account's identity key in this browser; null while it still has to
+  // be unlocked with the password.
+  const [identity, setIdentity] = useState<Identity | null | undefined>(undefined);
   const [inviteToken, setInviteToken] = useState(inviteTokenFromPath);
 
   const recheckSession = useCallback((): void => {
-    getSession().then(setUser, () => setUser(null));
+    getSession().then(
+      async (session) => {
+        setIdentity(session === null ? null : await currentIdentity(session).catch(() => null));
+        setUser(session);
+      },
+      () => setUser(null),
+    );
   }, []);
 
   useEffect(recheckSession, [recheckSession]);
 
-  const enter = (next: User): void => {
+  const enter = ({ user: next, identity: unlocked }: { user: User; identity: Identity }): void => {
     // Leave /invite/<token> so a reload doesn't show the signup page again.
     if (inviteToken !== null) {
       window.history.replaceState(null, "", "/");
       setInviteToken(null);
     }
+    setIdentity(unlocked);
     setUser(next);
   };
 
+  const leave = (): void => {
+    setIdentity(null);
+    setUser(null);
+  };
+
   if (inviteToken !== null && user !== undefined) return <SignupPage token={inviteToken} onSignup={enter} />;
-  if (user === undefined) {
+  if (user === undefined || identity === undefined) {
     return (
       <div className="splash" aria-busy>
         <Logo size={28} />
@@ -45,8 +61,11 @@ export function App(): JSX.Element {
     );
   }
   if (user === null) return <LoginPage onLogin={enter} />;
+  if (identity === null) {
+    return <UnlockPage user={user} onUnlock={(unlocked) => enter({ user, identity: unlocked })} onLogOut={leave} />;
+  }
   // Keyed so a different account never inherits the last one's dashboard.
-  return <Console key={user.id} user={user} onSessionEnded={() => setUser(null)} />;
+  return <Console key={user.id} user={user} identity={identity} onSessionEnded={leave} />;
 }
 
 const TABS: [Tab, string][] = [
@@ -55,11 +74,19 @@ const TABS: [Tab, string][] = [
   ["admin", "Admin"],
 ];
 
-function Console({ user, onSessionEnded }: { user: User; onSessionEnded: () => void }): JSX.Element {
+function Console({
+  user,
+  identity,
+  onSessionEnded,
+}: {
+  user: User;
+  identity: Identity;
+  onSessionEnded: () => void;
+}): JSX.Element {
   const [tab, setTab] = useState<Tab>("machines");
   // Owned here rather than by the machines page so the status bar can show
   // the relay link from any tab, and a live view survives switching tabs.
-  const dashboard = useDashboard(onSessionEnded);
+  const dashboard = useDashboard(identity, onSessionEnded);
 
   return (
     <div className="shell">
@@ -87,7 +114,7 @@ function Console({ user, onSessionEnded }: { user: User; onSessionEnded: () => v
           <button
             type="button"
             className="btn btn-ghost btn-sm"
-            onClick={() => void logout().finally(onSessionEnded)}
+            onClick={() => void logOut().finally(onSessionEnded)}
           >
             Log out
           </button>
@@ -97,11 +124,11 @@ function Console({ user, onSessionEnded }: { user: User; onSessionEnded: () => v
       {/* The machines page stays mounted so switching tabs doesn't drop a
           live view. */}
       <main className="view fixed" hidden={tab !== "machines"}>
-        <MachinesPage dashboard={dashboard} visible={tab === "machines"} />
+        <MachinesPage dashboard={dashboard} identity={identity} visible={tab === "machines"} />
       </main>
       {tab === "settings" && (
         <main className="view">
-          <SettingsPage />
+          <SettingsPage user={user} identity={identity} />
         </main>
       )}
       {tab === "admin" && user.isAdmin && (
