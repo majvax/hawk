@@ -158,6 +158,8 @@ TODO
 - [ ] Separately hosted dashboard: bearer-token sessions, `HAWK_ALLOWED_ORIGINS` (CORS + socket `Origin` allow-list), relay address entered in the browser, protocol version in the handshake
 - [ ] Relay installer (Linux): `systemd` service, Let's Encrypt or self-signed TLS with a stable pinned key, frontend modes, first admin
 - [ ] GitHub Pages workflow for hosting the dashboard on its own
+- [ ] Native dashboard app (Tauri): signed updates, full keyboard capture, identity key in the OS keychain
+- [ ] `/docs` and `/about` pages in the dashboard (late: once features and the name settle)
 
 Each of the unchecked items is described under [Planned Features](#planned-features).
 
@@ -568,6 +570,125 @@ factor they can. So: after a successful MFA, the browser can be remembered.
   trusted device immediately — the same way those already end sessions.
 * Capped per account (around ten), unused ones expire early, and the admin
   can shorten the window or switch the feature off entirely for everyone.
+
+### Native dashboard app
+
+End-to-end encryption keeps the relay from reading the stream and from
+deciding who watches it, but in a browser the code doing the encrypting is
+downloaded on every visit — in the default same-origin mode, from the relay
+itself. A compromised relay doesn't need to break the encryption; it serves
+a modified script that captures the password the keys are derived from,
+signs with the identity key while the page is open, or reads the decoded
+frames. A separately hosted dashboard (see *Frontend Hosting*) moves that
+trust to whoever controls *that* host; an installed app narrows it to
+whoever signs its updates. The app also gets what a browser won't give a
+remote desktop: the whole keyboard, and somewhere better than IndexedDB to
+keep keys.
+
+* **Both, from one codebase.** The web dashboard stays — any browser,
+  nothing installed, the borrowed laptop — and is documented as the weaker
+  option for E2EE. The app is a Tauri shell around the same React
+  dashboard, with a Rust side like the relay's, so a feature lands in both
+  at once.
+* **Built on the separate-origin mode.** To the relay, the app is one more
+  origin: it uses the bearer-token sessions, the relay address entered by
+  the user and the protocol version in the handshake planned under
+  *Frontend Hosting*, and the relay owner lists its fixed origin
+  (`tauri://localhost`, or `http://tauri.localhost` on Windows) in
+  `HAWK_ALLOWED_ORIGINS`. Nothing about sessions is app-specific, and one
+  install can remember several relays.
+* **Keys in the OS keychain.** The browser keeps the identity key as a
+  non-extractable WebCrypto key and other accounts' keys as first seen,
+  all in IndexedDB — per browser, per origin, and gone when site data is
+  cleared, which also forgets the first-seen record that makes a changed
+  key noticeable. The app keeps the same keys in the OS keychain
+  (Credential Manager, Keychain, Secret Service), out of reach of a
+  browser reset. The E2EE protocol itself doesn't change.
+* **The whole keyboard.** Browsers keep Win, Alt+Tab, Ctrl+W and friends
+  for themselves; the Keyboard Lock API gets some of them back, in
+  Chromium, in fullscreen only. The app grabs keys while focused and
+  forwards them as the same `KeyboardEvent.code` scancodes, with an
+  on-screen escape chord to release the grab. A few combinations belong to
+  the client OS no matter what — Ctrl+Alt+Del and Win+L on Windows — so
+  they get menu actions instead.
+* **Signed releases, signed updates.** Builds come from CI on tagged
+  releases, reproducible where the toolchain allows, with their hashes
+  published. Tauri's updater verifies a signature before installing, which
+  makes that signing key the most valuable secret in the project — it ships
+  code to every install — so releases are signed outside CI, with the key
+  offline or in hardware. Platform signing on top: Authenticode on Windows
+  (or SmartScreen warns on every download) and notarization on macOS.
+* **Platform reality.** Tauri renders with the system WebView: WebView2
+  (Chromium) on Windows, WKWebView on macOS, WebKitGTK on Linux. The last
+  has the weakest codec support, so the MSE fallback that exists for
+  Firefox on Android probably carries Linux too — worth testing before
+  anything else is built on it. Tauri 2 also targets iOS and Android, but
+  store review and touch input (see *Touch and mobile input*) make mobile
+  its own decision, not a build flag.
+
+The order follows from the dependencies: the separate-origin mode first,
+then the app. E2EE is already in place and the app reuses it unchanged, and
+nothing in the separate-origin work is wasted if the app comes later, or
+never.
+
+### Documentation and about pages
+
+Late in the project, on purpose: both pages describe the finished shape,
+and written now they'd go stale with every feature above — and with the
+project's name still open. The dashboard routes by path already (only
+`/invite/<token>` today) and the relay falls back to `index.html` for
+unknown paths, so neither page needs anything new on the server.
+
+**`/docs` — the full documentation, served by the dashboard.**
+
+* **Written for the people using it**, not for the people building it.
+  This README stays the design document; the docs cover using the
+  dashboard (signing in, enrolling a machine, viewing and control,
+  sharing, roles, temporary and single-view shares, sessions, MFA and
+  trusted devices), running a relay (the installer, environment variables,
+  TLS and the pin, frontend hosting modes, reverse proxies, backups),
+  installing and removing the machine side, the security model (what the
+  relay can and can't see, pinning, TPM identity, identity keys and
+  owner-signed shares, E2EE and where it stops, web versus app), and
+  troubleshooting the failures that actually happen — pin mismatch, a
+  machine stuck offline, a black secure desktop, the MSE fallback.
+* **Markdown in the repo, rendered at build time.** One `docs/` directory,
+  prerendered to static HTML into the frontend build: readable without
+  JavaScript, served unchanged from a static host (no SPA fallback
+  needed), and indexable on a public copy. Search is a client-side index
+  built at the same time — no third-party search service, for the same
+  reason there's no third-party anything else.
+* **Generated where it can drift.** The environment-variable reference
+  comes from the relay's config definitions and the machine config
+  reference from its schema (see *Synced configuration file*), so the
+  tables can't disagree with the code.
+* **Versioned with the build.** A relay serves the docs for the release it
+  runs, so an operator on an older version reads what matches it.
+* **Linked from where the questions come up.** A help link beside the
+  enrollment dialog, the share form, the Admin tab and the session list
+  opens the relevant section in place.
+* **Public, like the login page.** Someone installing the service or
+  standing up a relay needs the docs before they have an account. The
+  content is static and identical for everyone, so it reveals nothing the
+  login page doesn't already.
+
+**`/about` — what the project is, for someone deciding whether to trust
+it.**
+
+* **The description**: what it does, why it exists (self-hosted, no third
+  party, outbound-only), the architecture diagram and the security model
+  in a paragraph, with links to the source, the license, the issue tracker
+  and how to report a vulnerability.
+* **Third-party notices.** The relay and the dashboard bundle Rust crates
+  and npm packages whose licenses (MIT, Apache-2.0, …) require their
+  notices to ship with the software. They're generated at build time
+  (`cargo-about` for the relay, a license extractor for the bundle) and
+  listed here, and in the native app. This part is owed from the first
+  public binary release — if a release comes before the page, the notices
+  ship as a file beside it.
+* **Version and build** — release, commit, build date — shown only when
+  signed in. An exact version on a public page is a gift to anyone
+  matching relays against a vulnerability list.
 
 ---
 
