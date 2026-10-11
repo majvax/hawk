@@ -1360,6 +1360,62 @@ select {
   flex-wrap: wrap;
 }
 
+.files-panel {
+  border: 1px solid var(--line);
+  background: var(--void);
+}
+
+.files-panel .warn {
+  color: var(--warn);
+}
+
+.files-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.files-head .spacer {
+  flex: 1;
+}
+
+.files-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.transfer-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 140px;
+}
+
+.meter {
+  position: relative;
+  display: inline-block;
+  width: 80px;
+  height: 4px;
+  background: var(--line);
+}
+
+.meter > span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent);
+}
+
+.stage-screen.dropping {
+  outline: 1px dashed var(--accent);
+  outline-offset: -6px;
+}
+
 .clip-panel {
   display: flex;
   gap: 8px;

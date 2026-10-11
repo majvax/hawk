@@ -1,4 +1,4 @@
-import { type JSX, type ReactNode, useEffect, useRef, useState } from "react";
+import { type DragEvent, type JSX, type ReactNode, useEffect, useRef, useState } from "react";
 
 import {
   type EnrollmentCode,
@@ -13,6 +13,7 @@ import { MAX_CLIPBOARD_BYTES, type Machine, type Role } from "../protocol.js";
 import { Alert, CodeBlock, CopyButton, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
 import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
+import { FilesPanel } from "./FilesPanel.js";
 import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
 
 export const ROLE_LABEL: Record<Role, string> = { owner: "Owner", control: "Can control", view: "View only" };
@@ -502,12 +503,15 @@ function Viewer({
   status: Dashboard["status"];
   onConnect: (machine: Machine) => void;
 }): JSX.Element {
-  const { canvasRef, picture, stats, decodeError, security, clipboard, sendInput, sendClipboard } = dashboard;
+  const { canvasRef, picture, stats, decodeError, security, clipboard, files, fileActions, sendInput, sendClipboard } =
+    dashboard;
   const stageRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [keysLocked, setKeysLocked] = useState(false);
   const [clipPanel, setClipPanel] = useState<ClipboardPanel>(null);
   const [clipNote, setClipNote] = useState<string | null>(null);
+  const [filesOpen, setFilesOpen] = useState(false);
+  const [dropping, setDropping] = useState(false);
 
   const onScreen = shown && viewing !== null && selected?.id === viewing.id;
   // Nothing to send input to unless a picture is actually up, and the relay
@@ -525,6 +529,27 @@ function Viewer({
   const secured = onScreen && viewing.online && status === "open" && security?.kind === "secured";
   const canReadClipboard = secured && clipboard.access !== "off";
   const canPaste = canReadClipboard && security.role !== "view";
+  const canSendFiles = secured && files.enabled;
+  // Transfers stay listed while the view is down, so they can be seen
+  // waiting to resume.
+  const showFiles = onScreen && filesOpen && (files.enabled || files.transfers.length > 0);
+
+  // Dropping files on the screen sends them, and opens the panel to watch.
+  const onDragOver = (event: DragEvent): void => {
+    if (!canSendFiles || !event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setDropping(true);
+  };
+  const onDrop = (event: DragEvent): void => {
+    setDropping(false);
+    if (!canSendFiles) return;
+    event.preventDefault();
+    const dropped = [...event.dataTransfer.files];
+    if (dropped.length === 0) return;
+    fileActions.upload(dropped);
+    setFilesOpen(true);
+  };
 
   // A new view, or none: whatever the panel held was for the last one.
   useEffect(() => {
@@ -697,6 +722,18 @@ function Viewer({
               Paste to machine
             </button>
           )}
+          {(files.enabled || files.transfers.length > 0) && onScreen && (
+            <button
+              type="button"
+              onClick={() => {
+                if (!filesOpen && canSendFiles) fileActions.list();
+                setFilesOpen(!filesOpen);
+              }}
+              title="Send files to the machine, or download from its drop folder"
+            >
+              {filesOpen ? "Hide files" : "Files"}
+            </button>
+          )}
           {canReadClipboard && (
             <button
               type="button"
@@ -713,7 +750,12 @@ function Viewer({
             </button>
           )}
         </div>
-        <div className="stage-screen">
+        <div
+          className={dropping ? "stage-screen dropping" : "stage-screen"}
+          onDragOver={onDragOver}
+          onDragLeave={() => setDropping(false)}
+          onDrop={onDrop}
+        >
           <Corners />
           <canvas
             ref={canvasRef}
@@ -741,6 +783,7 @@ function Viewer({
           )}
           {viewing.role === "view" && <span>View only: you can watch this screen but not send it input.</span>}
           {canControl && !input.active && <span>Click the screen to send it your mouse and keyboard.</span>}
+          {canSendFiles && !filesOpen && <span>Drop files on the screen to send them to the machine.</span>}
           {canReadClipboard && clipboard.access === "sync" && (
             <span>Text copied on the machine comes to your clipboard while this page has focus.</span>
           )}
@@ -762,6 +805,7 @@ function Viewer({
           )}
         </div>
       )}
+      {showFiles && <FilesPanel files={files} actions={fileActions} connected={canSendFiles} />}
       {onScreen && clipPanel !== null && (
         <div className="clip-panel">
           {clipPanel.kind === "paste" ? (

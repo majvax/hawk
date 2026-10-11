@@ -2,6 +2,7 @@
 #include "config.hpp"
 #include "crypto.hpp"
 #include "e2e.hpp"
+#include "files.hpp"
 #include "machine_identity.hpp"
 #include "machine_key.hpp"
 #include "websocket/websocket.hpp"
@@ -89,11 +90,11 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard
+    std::string                                  sealed;         // input, clipboard, file
     std::vector<svc::SignedStatement>            revocations;    // revocations
 };
 
@@ -366,11 +367,12 @@ bool CompleteEnrollment(Session& session, const RelayCommand& command) {
 
 // Everything one relay connection works with.
 struct Connection {
-    net::WebSocketClient&            client;
-    svc::CaptureHost&                capture;
-    Session&                         session;
-    std::unique_ptr<svc::ViewerHub>& hub;
-    const svc::MachineConfig&        config;
+    net::WebSocketClient&                client;
+    svc::CaptureHost&                    capture;
+    Session&                             session;
+    std::unique_ptr<svc::ViewerHub>&     hub;
+    std::unique_ptr<svc::FileTransfers>& files;
+    const svc::MachineConfig&            config;
 };
 
 // The connection's viewers, once the machine knows its id.
@@ -385,7 +387,7 @@ void OpenViewerHub(Connection& connection) {
     auto& client = connection.client;
     connection.hub = std::make_unique<svc::ViewerHub>(
         connection.session.key, *connection.session.machine_id, std::move(owner_key), connection.config.clipboard,
-        [&client](const std::string& text) {
+        connection.config.files.enabled, [&client](const std::string& text) {
             if (text.empty()) {
                 return;
             }
@@ -393,6 +395,9 @@ void OpenViewerHub(Connection& connection) {
                 spdlog::warn("relay: failed to answer a viewer: {}", net::to_string(sent.error()));
             }
         });
+    if (connection.config.files.enabled) {
+        connection.files = std::make_unique<svc::FileTransfers>(connection.config.files, *connection.hub);
+    }
 }
 
 void HandleRelayCommand(std::string_view text, Connection& connection) {
@@ -401,7 +406,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
-    auto& [client, capture, session, hub, config] = connection;
+    auto& [client, capture, session, hub, files, config] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -425,6 +430,9 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         for (const auto& release : hub->leave(command.viewer)) {
             ForwardInput(capture, release);
         }
+        if (files != nullptr) {
+            files->drop_viewer(command.viewer);
+        }
     } else if (command.type == "input") {
         if (const auto packet = hub->input(command.viewer, command.sealed); packet.has_value()) {
             ForwardInput(capture, *packet);
@@ -437,6 +445,10 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
                 spdlog::info("relay: the clipboard request from viewer {} couldn't reach hawk-capture",
                              command.viewer);
             }
+        }
+    } else if (command.type == "file") {
+        if (auto message = hub->file(command.viewer, command.sealed); message.has_value() && files != nullptr) {
+            files->handle(command.viewer, std::move(*message));
         }
     } else if (command.type == "revocations") {
         hub->apply_revocations(command.revocations);
@@ -532,9 +544,14 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
             spdlog::warn("relay: failed to send hello message: {}", net::to_string(sent.error()));
         }
 
-        std::unique_ptr<svc::ViewerHub> hub;
-        Connection                      connection{
-            .client = client, .capture = capture, .session = *session, .hub = hub, .config = config};
+        std::unique_ptr<svc::ViewerHub>     hub;
+        std::unique_ptr<svc::FileTransfers> files;
+        Connection                          connection{.client = client,
+                                                       .capture = capture,
+                                                       .session = *session,
+                                                       .hub = hub,
+                                                       .files = files,
+                                                       .config = config};
         OpenViewerHub(connection);
 
         std::optional<std::uint16_t> close_code;
@@ -554,6 +571,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         // connection; stop it before the socket it forwards to goes away,
         // and before the viewers it seals frames for.
         capture.stop();
+        files.reset();  // answers through the hub
         hub.reset();
         active_client.store(nullptr);
         client.close();
@@ -614,6 +632,7 @@ void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* ar
     const svc::MachineConfig config = svc::load_machine_config();
     spdlog::info("config: clipboard {}{}", to_string(config.clipboard.mode),
                  config.clipboard.view_pull ? ", view shares may read it" : "");
+    spdlog::info("config: file transfer {}", config.files.enabled ? "on" : "off");
 
     ServiceContext service;
     service.status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;

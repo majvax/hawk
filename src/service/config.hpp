@@ -3,6 +3,7 @@
 #include "common/clipboard_pipe.hpp"
 
 #include <cstdint>
+#include <string>
 
 // The machine's own settings, from C:\ProgramData\HawkService\config.toml.
 // They're set on the machine, never through the relay, so nobody holding an
@@ -26,8 +27,24 @@ struct ClipboardConfig {
     bool view_pull = false;
 };
 
+// The most a single file may be, either way, unless the config says less.
+inline constexpr std::uint64_t default_max_file_size = 1024ULL * 1024 * 1024;  // 1 GiB
+// What the config may raise it to.
+inline constexpr std::uint64_t max_file_size_limit = 64ULL * 1024 * 1024 * 1024;
+
+struct FilesConfig {
+    // Off unless the machine's owner turns it on.
+    bool enabled = false;
+    // Where uploads land and downloads come from. Empty means the logged-on
+    // user's Downloads\Hawk; otherwise a path, in which that user's
+    // environment variables (%USERPROFILE%) are expanded.
+    std::string drop_dir;
+    std::uint64_t max_size = default_max_file_size;
+};
+
 struct MachineConfig {
     ClipboardConfig clipboard;
+    FilesConfig     files;
 };
 
 // The config, with defaults for what it leaves out (or for a missing file).
@@ -39,6 +56,11 @@ struct MachineConfig {
 //   mode = "pull"        # off | pull | sync
 //   max_size = 262144    # bytes, at most 262144
 //   view_pull = false
+//
+//   [[files]]
+//   enabled = false
+//   drop_dir = ""        # empty: %USERPROFILE%\Downloads\Hawk
+//   max_size = 1073741824
 [[nodiscard]] MachineConfig load_machine_config();
 
 }  // namespace hawk::service

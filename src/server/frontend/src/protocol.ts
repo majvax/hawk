@@ -53,11 +53,15 @@ export type DashboardEvent =
       signature: string;
       wrappedKey: string;
       clipboard?: ClipboardAccess;
+      // Whether this viewer may send and fetch files.
+      files?: boolean;
     }
   | { type: "view_rejected"; deviceId: string; reason: string }
   | { type: "stream_key"; deviceId: string; wrappedKey: string }
   // Clipboard text the machine sealed for this viewer (ViewSession.openClipboard).
-  | { type: "clipboard"; deviceId: string; sealed: string };
+  | { type: "clipboard"; deviceId: string; sealed: string }
+  // A file-channel message the machine sealed for this viewer (ViewSession.openFile).
+  | { type: "file"; deviceId: string; sealed: string };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -84,7 +88,9 @@ export type DashboardCommand =
   | { type: "input"; deviceId: string; sealed: string }
   // A clipboard request, sealed the same way (ViewSession.sealClipboard).
   // Passed on for any role; the machine decides what its config allows.
-  | { type: "clipboard"; deviceId: string; sealed: string };
+  | { type: "clipboard"; deviceId: string; sealed: string }
+  // A file-channel message (ViewSession.sealFile); control only.
+  | { type: "file"; deviceId: string; sealed: string };
 
 // One H.264 access unit, once the frame carrying it has been decrypted
 // (ViewSession.openFrame has the frame layout).

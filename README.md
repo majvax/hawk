@@ -152,7 +152,7 @@ TODO
 - [ ] Multiple display support (per-display capture, display-aware input)
 - [ ] Audio (WASAPI loopback, Opus) alongside the video stream
 - [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
-- [ ] File transfer
+- [x] File transfer into and out of one drop folder, resumable and hash-checked, off unless the machine's config turns it on
 - [ ] Remote power actions, reboot-and-reconnect, Wake-on-LAN via a LAN peer
 - [ ] Relay operations: container image, health endpoints, metrics, backups
 - [ ] Trusted devices (remember a browser after MFA)
@@ -469,27 +469,57 @@ How it works:
 * In sync mode, a copy is reported once the clipboard settles, so one copy
   is one push. What a viewer pasted isn't pushed back.
 
-**File transfer.** Drag a file onto the dashboard to send it; chunked over
-the existing authenticated channel, encrypted end-to-end like frames, so
-the relay stores and sees nothing.
+**File transfer (built).** Drop files on the screen (or use *Send files*
+in the dashboard's Files panel) to send them; the panel lists the machine's
+drop folder to download from. Chunks travel over the viewer's end-to-end
+encrypted channel, so the relay stores and sees nothing. Both ways need
+**control**; a view share never gets the panel, and the relay and the
+machine both refuse it.
 
 * **Into one directory, never an arbitrary path.** A remote write to a path
-  the viewer chooses is a privilege escalation with extra steps — the
-  Startup folder, or a DLL beside an executable. Uploads land in a single
-  configured drop directory (`%USERPROFILE%\Downloads\Hawk` by default),
-  filenames sanitised, no path separators honoured, collisions suffixed.
-* **Coming back the other way**, v1 is the same drop directory: the
-  machine's user (or a **dev** shell) puts a file there and the dashboard
-  lists and downloads it. A full remote file browser is a separate, larger
-  feature with its own access rules, and shouldn't be smuggled in as part
-  of a transfer.
-* SHA-256 per transfer, resume by offset after a reconnect, a size cap and
-  a concurrency cap. The relay streams chunks through bounded queues rather
-  than buffering whole files, the same discipline the frame path already
-  uses.
-* Every transfer is logged with name, size, hash, direction and who —
-  `files.enabled` defaults off and is lockable machine-side, as are
-  `files.drop_dir` and `files.max_size`.
+  the viewer chooses is a privilege escalation with extra steps: the
+  Startup folder, or a DLL beside an executable. Uploads land in one drop
+  directory (the logged-on user's `Downloads\Hawk` by default). Names are
+  sanitised: only the last path component counts, reserved characters and
+  device names are replaced, and a name that's taken becomes `name (1).ext`.
+* **As the user, not as SYSTEM.** Every file operation runs impersonating
+  the logged-on user, so a viewer gets exactly that user's rights in the
+  drop folder. A junction the user plants there leads nowhere the user
+  couldn't already write.
+* **Coming back the other way** is the same drop directory: the machine's
+  user puts a file there and the dashboard lists and downloads it. A full
+  remote file browser is a separate, larger feature with its own access
+  rules, and shouldn't be smuggled in as part of a transfer.
+* **SHA-256 per transfer, and resume by offset.** An upload is hashed in the
+  browser first and written to a hidden partial file named after its hash
+  and size. Offering the same file again (after a dropped connection, say)
+  picks up where it stopped, and it only gets its real name once the whole
+  thing hashes right. A download is hashed by the machine first and checked
+  by the browser at the end; an interrupted one asks for the rest. Partial
+  files nobody came back for are removed after a week.
+* **Bounded all the way.** Each side keeps 8 chunks of 64 KB
+  unacknowledged per transfer, at most 2 transfers each way per viewer and
+  6 on the machine. The relay queues file data per dashboard behind events
+  and video, dropping what overflows rather than buffering it (the transfer
+  stalls and resumes). It also caps how fast one dashboard can push.
+* **Logged:** who sent or fetched which file, its size and its hash.
+* In Chromium the browser streams a download straight to the file the
+  viewer picks; elsewhere it's held in memory and saved at the end.
+
+It's off unless the machine's config turns it on:
+
+```toml
+[[files]]
+enabled = true
+drop_dir = ""            # empty: the logged-on user's Downloads\Hawk
+max_size = 1073741824    # bytes per file, either way; at most 64 GiB
+```
+
+`drop_dir` may use the user's environment variables. Write it as a TOML
+literal string (`'%USERPROFILE%\Desktop\Drop'`) or double the backslashes:
+in a `"..."` string, `\D` is an invalid escape and the config won't parse. As
+with the clipboard, a config that doesn't parse, or a second `[[files]]`
+table, turns file transfer off.
 
 Both pair especially well with the **dev** role: a shell plus a clipboard
 plus a file drop covers most of what the GUI was being used for.

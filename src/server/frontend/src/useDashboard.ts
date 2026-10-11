@@ -2,6 +2,14 @@ import { type RefObject, useCallback, useEffect, useRef, useState } from "react"
 
 import { getSession } from "./api.js";
 import { type EnrollmentCheck, type MachineTrust, ViewSession, checkEnrollment, trustMachine } from "./e2e.js";
+import {
+  FileManager,
+  type FileSender,
+  type Listing,
+  type RemoteFile,
+  type Sink,
+  type Transfer,
+} from "./fileTransfers.js";
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
 import type {
@@ -112,6 +120,26 @@ const NO_CLIPBOARD: ClipboardState = { access: "off", waiting: false, latest: nu
 // or the request was dropped) stops showing as underway.
 const CLIPBOARD_WAIT_MS = 5000;
 
+// The open view's file transfers.
+export interface FilesState {
+  // Whether the machine lets this viewer send and fetch files.
+  enabled: boolean;
+  listing: Listing | null;
+  listingError: string | null;
+  transfers: Transfer[];
+}
+
+const NO_FILES: FilesState = { enabled: false, listing: null, listingError: null, transfers: [] };
+
+export interface FileActions {
+  list: () => void;
+  upload: (files: File[]) => void;
+  download: (file: RemoteFile, sink: Sink) => void;
+  cancel: (id: string) => void;
+  retry: (id: string) => void;
+  dismiss: (id: string) => void;
+}
+
 export interface StreamStats {
   fps: number; // frames shown over the last second
   received: number; // frames that arrived over the last second
@@ -142,6 +170,8 @@ export interface Dashboard {
   // The open view's end-to-end handshake; null with no view open.
   security: ViewSecurity | null;
   clipboard: ClipboardState;
+  files: FilesState;
+  fileActions: FileActions;
   // Owned machines whose enrollment this browser checked: "mismatch" means
   // the key the machine answered with isn't bound to the code made here.
   enrollmentChecks: Record<string, EnrollmentCheck>;
@@ -179,6 +209,32 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   // Numbers what the machine sends, so the same text twice still counts
   // as new.
   const clipboardIdRef = useRef(0);
+  const [files, setFiles] = useState<FilesState>(NO_FILES);
+  const filesEnabledRef = useRef(false);
+  // The open view's transfers, kept across a dropped connection so they can
+  // resume; replaced when the view moves to another machine.
+  const fileManagerRef = useRef<FileManager | null>(null);
+  // File messages are opened one at a time, in the order they arrived.
+  const fileChainRef = useRef<Promise<void>>(Promise.resolve());
+  const fileFrameRef = useRef<number | null>(null);
+  // Progress arrives per chunk; the panel is redrawn at most once a frame.
+  const publishFiles = useRef((): void => {
+    if (fileFrameRef.current !== null) return;
+    fileFrameRef.current = window.requestAnimationFrame(() => {
+      fileFrameRef.current = null;
+      const manager = fileManagerRef.current;
+      setFiles(
+        manager === null
+          ? NO_FILES
+          : {
+              enabled: filesEnabledRef.current,
+              listing: manager.listing,
+              listingError: manager.listingError,
+              transfers: manager.snapshot(),
+            },
+      );
+    });
+  }).current;
   const [enrollmentChecks, setEnrollmentChecks] = useState<Record<string, EnrollmentCheck>>({});
 
   const socketRef = useRef<WebSocket | null>(null);
@@ -213,6 +269,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     sessionRef.current?.abandon();
     sessionRef.current = null;
     setClipboard(NO_CLIPBOARD);
+    // Transfers wait for the view to come back rather than fail.
+    fileManagerRef.current?.attach(null);
   }).current;
   // Counted per frame, read and reset by the once-a-second stats sample.
   const framesRef = useRef(0);
@@ -435,6 +493,36 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     };
   }, []);
 
+  // A fresh set of transfers for the machine now being viewed (null: none).
+  const resetFiles = useCallback(
+    (deviceId: string | null): void => {
+      fileManagerRef.current?.close();
+      fileManagerRef.current = deviceId === null ? null : new FileManager(publishFiles);
+      filesEnabledRef.current = false;
+      publishFiles();
+    },
+    [publishFiles],
+  );
+
+  // Seals file-channel messages for `session` and sends them in order with
+  // input (they share its counter).
+  const fileSender = useCallback(
+    (session: ViewSession, deviceId: string): FileSender =>
+      (op, header, data) => {
+        if (sessionRef.current !== session) return false;
+        const sealed = session.sealFile(op, header, data);
+        if (sealed === null) return false;
+        inputChainRef.current = inputChainRef.current
+          .then(() => sealed)
+          .then((payload) => {
+            if (sessionRef.current === session) send({ type: "file", deviceId, sealed: payload });
+          })
+          .catch((error: unknown) => console.error("sealing file message:", error));
+        return true;
+      },
+    [send],
+  );
+
   // The open view is gone for good: stopped, or the machine was taken away.
   const clearView = useCallback((): void => {
     resetDecodeError();
@@ -445,7 +533,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     setViewingId(null);
     teardownDecoder();
     clearPicture();
-  }, [clearPicture, resetDecodeError, teardownDecoder]);
+    resetFiles(null);
+  }, [clearPicture, resetDecodeError, resetFiles, teardownDecoder]);
 
   const handleEvent = useCallback(
     (payload: DashboardEvent): void => {
@@ -491,6 +580,12 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
                 setSecurity({ kind: "secured", role: session.role });
                 // A relay from before the clipboard says nothing: none, then.
                 setClipboard({ access: payload.clipboard ?? "off", waiting: false, latest: null });
+                filesEnabledRef.current = payload.files === true;
+                const manager = fileManagerRef.current;
+                if (manager !== null) {
+                  manager.attach(payload.files === true ? fileSender(session, payload.deviceId) : null);
+                  if (payload.files === true) manager.list();
+                }
               }
             },
             (error: unknown) => {
@@ -527,6 +622,18 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
           });
           break;
         }
+        case "file": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          fileChainRef.current = fileChainRef.current
+            .then(() => session.openFile(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              fileManagerRef.current?.handle(opened.op, opened.header, opened.data);
+            })
+            .catch((error: unknown) => console.error("file message:", error));
+          break;
+        }
         case "view_rejected":
           if (viewing === payload.deviceId) {
             const machine = machinesRef.current.find((candidate) => candidate.id === payload.deviceId);
@@ -539,7 +646,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
           break;
       }
     },
-    [clearView, requestStream, send, teardownDecoder],
+    [clearView, fileSender, requestStream, send, teardownDecoder],
   );
 
   // Owned machines not vouched for yet: if this browser made the code a
@@ -656,11 +763,12 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       resetDecodeError();
 
       viewingRef.current = deviceId;
+      resetFiles(deviceId);
       blockedRef.current = null; // asked for by hand: try again
       setViewingId(deviceId);
       requestStream(deviceId); // while disconnected, the snapshot resumes it
     },
-    [clearPicture, requestStream, resetDecodeError, send, teardownDecoder],
+    [clearPicture, requestStream, resetDecodeError, resetFiles, send, teardownDecoder],
   );
 
   useEffect(() => {
@@ -754,6 +862,17 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [send],
   );
 
+  const fileActions = useRef<FileActions>({
+    list: () => fileManagerRef.current?.list(),
+    upload: (picked) => {
+      for (const file of picked) fileManagerRef.current?.upload(file);
+    },
+    download: (file, sink) => fileManagerRef.current?.download(file, sink),
+    cancel: (id) => fileManagerRef.current?.cancel(id),
+    retry: (id) => fileManagerRef.current?.retry(id),
+    dismiss: (id) => fileManagerRef.current?.dismiss(id),
+  }).current;
+
   const stopView = useCallback((): void => {
     if (viewingRef.current === null) return;
     if (streamingRef.current !== null) send({ type: "stop_view", deviceId: streamingRef.current });
@@ -773,6 +892,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     decodeError,
     security,
     clipboard,
+    files,
+    fileActions,
     enrollmentChecks,
     startView,
     stopView,

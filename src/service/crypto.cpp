@@ -185,6 +185,55 @@ Sha256Digest sha256(std::span<const std::byte> data) {
     return finish_hash(sha256_provider().get(), {}, {data});
 }
 
+namespace {
+
+[[nodiscard]] BCRYPT_HASH_HANDLE new_reusable_hash() {
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (sha256_provider().get() == nullptr ||
+        !BCRYPT_SUCCESS(
+            BCryptCreateHash(sha256_provider().get(), &hash, nullptr, 0, nullptr, 0, BCRYPT_HASH_REUSABLE_FLAG))) {
+        return nullptr;
+    }
+    return hash;
+}
+
+}  // namespace
+
+Sha256Stream::Sha256Stream() : hash_(new_reusable_hash()) {}
+
+Sha256Stream::Sha256Stream(Sha256Stream&& other) noexcept : hash_(std::exchange(other.hash_, nullptr)) {}
+
+Sha256Stream& Sha256Stream::operator=(Sha256Stream&& other) noexcept {
+    if (this != &other) {
+        if (hash_ != nullptr) {
+            BCryptDestroyHash(static_cast<BCRYPT_HASH_HANDLE>(hash_));
+        }
+        hash_ = std::exchange(other.hash_, nullptr);
+    }
+    return *this;
+}
+
+Sha256Stream::~Sha256Stream() {
+    if (hash_ != nullptr) {
+        BCryptDestroyHash(static_cast<BCRYPT_HASH_HANDLE>(hash_));
+    }
+}
+
+void Sha256Stream::update(std::span<const std::byte> data) {
+    if (hash_ != nullptr) {
+        BCryptHashData(static_cast<BCRYPT_HASH_HANDLE>(hash_), mutable_bytes(data), static_cast<ULONG>(data.size()), 0);
+    }
+}
+
+Sha256Digest Sha256Stream::finish() {
+    Sha256Digest digest{};
+    if (hash_ != nullptr) {
+        BCryptFinishHash(static_cast<BCRYPT_HASH_HANDLE>(hash_), reinterpret_cast<PUCHAR>(digest.data()),
+                         static_cast<ULONG>(digest.size()), 0);
+    }
+    return digest;
+}
+
 Sha256Digest hmac_sha256(std::span<const std::byte> key, std::span<const std::byte> data) {
     // CNG refuses an empty HMAC secret; HMAC pads a short key with zeros
     // anyway, so one zero byte is the same key.

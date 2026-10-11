@@ -237,6 +237,14 @@ it says is taken on trust. Formats are in `relay/src/e2e.rs`,
   requests on for any role while the viewer is watching, and leaves the
   rest to the machine. Each message is at most about 342 KB, and there are
   at most 2 a second per dashboard and per viewer.
+- **Files:** requests and upload chunks are sealed like input, with their
+  own associated data. What the machine sends back (listings, progress,
+  download chunks) uses a fourth per-viewer key with its own counter,
+  because the relay queues it apart from everything else and may deliver it
+  out of order with the rest. Only passed on for control. The relay queues
+  file data per dashboard in a bounded queue, written after events and
+  video, and drops what overflows. It caps each message at about 171 KB and
+  each dashboard at 64 MB/s of uploads.
 - **Limits:** the relay can still refuse service, see who watches what and
   when, and delay a revocation it should pass on, though not past the
   share's expiry. A dashboard served by a compromised relay could be

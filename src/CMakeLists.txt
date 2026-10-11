@@ -15,6 +15,7 @@ add_executable(hawk-service
     service/config.cpp
     service/crypto.cpp
     service/e2e.cpp
+    service/files.cpp
     service/machine_identity.cpp
     service/machine_key.cpp
     service/websocket/websocket.cpp
@@ -37,6 +38,8 @@ target_link_libraries(hawk-service PRIVATE
     advapi32
     wtsapi32
     userenv
+    shell32
+    ole32
     crypt32
     ncrypt
     bcrypt

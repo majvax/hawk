@@ -51,6 +51,12 @@ pub struct ViewEnded {
 pub struct DashboardHandle {
     pub events: mpsc::UnboundedSender<Outbound>,
     pub frames: mpsc::Sender<Bytes>,
+    /// File-channel messages from machines: bounded like frames, and sent
+    /// after both events and frames, so a download never holds up the
+    /// picture. The machine keeps only a small window unacknowledged, so an
+    /// honest one never fills it; what overflows is dropped, and the
+    /// transfer stalls and is retried from where it got to.
+    pub files: mpsc::Sender<DashboardEvent>,
     pub user_id: i64,
     pub session_id: i64,
     pub email: String,
@@ -93,7 +99,7 @@ impl Device {
 
 /// What the machine sent for one of its viewers.
 pub enum Answer {
-    Accept { statement: String, signature: String, wrapped_key: String, clipboard: &'static str },
+    Accept { statement: String, signature: String, wrapped_key: String, clipboard: &'static str, files: bool },
     Reject { reason: String },
     StreamKey { wrapped_key: String },
     Clipboard { sealed: String },
@@ -418,6 +424,33 @@ impl Registry {
         true
     }
 
+    /// Passes a sealed file-channel message on to the machine if this
+    /// dashboard may control it and is watching it. Returns whether it was.
+    pub fn file(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
+        let may_control = inner
+            .dashboards
+            .get(&dashboard_id)
+            .and_then(|dashboard| dashboard.access.get(machine_id))
+            .is_some_and(|row| row.role >= Role::Control);
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !may_control || !device.viewers.contains_key(&dashboard_id) {
+            return false;
+        }
+        device.send(DeviceCommand::File { viewer: dashboard_id, sealed });
+        true
+    }
+
+    /// Queues a machine's file-channel message for one of its viewers,
+    /// without waiting: false when that viewer isn't watching or its file
+    /// queue is full.
+    pub fn forward_file(&self, machine_id: &str, viewer: DashboardId, sealed: String) -> bool {
+        let inner = self.lock();
+        let watching = inner.devices.get(machine_id).is_some_and(|device| device.viewers.contains_key(&viewer));
+        let Some(dashboard) = inner.dashboards.get(&viewer).filter(|_| watching) else { return false };
+        dashboard.handle.files.try_send(DashboardEvent::File { device_id: machine_id.to_owned(), sealed }).is_ok()
+    }
+
     /// Routes the machine's answer to one of its viewers. A refused viewer
     /// stops being sent frames, and is told why.
     pub fn answer(&self, machine_id: &str, viewer: DashboardId, answer: Answer) {
@@ -428,8 +461,8 @@ impl Registry {
         }
         let device_id = machine_id.to_owned();
         let event = match answer {
-            Answer::Accept { statement, signature, wrapped_key, clipboard } => {
-                DashboardEvent::ViewAccepted { device_id, statement, signature, wrapped_key, clipboard }
+            Answer::Accept { statement, signature, wrapped_key, clipboard, files } => {
+                DashboardEvent::ViewAccepted { device_id, statement, signature, wrapped_key, clipboard, files }
             }
             Answer::StreamKey { wrapped_key } => DashboardEvent::StreamKey { device_id, wrapped_key },
             Answer::Clipboard { sealed } => DashboardEvent::Clipboard { device_id, sealed },
@@ -572,8 +605,15 @@ mod tests {
     fn handle(user_id: i64) -> (DashboardHandle, mpsc::UnboundedReceiver<Outbound>) {
         let (events, events_rx) = mpsc::unbounded_channel();
         let (frames, _) = mpsc::channel(1);
-        let handle =
-            DashboardHandle { events, frames, user_id, session_id: user_id, email: format!("user{user_id}@example.com") };
+        let (files, _) = mpsc::channel(1);
+        let handle = DashboardHandle {
+            events,
+            frames,
+            files,
+            user_id,
+            session_id: user_id,
+            email: format!("user{user_id}@example.com"),
+        };
         (handle, events_rx)
     }
 
@@ -708,6 +748,43 @@ mod tests {
         let Ok(Outbound::Event(event)) = events.try_recv() else { panic!("no clipboard event") };
         assert!(matches!(*event, DashboardEvent::Clipboard { ref sealed, .. } if sealed == "text"));
         assert!(other_events.try_recv().is_err());
+    }
+
+    /// Files need control, and an open view.
+    #[test]
+    fn file_requests_need_control() {
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::View);
+        assert!(!registry.file(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
+        assert!(registry.file(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::File { viewer, .. }) if viewer == dashboard));
+        registry.stop_view(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.file(dashboard, MACHINE, "sealed".to_owned()));
+    }
+
+    /// File data goes on the bounded queue of the viewer it's for, and is
+    /// dropped rather than queued without limit.
+    #[test]
+    fn file_data_is_bounded() {
+        let registry = Registry::default();
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let (frames, _frames_rx) = mpsc::channel(1);
+        let (files, mut files_rx) = mpsc::channel(2);
+        let handle =
+            DashboardHandle { events, frames, files, user_id: 2, session_id: 2, email: "user2@example.com".to_owned() };
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::Control)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, outbound);
+        assert!(!registry.forward_file(MACHINE, dashboard, "early".to_owned()));
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+
+        assert!(registry.forward_file(MACHINE, dashboard, "a".to_owned()));
+        assert!(registry.forward_file(MACHINE, dashboard, "b".to_owned()));
+        assert!(!registry.forward_file(MACHINE, dashboard, "c".to_owned()));
+        assert!(matches!(files_rx.try_recv(), Ok(DashboardEvent::File { ref sealed, .. }) if sealed == "a"));
     }
 
     /// Answers only go to a dashboard that is watching that machine.

@@ -222,6 +222,7 @@ const CLIPBOARD_SET = 1;
 const CLIPBOARD_GET = 2;
 const CLIPBOARD_TEXT = 3;
 const CLIPBOARD_PUSH = 4;
+const FILE_AAD = utf8("hawk-file-v1");
 // Stream keys kept around after a newer one arrives, for frames already in
 // flight under the old one.
 const KEEP_STREAM_KEYS = 2;
@@ -241,6 +242,10 @@ export class ViewSession {
   private wrapKey: CryptoKey | null = null;
   // Opens what the machine sends this viewer alone (clipboard text).
   private replyKey: CryptoKey | null = null;
+  // And file-channel messages, which the relay queues apart from the rest,
+  // so they have a key and a counter of their own.
+  private fileKey: CryptoKey | null = null;
+  private fileCounter = 0n;
   private readonly streamKeys = new Map<number, CryptoKey>();
   // Numbers input events and clipboard requests alike: the machine keeps
   // one counter for both.
@@ -292,10 +297,11 @@ export class ViewSession {
       throw new Error("the machine's answer doesn't match this request");
     }
     const shared = await exchange(this.exchangeKey.privateKey, fromBase64(ephemeral));
-    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 96);
+    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 128);
     this.inputKey = await aesKey(keys.slice(0, 32), ["encrypt"]);
     this.wrapKey = await aesKey(keys.slice(32, 64), ["decrypt"]);
     this.replyKey = await aesKey(keys.slice(64, 96), ["decrypt"]);
+    this.fileKey = await aesKey(keys.slice(96, 128), ["decrypt"]);
     this.role = role;
     await this.addStreamKey(answer.wrappedKey);
     this.settle(true);
@@ -378,6 +384,39 @@ export class ViewSession {
       if (op !== CLIPBOARD_TEXT && op !== CLIPBOARD_PUSH) return null;
       this.replyCounter = counter;
       return { text: new TextDecoder().decode(plain.slice(1)), pushed: op === CLIPBOARD_PUSH };
+    } catch {
+      return null;
+    }
+  }
+
+  // Seals a file-channel message: op, header length, the JSON header, then
+  // file data. Numbered from the input counter like everything sent.
+  sealFile(op: number, header: object, data?: Uint8Array): Promise<string> | null {
+    const json = utf8(JSON.stringify(header));
+    if (json.length > 0xffff) return null;
+    const preamble = new Uint8Array([op, json.length >> 8, json.length & 0xff]);
+    return this.sealRequest(concat(preamble, json, data ?? new Uint8Array(0)), FILE_AAD);
+  }
+
+  // A file-channel message from the machine; null for anything that
+  // doesn't open or was seen before. Must be called in the order the
+  // messages arrived.
+  async openFile(sealed: string): Promise<{ op: number; header: unknown; data: Uint8Array<ArrayBuffer> } | null> {
+    const key = this.fileKey;
+    if (key === null) return null;
+    try {
+      const bytes = fromBase64(sealed);
+      if (bytes.length < 8 + 16) return null;
+      const counter = new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(0);
+      if (counter <= this.fileCounter) return null;
+      const iv = concat(bytes.slice(0, 8), new Uint8Array(4));
+      const plain = await aesDecrypt(key, iv, bytes.slice(8), FILE_AAD);
+      if (counter <= this.fileCounter || plain.length < 3) return null;
+      this.fileCounter = counter;
+      const headerSize = ((plain[1] ?? 0) << 8) | (plain[2] ?? 0);
+      if (plain.length < 3 + headerSize) return null;
+      const header: unknown = JSON.parse(new TextDecoder().decode(plain.slice(3, 3 + headerSize)));
+      return { op: plain[0] ?? 0, header, data: plain.slice(3 + headerSize) };
     } catch {
       return null;
     }

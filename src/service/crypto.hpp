@@ -49,6 +49,24 @@ void random(std::span<std::byte> out);
 [[nodiscard]] bool ecdsa_verify(std::span<const std::byte> public_key, std::span<const std::byte> message,
                                 std::span<const std::byte> signature);
 
+// SHA-256 over data that arrives in pieces, such as a file read in chunks.
+class Sha256Stream {
+public:
+    Sha256Stream();
+    Sha256Stream(Sha256Stream&&) noexcept;
+    Sha256Stream& operator=(Sha256Stream&&) noexcept;
+    Sha256Stream(const Sha256Stream&) = delete;
+    Sha256Stream& operator=(const Sha256Stream&) = delete;
+    ~Sha256Stream();
+
+    void update(std::span<const std::byte> data);
+    // The digest of everything so far; the stream starts over after it.
+    [[nodiscard]] Sha256Digest finish();
+
+private:
+    void* hash_ = nullptr;  // BCRYPT_HASH_HANDLE
+};
+
 // An AES-256-GCM key. Not safe to use from two threads at once.
 class AesGcm {
 public:

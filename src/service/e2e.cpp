@@ -35,6 +35,10 @@ constexpr std::string_view kAcceptContext = "hawk-accept-v1";
 constexpr std::string_view kStreamKeyAad = "hawk-stream-key-v1";
 constexpr std::string_view kInputAad = "hawk-input-v1";
 constexpr std::string_view kClipboardAad = "hawk-clipboard-v1";
+constexpr std::string_view kFileAad = "hawk-file-v1";
+// A file-channel plaintext: op, header length (u16, big-endian), the JSON
+// header, then file data.
+constexpr std::size_t kFilePreamble = 3;
 
 // The first byte of a sealed clipboard message; UTF-8 text follows it.
 // Viewer to machine: set (with text) or get (without). Machine to viewer:
@@ -248,6 +252,8 @@ struct AcceptMessage {
     // For the dashboard to show the right buttons; the machine checks for
     // itself on every request.
     std::string clipboard;
+    // Whether this viewer may send and fetch files. Likewise only a hint.
+    bool files = false;
 };
 
 struct RejectMessage {
@@ -268,6 +274,12 @@ struct ClipboardMessage {
     std::string   sealed;
 };
 
+struct FileOutMessage {
+    std::string   type = "file";
+    std::uint64_t viewer = 0;
+    std::string   sealed;
+};
+
 }  // namespace
 
 }  // namespace hawk::service
@@ -283,7 +295,8 @@ template <>
 struct glz::meta<hawk::service::AcceptMessage> {
     using T                     = hawk::service::AcceptMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "statement", &T::statement,
-                                         "signature", &T::signature, "wrapped_key", &T::wrapped_key, "clipboard", &T::clipboard);
+                                         "signature", &T::signature, "wrapped_key", &T::wrapped_key, "clipboard", &T::clipboard,
+                                         "files", &T::files);
 };
 
 template <>
@@ -301,6 +314,12 @@ struct glz::meta<hawk::service::StreamKeyMessage> {
 template <>
 struct glz::meta<hawk::service::ClipboardMessage> {
     using T                     = hawk::service::ClipboardMessage;
+    static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "sealed", &T::sealed);
+};
+
+template <>
+struct glz::meta<hawk::service::FileOutMessage> {
+    using T                     = hawk::service::FileOutMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "sealed", &T::sealed);
 };
 
@@ -489,6 +508,11 @@ struct Viewer {
     // under nonces from its own counter.
     crypto::AesGcm               reply_key;
     std::uint64_t                reply_counter = 0;
+    // The same for file data, which the relay queues apart from everything
+    // else (and so may deliver out of order with it): a key and counter of
+    // its own.
+    crypto::AesGcm               file_key;
+    std::uint64_t                file_counter = 0;
     // Shared by input and clipboard requests, which the dashboard numbers
     // from one counter.
     std::uint64_t                last_counter = 0;
@@ -564,6 +588,7 @@ struct ViewerHub::Impl {
     std::optional<crypto::Bytes> owner_key;
     std::string                  owner_key_text;
     ClipboardConfig              clipboard;
+    bool                         files_enabled = false;
     Sender                       send;
 
     std::mutex                       mutex;
@@ -573,13 +598,20 @@ struct ViewerHub::Impl {
     std::chrono::steady_clock::time_point last_expiry_check{};
 
     Impl(const MachineKey& key, std::string id, std::optional<crypto::Bytes> owner, ClipboardConfig clipboard_config,
-         Sender sender)
+         bool files, Sender sender)
         : machine_key(key),
           machine_id(std::move(id)),
           owner_key(std::move(owner)),
           owner_key_text(owner_key.has_value() ? crypto::base64_encode(*owner_key) : std::string{}),
           clipboard(clipboard_config),
+          files_enabled(files),
           send(std::move(sender)) {}
+
+    // Files go both ways at once, and a write to the machine's disk is a
+    // write: control, always.
+    [[nodiscard]] bool may_use_files(const Viewer& viewer) const {
+        return files_enabled && !viewer.refused && viewer.role != "view";
+    }
 
     [[nodiscard]] bool may_set_clipboard(const Viewer& viewer) const {
         return clipboard.mode != ClipboardMode::off && viewer.role != "view";
@@ -748,8 +780,9 @@ struct ViewerHub::Impl {
 };
 
 ViewerHub::ViewerHub(const MachineKey& key, std::string machine_id, std::optional<crypto::Bytes> owner_key,
-                     ClipboardConfig clipboard, Sender send)
-    : impl_(std::make_unique<Impl>(key, std::move(machine_id), std::move(owner_key), clipboard, std::move(send))) {}
+                     ClipboardConfig clipboard, bool files_enabled, Sender send)
+    : impl_(std::make_unique<Impl>(key, std::move(machine_id), std::move(owner_key), clipboard, files_enabled,
+                                   std::move(send))) {}
 
 ViewerHub::~ViewerHub() = default;
 
@@ -793,15 +826,17 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     const auto join_hash = crypto::sha256(crypto::as_bytes(request.statement));
     // HKDF output is a prefix of any longer output: the first 64 bytes are
     // the input and wrap keys whatever length is asked for.
-    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 96);
+    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 128);
     auto input_key = crypto::AesGcm::create(std::span(keys).first(32));
     auto wrap_key = crypto::AesGcm::create(std::span(keys).subspan(32, 32));
     auto reply_key = crypto::AesGcm::create(std::span(keys).subspan(64, 32));
+    auto file_key = crypto::AesGcm::create(std::span(keys).subspan(96, 32));
     const auto accept = std::format("{}\nmachine={}\njoin={}\nephemeral={}\nrole={}", kAcceptContext, impl.machine_id,
                                     crypto::base64_encode(join_hash), crypto::base64_encode(exchange->public_key()),
                                     admission->role);
     const auto signature = impl.machine_key.sign(crypto::as_bytes(accept));
-    if (!input_key.has_value() || !wrap_key.has_value() || !reply_key.has_value() || !signature.has_value()) {
+    if (!input_key.has_value() || !wrap_key.has_value() || !reply_key.has_value() || !file_key.has_value() ||
+        !signature.has_value()) {
         impl.reject(viewer, "the machine couldn't sign its answer");
         return;
     }
@@ -814,6 +849,7 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
         .input_key = std::move(*input_key),
         .wrap_key = std::move(*wrap_key),
         .reply_key = std::move(*reply_key),
+        .file_key = std::move(*file_key),
         .grant_issued = admission->grant_issued,
         .not_after = admission->not_after,
         .single_view_grant = admission->single_view_grant,
@@ -826,13 +862,15 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     }
     const auto wrapped = impl.wrap_stream_key(session);
     auto       clipboard = impl.clipboard_access(session);
+    const bool files = impl.may_use_files(session);
     spdlog::info("e2e: viewer {} ({}) admitted as {}", viewer, session.fingerprint, admission->role);
     impl.viewers.insert_or_assign(viewer, std::move(session));
     impl.send(to_json(AcceptMessage{.viewer = viewer,
                                     .statement = accept,
                                     .signature = crypto::base64_encode(*signature),
                                     .wrapped_key = wrapped,
-                                    .clipboard = std::move(clipboard)}));
+                                    .clipboard = std::move(clipboard),
+                                    .files = files}));
 }
 
 std::vector<ipc::InputPacket> ViewerHub::leave(std::uint64_t viewer) {
@@ -958,6 +996,70 @@ void ViewerHub::deliver_clipboard(std::string_view text, bool pushed) {
         impl.send(to_json(ClipboardMessage{
             .viewer = id, .sealed = Impl::seal_reply(viewer, pushed ? kClipboardPush : kClipboardText, prefix)}));
     }
+}
+
+std::optional<FileMessage> ViewerHub::file(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !impl.may_use_files(found->second)) {
+        return std::nullopt;
+    }
+    auto plain = Impl::open_request(found->second, sealed, kFileAad);
+    if (!plain.has_value() || plain->size() < kFilePreamble) {
+        return std::nullopt;
+    }
+    const auto header_size =
+        (std::to_integer<std::size_t>((*plain)[1]) << 8U) | std::to_integer<std::size_t>((*plain)[2]);
+    if (plain->size() < kFilePreamble + header_size) {
+        return std::nullopt;
+    }
+    FileMessage message;
+    message.op = std::to_integer<std::uint8_t>(plain->front());
+    message.header.assign(reinterpret_cast<const char*>(plain->data()) + kFilePreamble, header_size);
+    message.data.assign(plain->begin() + static_cast<std::ptrdiff_t>(kFilePreamble + header_size), plain->end());
+    return message;
+}
+
+bool ViewerHub::send_file(std::uint64_t viewer, const FileMessage& message) {
+    if (message.header.size() > 0xFFFFU) {
+        return false;
+    }
+    auto&            impl = *impl_;
+    std::unique_lock lock(impl.mutex);
+    const auto       found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !impl.may_use_files(found->second)) {
+        return false;
+    }
+    Viewer&       session = found->second;
+    crypto::Bytes plain;
+    plain.reserve(kFilePreamble + message.header.size() + message.data.size());
+    plain.push_back(std::byte{message.op});
+    plain.push_back(static_cast<std::byte>(message.header.size() >> 8U));
+    plain.push_back(static_cast<std::byte>(message.header.size() & 0xFFU));
+    const auto header = std::as_bytes(std::span(message.header));
+    plain.insert(plain.end(), header.begin(), header.end());
+    plain.insert(plain.end(), message.data.begin(), message.data.end());
+
+    const auto    counter = ++session.file_counter;
+    crypto::Bytes out;
+    put_u64_be(out, counter);
+    const auto sealed = session.file_key.encrypt(counter_nonce(counter), plain, crypto::as_bytes(kFileAad));
+    out.insert(out.end(), sealed.begin(), sealed.end());
+    auto json = to_json(FileOutMessage{.viewer = viewer, .sealed = crypto::base64_encode(out)});
+    // Sent outside the lock: a chunk takes a while on a slow link, and the
+    // capture thread seals frames under this lock. File messages are only
+    // ever sent from FileTransfers' one thread, so they stay in order.
+    lock.unlock();
+    impl.send(json);
+    return true;
+}
+
+std::string ViewerHub::fingerprint_of(std::uint64_t viewer) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    return found == impl.viewers.end() ? std::string{} : found->second.fingerprint;
 }
 
 void ViewerHub::apply_revocations(const std::vector<SignedStatement>& revocations) {
