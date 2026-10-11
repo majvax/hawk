@@ -1,5 +1,7 @@
 #include "files.hpp"
 
+#include "win_util.hpp"
+
 #include <windows.h>
 #include <knownfolders.h>
 #include <shlobj.h>
@@ -31,6 +33,12 @@ namespace hawk::service {
 
 namespace {
 
+using win::Impersonation;
+using win::UniqueHandle;
+using win::to_utf8;
+using win::to_wide;
+using win::user_token;
+
 // What one chunk carries, and how many may be unacknowledged at once:
 // half a megabyte in flight per transfer, whatever the link.
 constexpr std::size_t kChunkSize = 64 * 1024;
@@ -56,82 +64,6 @@ constexpr std::wstring_view kPartialPrefix = L".hawk-";
 constexpr std::wstring_view kPartialSuffix = L".part";
 
 using Clock = std::chrono::steady_clock;
-
-class UniqueHandle {
-public:
-    UniqueHandle() = default;
-    explicit UniqueHandle(HANDLE handle) noexcept : handle_(handle) {}
-    ~UniqueHandle() { reset(); }
-    UniqueHandle(UniqueHandle&& other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
-    UniqueHandle& operator=(UniqueHandle&& other) noexcept {
-        if (this != &other) {
-            reset(std::exchange(other.handle_, nullptr));
-        }
-        return *this;
-    }
-    UniqueHandle(const UniqueHandle&) = delete;
-    UniqueHandle& operator=(const UniqueHandle&) = delete;
-
-    [[nodiscard]] HANDLE get() const noexcept { return handle_; }
-    [[nodiscard]] explicit operator bool() const noexcept {
-        return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE;
-    }
-    void reset(HANDLE handle = nullptr) noexcept {
-        if (*this) {
-            CloseHandle(handle_);
-        }
-        handle_ = handle;
-    }
-
-private:
-    HANDLE handle_ = nullptr;
-};
-
-// Runs the calling thread as the logged-on user until destroyed. Handles
-// opened meanwhile keep the access they were opened with afterwards.
-class Impersonation {
-public:
-    explicit Impersonation(HANDLE token) : ok_(ImpersonateLoggedOnUser(token) != FALSE) {}
-    ~Impersonation() {
-        if (ok_) {
-            RevertToSelf();
-        }
-    }
-    Impersonation(const Impersonation&) = delete;
-    Impersonation& operator=(const Impersonation&) = delete;
-    Impersonation(Impersonation&&) = delete;
-    Impersonation& operator=(Impersonation&&) = delete;
-
-    [[nodiscard]] bool ok() const noexcept { return ok_; }
-
-private:
-    bool ok_;
-};
-
-[[nodiscard]] std::optional<std::wstring> to_wide(std::string_view text) {
-    if (text.empty()) {
-        return std::wstring{};
-    }
-    const int length =
-        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
-    if (length <= 0) {
-        return std::nullopt;
-    }
-    std::wstring wide(static_cast<std::size_t>(length), L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), wide.data(), length);
-    return wide;
-}
-
-[[nodiscard]] std::string to_utf8(std::wstring_view text) {
-    if (text.empty()) {
-        return {};
-    }
-    const int length =
-        WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-    std::string utf8(static_cast<std::size_t>(std::max(length, 0)), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), utf8.data(), length, nullptr, nullptr);
-    return utf8;
-}
 
 [[nodiscard]] std::string hex(std::span<const std::byte> bytes) {
     std::string text;
@@ -363,7 +295,7 @@ struct Download {
 
 struct Request {
     std::uint64_t viewer = 0;
-    FileMessage   message;
+    ChannelMessage   message;
 };
 
 struct Drop {
@@ -443,7 +375,7 @@ struct FileTransfers::Impl {
     // --- replies --------------------------------------------------------------
 
     void reply(std::uint64_t viewer, std::uint8_t op, const auto& header, std::span<const std::byte> data = {}) {
-        FileMessage message{.op = op, .header = to_json(header), .data = {data.begin(), data.end()}};
+        ChannelMessage message{.op = op, .header = to_json(header), .data = {data.begin(), data.end()}};
         hub.send_file(viewer, message);
     }
 
@@ -453,16 +385,6 @@ struct FileTransfers::Impl {
     }
 
     // --- the user's side of things ---------------------------------------------
-
-    // The logged-on user's token, which every file operation runs under.
-    [[nodiscard]] static UniqueHandle user_token() {
-        HANDLE token = nullptr;
-        const DWORD session = WTSGetActiveConsoleSessionId();
-        if (session == 0xFFFFFFFF || WTSQueryUserToken(session, &token) == FALSE) {
-            return {};
-        }
-        return UniqueHandle(token);
-    }
 
     // The drop directory, created if it isn't there. Resolved as the user:
     // their Downloads folder, or their environment in a configured path.
@@ -522,7 +444,7 @@ struct FileTransfers::Impl {
 
     // --- requests ---------------------------------------------------------------
 
-    void serve(std::uint64_t viewer, const FileMessage& message) {
+    void serve(std::uint64_t viewer, const ChannelMessage& message) {
         RequestHeader header;
         if (glz::read<glz::opts{.error_on_unknown_keys = false}>(header, message.header)) {
             return;
@@ -601,7 +523,7 @@ struct FileTransfers::Impl {
             listing.files.resize(listing.files.size() * 3 / 4);
             json = to_json(listing);
         }
-        hub.send_file(viewer, FileMessage{.op = file_op::listing, .header = std::move(json), .data = {}});
+        hub.send_file(viewer, ChannelMessage{.op = file_op::listing, .header = std::move(json), .data = {}});
     }
 
     [[nodiscard]] std::size_t count_for(const auto& transfers, std::uint64_t viewer) const {
@@ -873,7 +795,7 @@ struct FileTransfers::Impl {
                     gone = true;
                     break;
                 }
-                const FileMessage message{.op = file_op::data,
+                const ChannelMessage message{.op = file_op::data,
                                           .header = to_json(ReplyHeader{.id = key.second, .offset = download.sent}),
                                           .data = {buffer.begin(), buffer.begin() + read}};
                 if (!hub.send_file(key.first, message)) {
@@ -905,7 +827,7 @@ FileTransfers::FileTransfers(FilesConfig config, ViewerHub& hub)
 
 FileTransfers::~FileTransfers() = default;
 
-void FileTransfers::handle(std::uint64_t viewer, FileMessage message) {
+void FileTransfers::handle(std::uint64_t viewer, ChannelMessage message) {
     impl_->push(Request{.viewer = viewer, .message = std::move(message)});
 }
 

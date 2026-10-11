@@ -26,9 +26,11 @@ import { type PinStatus, checkContact, trustContact } from "../keystore.js";
 import type { Machine } from "../protocol.js";
 import { Alert, ConfirmButton, Segmented, Tag, errorMessage } from "../ui.js";
 
+// dev: a shell (and files, where the machine allows them), no screen.
 const SHARE_ROLES = [
   ["view", "View only"],
   ["control", "Can control"],
+  ["dev", "Shell only"],
 ] as const;
 
 type Duration = "forever" | "30m" | "1h" | "2h" | "8h" | "1d" | "1w" | "until";

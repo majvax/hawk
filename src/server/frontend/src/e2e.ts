@@ -223,9 +223,42 @@ const CLIPBOARD_GET = 2;
 const CLIPBOARD_TEXT = 3;
 const CLIPBOARD_PUSH = 4;
 const FILE_AAD = utf8("hawk-file-v1");
+const SHELL_AAD = utf8("hawk-shell-v1");
+
+// One file- or shell-channel message from the machine, opened.
+export interface ChannelMessage {
+  op: number;
+  header: unknown;
+  data: Uint8Array<ArrayBuffer>;
+}
 // Stream keys kept around after a newer one arrives, for frames already in
 // flight under the old one.
 const KEEP_STREAM_KEYS = 2;
+
+// counter || ciphertext from the machine, opened: null for anything that
+// doesn't open, or whose counter isn't past `last`.
+async function openChannel(
+  key: CryptoKey,
+  sealed: string,
+  aad: Uint8Array<ArrayBuffer>,
+  last: bigint,
+): Promise<{ counter: bigint; message: ChannelMessage } | null> {
+  try {
+    const bytes = fromBase64(sealed);
+    if (bytes.length < 8 + 16) return null;
+    const counter = new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(0);
+    if (counter <= last) return null;
+    const iv = concat(bytes.slice(0, 8), new Uint8Array(4));
+    const plain = await aesDecrypt(key, iv, bytes.slice(8), aad);
+    if (plain.length < 3) return null;
+    const headerSize = ((plain[1] ?? 0) << 8) | (plain[2] ?? 0);
+    if (plain.length < 3 + headerSize) return null;
+    const header: unknown = JSON.parse(new TextDecoder().decode(plain.slice(3, 3 + headerSize)));
+    return { counter, message: { op: plain[0] ?? 0, header, data: plain.slice(3 + headerSize) } };
+  } catch {
+    return null;
+  }
+}
 
 export class ViewSession {
   readonly join: SignedStatement;
@@ -246,6 +279,9 @@ export class ViewSession {
   // so they have a key and a counter of their own.
   private fileKey: CryptoKey | null = null;
   private fileCounter = 0n;
+  // And shell output, likewise.
+  private shellKey: CryptoKey | null = null;
+  private shellCounter = 0n;
   private readonly streamKeys = new Map<number, CryptoKey>();
   // Numbers input events and clipboard requests alike: the machine keeps
   // one counter for both.
@@ -292,18 +328,20 @@ export class ViewSession {
       fields.get("machine") !== this.machineId ||
       fields.get("join") !== toBase64(joinHash) ||
       ephemeral === undefined ||
-      (role !== "owner" && role !== "control" && role !== "view")
+      (role !== "owner" && role !== "control" && role !== "view" && role !== "dev")
     ) {
       throw new Error("the machine's answer doesn't match this request");
     }
     const shared = await exchange(this.exchangeKey.privateKey, fromBase64(ephemeral));
-    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 128);
+    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 160);
     this.inputKey = await aesKey(keys.slice(0, 32), ["encrypt"]);
     this.wrapKey = await aesKey(keys.slice(32, 64), ["decrypt"]);
     this.replyKey = await aesKey(keys.slice(64, 96), ["decrypt"]);
     this.fileKey = await aesKey(keys.slice(96, 128), ["decrypt"]);
+    this.shellKey = await aesKey(keys.slice(128, 160), ["decrypt"]);
     this.role = role;
-    await this.addStreamKey(answer.wrappedKey);
+    // A dev viewer doesn't watch the screen, and is never given its key.
+    if (answer.wrappedKey !== "") await this.addStreamKey(answer.wrappedKey);
     this.settle(true);
   }
 
@@ -392,34 +430,42 @@ export class ViewSession {
   // Seals a file-channel message: op, header length, the JSON header, then
   // file data. Numbered from the input counter like everything sent.
   sealFile(op: number, header: object, data?: Uint8Array): Promise<string> | null {
-    const json = utf8(JSON.stringify(header));
-    if (json.length > 0xffff) return null;
-    const preamble = new Uint8Array([op, json.length >> 8, json.length & 0xff]);
-    return this.sealRequest(concat(preamble, json, data ?? new Uint8Array(0)), FILE_AAD);
+    return this.sealChannel(op, header, data, FILE_AAD);
+  }
+
+  // The same for the shell channel (dev and owner).
+  sealShell(op: number, header: object, data?: Uint8Array): Promise<string> | null {
+    return this.sealChannel(op, header, data, SHELL_AAD);
   }
 
   // A file-channel message from the machine; null for anything that
   // doesn't open or was seen before. Must be called in the order the
   // messages arrived.
-  async openFile(sealed: string): Promise<{ op: number; header: unknown; data: Uint8Array<ArrayBuffer> } | null> {
+  async openFile(sealed: string): Promise<ChannelMessage | null> {
     const key = this.fileKey;
     if (key === null) return null;
-    try {
-      const bytes = fromBase64(sealed);
-      if (bytes.length < 8 + 16) return null;
-      const counter = new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(0);
-      if (counter <= this.fileCounter) return null;
-      const iv = concat(bytes.slice(0, 8), new Uint8Array(4));
-      const plain = await aesDecrypt(key, iv, bytes.slice(8), FILE_AAD);
-      if (counter <= this.fileCounter || plain.length < 3) return null;
-      this.fileCounter = counter;
-      const headerSize = ((plain[1] ?? 0) << 8) | (plain[2] ?? 0);
-      if (plain.length < 3 + headerSize) return null;
-      const header: unknown = JSON.parse(new TextDecoder().decode(plain.slice(3, 3 + headerSize)));
-      return { op: plain[0] ?? 0, header, data: plain.slice(3 + headerSize) };
-    } catch {
-      return null;
-    }
+    const opened = await openChannel(key, sealed, FILE_AAD, this.fileCounter);
+    if (opened === null || opened.counter <= this.fileCounter) return null;
+    this.fileCounter = opened.counter;
+    return opened.message;
+  }
+
+  // The same for the shell channel.
+  async openShell(sealed: string): Promise<ChannelMessage | null> {
+    const key = this.shellKey;
+    if (key === null) return null;
+    const opened = await openChannel(key, sealed, SHELL_AAD, this.shellCounter);
+    if (opened === null || opened.counter <= this.shellCounter) return null;
+    this.shellCounter = opened.counter;
+    return opened.message;
+  }
+
+  // op, header length, the JSON header, then bytes.
+  private sealChannel(op: number, header: object, data: Uint8Array | undefined, aad: Uint8Array<ArrayBuffer>) {
+    const json = utf8(JSON.stringify(header));
+    if (json.length > 0xffff) return null;
+    const preamble = new Uint8Array([op, json.length >> 8, json.length & 0xff]);
+    return this.sealRequest(concat(preamble, json, data ?? new Uint8Array(0)), aad);
   }
 
   private sealRequest(plain: Uint8Array<ArrayBuffer>, aad: Uint8Array<ArrayBuffer>): Promise<string> | null {

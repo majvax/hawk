@@ -32,9 +32,15 @@ struct FilesTable {
     std::optional<std::uint64_t> max_size;
 };
 
+struct ShellTable {
+    std::optional<bool>        enabled;
+    std::optional<std::string> command;
+};
+
 struct ConfigFile {
     std::vector<ClipboardTable> clipboard;
     std::vector<FilesTable>     files;
+    std::vector<ShellTable>     shell;
 };
 
 }  // namespace
@@ -54,9 +60,15 @@ struct glz::meta<hawk::service::FilesTable> {
 };
 
 template <>
+struct glz::meta<hawk::service::ShellTable> {
+    using T                     = hawk::service::ShellTable;
+    static constexpr auto value = object("enabled", &T::enabled, "command", &T::command);
+};
+
+template <>
 struct glz::meta<hawk::service::ConfigFile> {
     using T                     = hawk::service::ConfigFile;
-    static constexpr auto value = object("clipboard", &T::clipboard, "files", &T::files);
+    static constexpr auto value = object("clipboard", &T::clipboard, "files", &T::files, "shell", &T::shell);
 };
 
 namespace hawk::service {
@@ -128,6 +140,27 @@ namespace {
     return config;
 }
 
+[[nodiscard]] std::optional<ShellConfig> shell_config(const std::vector<ShellTable>& tables) {
+    ShellConfig config;
+    if (tables.empty()) {
+        return config;
+    }
+    if (tables.size() > 1) {
+        spdlog::error("config: {} has more than one [[shell]] table", kConfigPath.string());
+        return std::nullopt;
+    }
+    const auto& table = tables.front();
+    if (table.command.has_value()) {
+        if (table.command->find_first_not_of(" \t") == std::string::npos) {
+            spdlog::error("config: shell command is empty");
+            return std::nullopt;
+        }
+        config.command = *table.command;
+    }
+    config.enabled = table.enabled.value_or(config.enabled);
+    return config;
+}
+
 }  // namespace
 
 MachineConfig load_machine_config() {
@@ -145,10 +178,11 @@ MachineConfig load_machine_config() {
 
     ConfigFile parsed;
     if (const auto error = glz::read_toml(parsed, text); error) {
-        spdlog::error("config: {} doesn't parse ({}); the clipboard and file transfer are off", kConfigPath.string(),
+        spdlog::error("config: {} doesn't parse ({}); the clipboard, file transfer and shell are off", kConfigPath.string(),
                       glz::format_error(error, text));
         config.clipboard.mode = ClipboardMode::off;
         config.files.enabled = false;
+        config.shell.enabled = false;
         return config;
     }
     if (auto clipboard = clipboard_config(parsed.clipboard); clipboard.has_value()) {
@@ -162,6 +196,12 @@ MachineConfig load_machine_config() {
     } else {
         spdlog::error("config: file transfer is off until {} is fixed", kConfigPath.string());
         config.files.enabled = false;
+    }
+    if (auto shell = shell_config(parsed.shell); shell.has_value()) {
+        config.shell = *shell;
+    } else {
+        spdlog::error("config: the shell is off until {} is fixed", kConfigPath.string());
+        config.shell.enabled = false;
     }
     return config;
 }

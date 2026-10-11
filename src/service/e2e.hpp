@@ -61,10 +61,11 @@ struct ClipboardRequest {
     std::string text;  // set: valid UTF-8, within the configured max_size
 };
 
-// One message of the file channel, either way, once opened: what it is,
-// a JSON header saying which transfer and where, and file data. See
-// files.hpp for the ops.
-struct FileMessage {
+// One message of the file or shell channel, either way, once opened: what
+// it is, a JSON header saying which transfer or shell and where, and bytes
+// (file data, terminal input or output). See files.hpp and shell.hpp for
+// the ops.
+struct ChannelMessage {
     std::uint8_t  op = 0;
     std::string   header;
     crypto::Bytes data;
@@ -85,7 +86,7 @@ public:
     // `owner_key` is empty for a machine enrolled before end-to-end
     // encryption, which refuses every viewer until it's enrolled again.
     ViewerHub(const MachineKey& key, std::string machine_id, std::optional<crypto::Bytes> owner_key,
-              ClipboardConfig clipboard, bool files_enabled, Sender send);
+              const MachineConfig& config, Sender send);
     ~ViewerHub();
     ViewerHub(const ViewerHub&) = delete;
     ViewerHub& operator=(const ViewerHub&) = delete;
@@ -117,11 +118,16 @@ public:
 
     // Opens one sealed file-channel message; returns it if it's genuine,
     // new, and from a viewer with control while file transfer is on.
-    [[nodiscard]] std::optional<FileMessage> file(std::uint64_t viewer, std::string_view sealed);
+    [[nodiscard]] std::optional<ChannelMessage> file(std::uint64_t viewer, std::string_view sealed);
 
     // Seals a file-channel message for one viewer and sends it. False when
     // that viewer is gone, refused, or no longer allowed files.
-    bool send_file(std::uint64_t viewer, const FileMessage& message);
+    bool send_file(std::uint64_t viewer, const ChannelMessage& message);
+
+    // The same for the shell channel: owner and dev viewers only, while the
+    // config has the shell on.
+    [[nodiscard]] std::optional<ChannelMessage> shell(std::uint64_t viewer, std::string_view sealed);
+    bool send_shell(std::uint64_t viewer, const ChannelMessage& message);
 
     // "AB12 CD34 ..." for the viewer's identity key, for the log; empty
     // for a viewer that isn't here.

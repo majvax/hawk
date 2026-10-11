@@ -113,6 +113,30 @@ const MIGRATIONS: &[&str] = &["
         signature  BLOB    NOT NULL,
         created_at INTEGER NOT NULL
     );
+", "
+    -- A third share role, dev: a shell (and files), no video. SQLite can't
+    -- change a CHECK in place, so the table is rebuilt with the same rows.
+    CREATE TABLE machine_shares_new (
+        machine_id      INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+        user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role            TEXT    NOT NULL CHECK (role IN ('view', 'control', 'dev')),
+        created_at      INTEGER NOT NULL,
+        starts_at       INTEGER,
+        expires_at      INTEGER,
+        single_view     INTEGER NOT NULL DEFAULT 0,
+        grant_statement TEXT,
+        grant_signature BLOB,
+        PRIMARY KEY (machine_id, user_id)
+    );
+    INSERT INTO machine_shares_new
+        (machine_id, user_id, role, created_at, starts_at, expires_at, single_view, grant_statement, grant_signature)
+        SELECT machine_id, user_id, role, created_at, starts_at, expires_at, single_view, grant_statement,
+               grant_signature
+        FROM machine_shares;
+    DROP TABLE machine_shares;
+    ALTER TABLE machine_shares_new RENAME TO machine_shares;
+    CREATE INDEX machine_shares_expires_at ON machine_shares (expires_at) WHERE expires_at IS NOT NULL;
+    CREATE INDEX machine_shares_starts_at ON machine_shares (starts_at) WHERE starts_at IS NOT NULL;
 "];
 
 #[derive(Clone)]
@@ -520,13 +544,15 @@ pub fn purge_expired(conn: &Connection, now: i64) -> rusqlite::Result<()> {
 
 // ---- machines -------------------------------------------------------------
 
-/// What a user may do with a machine. Ordered: each role includes the ones
-/// before it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+/// What a user may do with a machine. Not a ladder: dev can do things view
+/// can't (a shell, files) without control's video and input, so access is
+/// always asked as a capability, never by comparing roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     View,
     Control,
+    Dev,
     Owner,
 }
 
@@ -535,6 +561,7 @@ impl Role {
         match text {
             "owner" => Self::Owner,
             "control" => Self::Control,
+            "dev" => Self::Dev,
             _ => Self::View,
         }
     }
@@ -544,7 +571,28 @@ impl Role {
         match self {
             Self::View => "view",
             Self::Control | Self::Owner => "control",
+            Self::Dev => "dev",
         }
+    }
+
+    /// Watches the screen.
+    pub fn can_view(self) -> bool {
+        matches!(self, Self::View | Self::Control | Self::Owner)
+    }
+
+    /// Sends the machine mouse and keyboard input.
+    pub fn can_control(self) -> bool {
+        matches!(self, Self::Control | Self::Owner)
+    }
+
+    /// Sends files to the machine's drop folder and downloads from it.
+    pub fn can_files(self) -> bool {
+        matches!(self, Self::Control | Self::Dev | Self::Owner)
+    }
+
+    /// Opens a shell on the machine.
+    pub fn can_shell(self) -> bool {
+        matches!(self, Self::Dev | Self::Owner)
     }
 }
 
@@ -1029,4 +1077,45 @@ pub fn revocations(conn: &Connection, public_id: &str) -> rusqlite::Result<Vec<S
 /// `user_id`'s share of an owned machine, if there is one.
 pub fn share_for(conn: &Connection, public_id: &str, owner_id: i64, user_id: i64) -> rusqlite::Result<Option<ShareRow>> {
     Ok(list_shares(conn, public_id, owner_id)?.and_then(|shares| shares.into_iter().find(|s| s.user_id == user_id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rebuild that lets shares be dev keeps every share already there.
+    #[test]
+    fn dev_migration_keeps_shares() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Only the shares table is under test: no users or machines to point at.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let before_dev = MIGRATIONS.len() - 1;
+        for migration in &MIGRATIONS[..before_dev] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", i64::try_from(before_dev).unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO machine_shares (machine_id, user_id, role, created_at, expires_at, single_view, grant_statement)
+             VALUES (1, 2, 'control', 10, 20, 1, 'hawk-grant-v1')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let kept: (String, i64, i64, String) = conn
+            .query_row(
+                "SELECT role, expires_at, single_view, grant_statement FROM machine_shares WHERE user_id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("control".to_owned(), 20, 1, "hawk-grant-v1".to_owned()));
+        conn.execute("INSERT INTO machine_shares (machine_id, user_id, role, created_at) VALUES (1, 3, 'dev', 0)", [])
+            .unwrap();
+        assert!(
+            conn.execute("INSERT INTO machine_shares (machine_id, user_id, role, created_at) VALUES (1, 4, 'root', 0)", [])
+                .is_err()
+        );
+        assert_eq!(Role::from_sql("dev"), Role::Dev);
+    }
 }

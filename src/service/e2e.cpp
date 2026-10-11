@@ -36,9 +36,10 @@ constexpr std::string_view kStreamKeyAad = "hawk-stream-key-v1";
 constexpr std::string_view kInputAad = "hawk-input-v1";
 constexpr std::string_view kClipboardAad = "hawk-clipboard-v1";
 constexpr std::string_view kFileAad = "hawk-file-v1";
-// A file-channel plaintext: op, header length (u16, big-endian), the JSON
-// header, then file data.
-constexpr std::size_t kFilePreamble = 3;
+constexpr std::string_view kShellAad = "hawk-shell-v1";
+// A file- or shell-channel plaintext: op, header length (u16, big-endian),
+// the JSON header, then bytes.
+constexpr std::size_t kChannelPreamble = 3;
 
 // The first byte of a sealed clipboard message; UTF-8 text follows it.
 // Viewer to machine: set (with text) or get (without). Machine to viewer:
@@ -254,6 +255,8 @@ struct AcceptMessage {
     std::string clipboard;
     // Whether this viewer may send and fetch files. Likewise only a hint.
     bool files = false;
+    // Whether it may open shells. Likewise.
+    bool shell = false;
 };
 
 struct RejectMessage {
@@ -274,8 +277,9 @@ struct ClipboardMessage {
     std::string   sealed;
 };
 
-struct FileOutMessage {
-    std::string   type = "file";
+// A sealed file- or shell-channel message for one viewer; `type` says which.
+struct ChannelOutMessage {
+    std::string   type;
     std::uint64_t viewer = 0;
     std::string   sealed;
 };
@@ -296,7 +300,7 @@ struct glz::meta<hawk::service::AcceptMessage> {
     using T                     = hawk::service::AcceptMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "statement", &T::statement,
                                          "signature", &T::signature, "wrapped_key", &T::wrapped_key, "clipboard", &T::clipboard,
-                                         "files", &T::files);
+                                         "files", &T::files, "shell", &T::shell);
 };
 
 template <>
@@ -318,8 +322,8 @@ struct glz::meta<hawk::service::ClipboardMessage> {
 };
 
 template <>
-struct glz::meta<hawk::service::FileOutMessage> {
-    using T                     = hawk::service::FileOutMessage;
+struct glz::meta<hawk::service::ChannelOutMessage> {
+    using T                     = hawk::service::ChannelOutMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "sealed", &T::sealed);
 };
 
@@ -513,6 +517,9 @@ struct Viewer {
     // its own.
     crypto::AesGcm               file_key;
     std::uint64_t                file_counter = 0;
+    // And shell output, likewise queued with file data.
+    crypto::AesGcm               shell_key;
+    std::uint64_t                shell_counter = 0;
     // Shared by input and clipboard requests, which the dashboard numbers
     // from one counter.
     std::uint64_t                last_counter = 0;
@@ -589,7 +596,13 @@ struct ViewerHub::Impl {
     std::string                  owner_key_text;
     ClipboardConfig              clipboard;
     bool                         files_enabled = false;
+    bool                         shell_enabled = false;
     Sender                       send;
+    // Held from sealing a shell message to sending it: several threads send
+    // them (one per shell, and the worker), and each viewer's counter only
+    // goes up, so they have to leave in the order they were numbered. Not
+    // the main lock, so a slow send never holds up sealing frames.
+    std::mutex                   shell_send_mutex;
 
     std::mutex                       mutex;
     AccessState                      state = AccessState::load();
@@ -597,28 +610,84 @@ struct ViewerHub::Impl {
     StreamKey                        stream = new_stream_key(1);
     std::chrono::steady_clock::time_point last_expiry_check{};
 
-    Impl(const MachineKey& key, std::string id, std::optional<crypto::Bytes> owner, ClipboardConfig clipboard_config,
-         bool files, Sender sender)
+    Impl(const MachineKey& key, std::string id, std::optional<crypto::Bytes> owner, const MachineConfig& config,
+         Sender sender)
         : machine_key(key),
           machine_id(std::move(id)),
           owner_key(std::move(owner)),
           owner_key_text(owner_key.has_value() ? crypto::base64_encode(*owner_key) : std::string{}),
-          clipboard(clipboard_config),
-          files_enabled(files),
+          clipboard(config.clipboard),
+          files_enabled(config.files.enabled),
+          shell_enabled(config.shell.enabled),
           send(std::move(sender)) {}
 
-    // Files go both ways at once, and a write to the machine's disk is a
-    // write: control, always.
+    // What each role may do. Not a ladder: dev has a shell and files but
+    // neither the screen nor input. Asked by capability, never by rank.
+    [[nodiscard]] static bool can_view(const Viewer& viewer) {
+        return viewer.role == "owner" || viewer.role == "control" || viewer.role == "view";
+    }
+    [[nodiscard]] static bool can_control(const Viewer& viewer) {
+        return viewer.role == "owner" || viewer.role == "control";
+    }
+
+    // A write to the machine's disk is a write: control, dev or owner.
     [[nodiscard]] bool may_use_files(const Viewer& viewer) const {
-        return files_enabled && !viewer.refused && viewer.role != "view";
+        return files_enabled && !viewer.refused &&
+               (viewer.role == "owner" || viewer.role == "control" || viewer.role == "dev");
+    }
+
+    [[nodiscard]] bool may_use_shell(const Viewer& viewer) const {
+        return shell_enabled && !viewer.refused && (viewer.role == "owner" || viewer.role == "dev");
     }
 
     [[nodiscard]] bool may_set_clipboard(const Viewer& viewer) const {
-        return clipboard.mode != ClipboardMode::off && viewer.role != "view";
+        return clipboard.mode != ClipboardMode::off && can_control(viewer);
     }
 
     [[nodiscard]] bool may_read_clipboard(const Viewer& viewer) const {
-        return clipboard.mode != ClipboardMode::off && (viewer.role != "view" || clipboard.view_pull);
+        return clipboard.mode != ClipboardMode::off &&
+               (can_control(viewer) || (viewer.role == "view" && clipboard.view_pull));
+    }
+
+    // op || u16 header length || header || data.
+    [[nodiscard]] static crypto::Bytes channel_plaintext(const ChannelMessage& message) {
+        crypto::Bytes plain;
+        plain.reserve(kChannelPreamble + message.header.size() + message.data.size());
+        plain.push_back(std::byte{message.op});
+        plain.push_back(static_cast<std::byte>(message.header.size() >> 8U));
+        plain.push_back(static_cast<std::byte>(message.header.size() & 0xFFU));
+        const auto header = std::as_bytes(std::span(message.header));
+        plain.insert(plain.end(), header.begin(), header.end());
+        plain.insert(plain.end(), message.data.begin(), message.data.end());
+        return plain;
+    }
+
+    [[nodiscard]] static std::optional<ChannelMessage> parse_channel(const crypto::Bytes& plain) {
+        if (plain.size() < kChannelPreamble) {
+            return std::nullopt;
+        }
+        const auto header_size =
+            (std::to_integer<std::size_t>(plain[1]) << 8U) | std::to_integer<std::size_t>(plain[2]);
+        if (plain.size() < kChannelPreamble + header_size) {
+            return std::nullopt;
+        }
+        ChannelMessage message;
+        message.op = std::to_integer<std::uint8_t>(plain.front());
+        message.header.assign(reinterpret_cast<const char*>(plain.data()) + kChannelPreamble, header_size);
+        message.data.assign(plain.begin() + static_cast<std::ptrdiff_t>(kChannelPreamble + header_size), plain.end());
+        return message;
+    }
+
+    // counter || AES-GCM(key, plaintext), as the JSON the relay routes.
+    [[nodiscard]] static std::string seal_channel(std::uint64_t viewer, std::string_view type, const crypto::AesGcm& key,
+                                                  std::uint64_t& counter, std::string_view aad,
+                                                  const ChannelMessage& message) {
+        const auto    number = ++counter;
+        crypto::Bytes out;
+        put_u64_be(out, number);
+        const auto sealed = key.encrypt(counter_nonce(number), channel_plaintext(message), crypto::as_bytes(aad));
+        out.insert(out.end(), sealed.begin(), sealed.end());
+        return to_json(ChannelOutMessage{.type = std::string(type), .viewer = viewer, .sealed = crypto::base64_encode(out)});
     }
 
     // What the dashboard is told this viewer may do with the clipboard.
@@ -695,7 +764,8 @@ struct ViewerHub::Impl {
         auto next = new_stream_key(stream.id + 1);
         std::swap(stream, next);  // wrap_stream_key reads `stream`
         for (const auto& [id, viewer] : viewers) {
-            if (!viewer.refused) {
+            // A dev viewer never had the stream key, and isn't given one.
+            if (!viewer.refused && can_view(viewer)) {
                 send(to_json(StreamKeyMessage{.viewer = id, .wrapped_key = wrap_stream_key(viewer)}));
             }
         }
@@ -731,7 +801,7 @@ struct ViewerHub::Impl {
         }
         const auto role = std::string(field(*fields, "role"));
         const auto issued = parse_int(field(*fields, "issued"));
-        if ((role != "view" && role != "control") || !issued.has_value()) {
+        if ((role != "view" && role != "control" && role != "dev") || !issued.has_value()) {
             return std::unexpected("the grant is malformed");
         }
         const auto now = unix_seconds();
@@ -780,9 +850,8 @@ struct ViewerHub::Impl {
 };
 
 ViewerHub::ViewerHub(const MachineKey& key, std::string machine_id, std::optional<crypto::Bytes> owner_key,
-                     ClipboardConfig clipboard, bool files_enabled, Sender send)
-    : impl_(std::make_unique<Impl>(key, std::move(machine_id), std::move(owner_key), clipboard, files_enabled,
-                                   std::move(send))) {}
+                     const MachineConfig& config, Sender send)
+    : impl_(std::make_unique<Impl>(key, std::move(machine_id), std::move(owner_key), config, std::move(send))) {}
 
 ViewerHub::~ViewerHub() = default;
 
@@ -826,17 +895,18 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     const auto join_hash = crypto::sha256(crypto::as_bytes(request.statement));
     // HKDF output is a prefix of any longer output: the first 64 bytes are
     // the input and wrap keys whatever length is asked for.
-    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 128);
+    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 160);
     auto input_key = crypto::AesGcm::create(std::span(keys).first(32));
     auto wrap_key = crypto::AesGcm::create(std::span(keys).subspan(32, 32));
     auto reply_key = crypto::AesGcm::create(std::span(keys).subspan(64, 32));
     auto file_key = crypto::AesGcm::create(std::span(keys).subspan(96, 32));
+    auto shell_key = crypto::AesGcm::create(std::span(keys).subspan(128, 32));
     const auto accept = std::format("{}\nmachine={}\njoin={}\nephemeral={}\nrole={}", kAcceptContext, impl.machine_id,
                                     crypto::base64_encode(join_hash), crypto::base64_encode(exchange->public_key()),
                                     admission->role);
     const auto signature = impl.machine_key.sign(crypto::as_bytes(accept));
     if (!input_key.has_value() || !wrap_key.has_value() || !reply_key.has_value() || !file_key.has_value() ||
-        !signature.has_value()) {
+        !shell_key.has_value() || !signature.has_value()) {
         impl.reject(viewer, "the machine couldn't sign its answer");
         return;
     }
@@ -850,6 +920,7 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
         .wrap_key = std::move(*wrap_key),
         .reply_key = std::move(*reply_key),
         .file_key = std::move(*file_key),
+        .shell_key = std::move(*shell_key),
         .grant_issued = admission->grant_issued,
         .not_after = admission->not_after,
         .single_view_grant = admission->single_view_grant,
@@ -860,9 +931,12 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
         session.held = std::move(previous->second.held);
         session.sent_input = previous->second.sent_input;
     }
-    const auto wrapped = impl.wrap_stream_key(session);
+    // The screen is only for roles that watch it: a dev viewer gets no
+    // stream key, so frames are noise to it whatever the relay forwards.
+    const auto wrapped = Impl::can_view(session) ? impl.wrap_stream_key(session) : std::string{};
     auto       clipboard = impl.clipboard_access(session);
     const bool files = impl.may_use_files(session);
+    const bool shell = impl.may_use_shell(session);
     spdlog::info("e2e: viewer {} ({}) admitted as {}", viewer, session.fingerprint, admission->role);
     impl.viewers.insert_or_assign(viewer, std::move(session));
     impl.send(to_json(AcceptMessage{.viewer = viewer,
@@ -870,7 +944,8 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
                                     .signature = crypto::base64_encode(*signature),
                                     .wrapped_key = wrapped,
                                     .clipboard = std::move(clipboard),
-                                    .files = files}));
+                                    .files = files,
+                                    .shell = shell}));
 }
 
 std::vector<ipc::InputPacket> ViewerHub::leave(std::uint64_t viewer) {
@@ -916,7 +991,7 @@ std::optional<ipc::InputPacket> ViewerHub::input(std::uint64_t viewer, std::stri
     auto&                 impl = *impl_;
     const std::lock_guard lock(impl.mutex);
     const auto            found = impl.viewers.find(viewer);
-    if (found == impl.viewers.end() || found->second.refused || found->second.role == "view") {
+    if (found == impl.viewers.end() || found->second.refused || !Impl::can_control(found->second)) {
         return std::nullopt;
     }
     Viewer&    session = found->second;
@@ -998,30 +1073,18 @@ void ViewerHub::deliver_clipboard(std::string_view text, bool pushed) {
     }
 }
 
-std::optional<FileMessage> ViewerHub::file(std::uint64_t viewer, std::string_view sealed) {
+std::optional<ChannelMessage> ViewerHub::file(std::uint64_t viewer, std::string_view sealed) {
     auto&                 impl = *impl_;
     const std::lock_guard lock(impl.mutex);
     const auto            found = impl.viewers.find(viewer);
     if (found == impl.viewers.end() || !impl.may_use_files(found->second)) {
         return std::nullopt;
     }
-    auto plain = Impl::open_request(found->second, sealed, kFileAad);
-    if (!plain.has_value() || plain->size() < kFilePreamble) {
-        return std::nullopt;
-    }
-    const auto header_size =
-        (std::to_integer<std::size_t>((*plain)[1]) << 8U) | std::to_integer<std::size_t>((*plain)[2]);
-    if (plain->size() < kFilePreamble + header_size) {
-        return std::nullopt;
-    }
-    FileMessage message;
-    message.op = std::to_integer<std::uint8_t>(plain->front());
-    message.header.assign(reinterpret_cast<const char*>(plain->data()) + kFilePreamble, header_size);
-    message.data.assign(plain->begin() + static_cast<std::ptrdiff_t>(kFilePreamble + header_size), plain->end());
-    return message;
+    const auto plain = Impl::open_request(found->second, sealed, kFileAad);
+    return plain.has_value() ? Impl::parse_channel(*plain) : std::nullopt;
 }
 
-bool ViewerHub::send_file(std::uint64_t viewer, const FileMessage& message) {
+bool ViewerHub::send_file(std::uint64_t viewer, const ChannelMessage& message) {
     if (message.header.size() > 0xFFFFU) {
         return false;
     }
@@ -1031,25 +1094,41 @@ bool ViewerHub::send_file(std::uint64_t viewer, const FileMessage& message) {
     if (found == impl.viewers.end() || !impl.may_use_files(found->second)) {
         return false;
     }
-    Viewer&       session = found->second;
-    crypto::Bytes plain;
-    plain.reserve(kFilePreamble + message.header.size() + message.data.size());
-    plain.push_back(std::byte{message.op});
-    plain.push_back(static_cast<std::byte>(message.header.size() >> 8U));
-    plain.push_back(static_cast<std::byte>(message.header.size() & 0xFFU));
-    const auto header = std::as_bytes(std::span(message.header));
-    plain.insert(plain.end(), header.begin(), header.end());
-    plain.insert(plain.end(), message.data.begin(), message.data.end());
-
-    const auto    counter = ++session.file_counter;
-    crypto::Bytes out;
-    put_u64_be(out, counter);
-    const auto sealed = session.file_key.encrypt(counter_nonce(counter), plain, crypto::as_bytes(kFileAad));
-    out.insert(out.end(), sealed.begin(), sealed.end());
-    auto json = to_json(FileOutMessage{.viewer = viewer, .sealed = crypto::base64_encode(out)});
+    Viewer&    session = found->second;
+    const auto json = Impl::seal_channel(viewer, "file", session.file_key, session.file_counter, kFileAad, message);
     // Sent outside the lock: a chunk takes a while on a slow link, and the
     // capture thread seals frames under this lock. File messages are only
     // ever sent from FileTransfers' one thread, so they stay in order.
+    lock.unlock();
+    impl.send(json);
+    return true;
+}
+
+std::optional<ChannelMessage> ViewerHub::shell(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !impl.may_use_shell(found->second)) {
+        return std::nullopt;
+    }
+    const auto plain = Impl::open_request(found->second, sealed, kShellAad);
+    return plain.has_value() ? Impl::parse_channel(*plain) : std::nullopt;
+}
+
+bool ViewerHub::send_shell(std::uint64_t viewer, const ChannelMessage& message) {
+    if (message.header.size() > 0xFFFFU) {
+        return false;
+    }
+    auto&                 impl = *impl_;
+    const std::lock_guard order(impl.shell_send_mutex);
+    std::unique_lock      lock(impl.mutex);
+    const auto       found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !impl.may_use_shell(found->second)) {
+        return false;
+    }
+    Viewer&    session = found->second;
+    const auto json = Impl::seal_channel(viewer, "shell", session.shell_key, session.shell_counter, kShellAad, message);
+    // Outside the main lock, as with files; still inside the ordering one.
     lock.unlock();
     impl.send(json);
     return true;

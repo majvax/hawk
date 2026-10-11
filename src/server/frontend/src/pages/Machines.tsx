@@ -1,4 +1,4 @@
-import { type DragEvent, type JSX, type ReactNode, useEffect, useRef, useState } from "react";
+import { type DragEvent, type JSX, type ReactNode, Suspense, lazy, useEffect, useRef, useState } from "react";
 
 import {
   type EnrollmentCode,
@@ -9,16 +9,32 @@ import {
 } from "../api.js";
 import { createEnrollment } from "../e2e.js";
 import type { Identity } from "../keys.js";
-import { MAX_CLIPBOARD_BYTES, type Machine, type Role } from "../protocol.js";
+import {
+  MAX_CLIPBOARD_BYTES,
+  type Machine,
+  type Role,
+  canControl as roleCanControl,
+  canFiles,
+  canShell,
+  canView,
+} from "../protocol.js";
 import { Alert, CodeBlock, CopyButton, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
 import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
 import { FilesPanel } from "./FilesPanel.js";
 import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
 
-export const ROLE_LABEL: Record<Role, string> = { owner: "Owner", control: "Can control", view: "View only" };
+// xterm.js is most of a terminal's weight, and most visits never open one:
+// it's loaded the first time a terminal is shown.
+const ShellPanel = lazy(() => import("./ShellPanel.js").then((module) => ({ default: module.ShellPanel })));
 
-type DetailTab = "screen" | "sharing" | "machine";
+export const ROLE_LABEL: Record<Role, string> = {
+  owner: "Owner",
+  control: "Can control",
+  view: "View only",
+  dev: "Shell only",
+};
+
 
 export function formatBitrate(kbps: number): string {
   return kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mb/s` : `${kbps} kb/s`;
@@ -62,17 +78,19 @@ export function MachinesPage({
 
   const selected = machines.find((machine) => machine.id === selectedId) ?? null;
   const viewing = machines.find((machine) => machine.id === viewingId) ?? null;
-  // Only an owner gets the sharing and machine tabs.
-  const detailTab = selected?.role === "owner" ? tab : "screen";
+  const tabs = selected === null ? [] : tabsFor(selected.role);
+  const detailTab = tabs.some(([id]) => id === tab) ? tab : (tabs[0]?.[0] ?? "screen");
 
   const select = (id: string | null): void => {
-    if (id !== selectedId) setTab("screen");
+    if (id !== selectedId) {
+      const machine = machines.find((candidate) => candidate.id === id);
+      setTab(machine === undefined ? "screen" : (tabsFor(machine.role)[0]?.[0] ?? "screen"));
+    }
     setSelectedId(id);
   };
 
   const connect = (machine: Machine): void => {
-    select(machine.id);
-    setTab("screen");
+    if (machine.id !== selectedId) select(machine.id);
     startView(machine.id);
   };
 
@@ -180,15 +198,9 @@ export function MachinesPage({
               </div>
             </div>
             <MachineStrip machine={selected} now={now} />
-            {selected.role === "owner" && (
+            {tabs.length > 1 && (
               <div className="pane-tabs" role="tablist">
-                {(
-                  [
-                    ["screen", "Screen"],
-                    ["sharing", "Sharing"],
-                    ["machine", "Machine"],
-                  ] as const
-                ).map(([id, label]) => (
+                {tabs.map(([id, label]) => (
                   <button
                     key={id}
                     type="button"
@@ -200,6 +212,13 @@ export function MachinesPage({
                   </button>
                 ))}
               </div>
+            )}
+            {detailTab === "files" && (
+              <ToolTab dashboard={dashboard} machine={selected} viewing={viewing} onConnect={connect}>
+                {(connected) => (
+                  <FilesPanel files={dashboard.files} actions={dashboard.fileActions} connected={connected} />
+                )}
+              </ToolTab>
             )}
             {detailTab === "sharing" && <SharingPanel key={selected.id} machine={selected} identity={identity} />}
             {detailTab === "machine" && (
@@ -213,6 +232,16 @@ export function MachinesPage({
             )}
           </>
         )}
+
+        {/* Mounted while there are shells, so their terminals keep their
+            scrollback while another tab or machine is on show. */}
+        <ShellTab
+          dashboard={dashboard}
+          machine={selected}
+          viewing={viewing}
+          shown={visible && selected !== null && detailTab === "terminal"}
+          onConnect={connect}
+        />
 
         {/* Always mounted: the canvas frames are drawn into lives here, and a
             view keeps running while another machine or tab is on show. */}
@@ -503,38 +532,46 @@ function Viewer({
   status: Dashboard["status"];
   onConnect: (machine: Machine) => void;
 }): JSX.Element {
-  const { canvasRef, picture, stats, decodeError, security, clipboard, files, fileActions, sendInput, sendClipboard } =
-    dashboard;
+  const {
+    canvasRef,
+    picture,
+    stats,
+    decodeError,
+    security,
+    clipboard,
+    files,
+    fileActions,
+    sendInput,
+    sendClipboard,
+  } = dashboard;
   const stageRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [keysLocked, setKeysLocked] = useState(false);
   const [clipPanel, setClipPanel] = useState<ClipboardPanel>(null);
   const [clipNote, setClipNote] = useState<string | null>(null);
-  const [filesOpen, setFilesOpen] = useState(false);
   const [dropping, setDropping] = useState(false);
+  const [dropNote, setDropNote] = useState<string | null>(null);
+  const [clipMenu, setClipMenu] = useState(false);
 
   const onScreen = shown && viewing !== null && selected?.id === viewing.id;
   // Nothing to send input to unless a picture is actually up, and the relay
   // would drop it from a view-only share anyway.
   const canControl =
     onScreen &&
-    viewing.role !== "view" &&
+    roleCanControl(viewing.role) &&
     viewing.online &&
     status === "open" &&
     picture !== null &&
     security?.kind === "secured" &&
-    security.role !== "view";
+    roleCanControl(security.role);
   // The machine checks every clipboard request for itself; these only
   // decide which buttons make sense to show.
   const secured = onScreen && viewing.online && status === "open" && security?.kind === "secured";
   const canReadClipboard = secured && clipboard.access !== "off";
-  const canPaste = canReadClipboard && security.role !== "view";
-  const canSendFiles = secured && files.enabled;
-  // Transfers stay listed while the view is down, so they can be seen
-  // waiting to resume.
-  const showFiles = onScreen && filesOpen && (files.enabled || files.transfers.length > 0);
+  const canPaste = canReadClipboard && roleCanControl(security.role);
 
-  // Dropping files on the screen sends them, and opens the panel to watch.
+  const canSendFiles = secured && files.enabled;
+  // Dropping files on the screen sends them; the Files tab follows them.
   const onDragOver = (event: DragEvent): void => {
     if (!canSendFiles || !event.dataTransfer.types.includes("Files")) return;
     event.preventDefault();
@@ -548,13 +585,19 @@ function Viewer({
     const dropped = [...event.dataTransfer.files];
     if (dropped.length === 0) return;
     fileActions.upload(dropped);
-    setFilesOpen(true);
+    setDropNote(
+      dropped.length === 1
+        ? `Sending ${dropped[0]?.name ?? "a file"}: follow it in the Files tab.`
+        : `Sending ${dropped.length} files: follow them in the Files tab.`,
+    );
   };
 
   // A new view, or none: whatever the panel held was for the last one.
   useEffect(() => {
     setClipPanel(null);
     setClipNote(null);
+    setDropNote(null);
+    setClipMenu(false);
   }, [viewing?.id, canReadClipboard]);
 
   // Text from the machine: straight onto this computer's clipboard where
@@ -629,6 +672,17 @@ function Viewer({
   const getClipboard = (): void => {
     if (sendClipboard(null)) setClipNote(null);
   };
+  const clipboardMenu = canPaste || canReadClipboard;
+  // The menu closes on any click outside it (or its button).
+  useEffect(() => {
+    if (!clipMenu) return;
+    const onPointer = (event: PointerEvent): void => {
+      const target = event.target as Element | null;
+      if (target?.closest(".stage-menu, [data-clip-menu]") == null) setClipMenu(false);
+    };
+    document.addEventListener("pointerdown", onPointer);
+    return () => document.removeEventListener("pointerdown", onPointer);
+  }, [clipMenu]);
 
   useEffect(() => {
     const onChange = (): void => {
@@ -713,35 +767,9 @@ function Viewer({
               Release
             </button>
           )}
-          {canPaste && (
-            <button
-              type="button"
-              onClick={() => void pasteFromClipboard()}
-              title="Send your clipboard's text to the machine's clipboard"
-            >
-              Paste to machine
-            </button>
-          )}
-          {(files.enabled || files.transfers.length > 0) && onScreen && (
-            <button
-              type="button"
-              onClick={() => {
-                if (!filesOpen && canSendFiles) fileActions.list();
-                setFilesOpen(!filesOpen);
-              }}
-              title="Send files to the machine, or download from its drop folder"
-            >
-              {filesOpen ? "Hide files" : "Files"}
-            </button>
-          )}
-          {canReadClipboard && (
-            <button
-              type="button"
-              onClick={getClipboard}
-              disabled={clipboard.waiting}
-              title="Copy the machine's clipboard to yours"
-            >
-              {clipboard.waiting ? "Getting…" : "Get clipboard"}
+          {clipboardMenu && (
+            <button type="button" data-clip-menu aria-expanded={clipMenu} onClick={() => setClipMenu(!clipMenu)}>
+              {clipboard.waiting ? "Getting…" : "Clipboard ▾"}
             </button>
           )}
           {onScreen && (
@@ -750,6 +778,35 @@ function Viewer({
             </button>
           )}
         </div>
+        {clipboardMenu && clipMenu && (
+          <div className="stage-menu" role="menu">
+            {canPaste && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setClipMenu(false);
+                  void pasteFromClipboard();
+                }}
+              >
+                Paste my clipboard to the machine
+              </button>
+            )}
+            {canReadClipboard && (
+              <button
+                type="button"
+                role="menuitem"
+                disabled={clipboard.waiting}
+                onClick={() => {
+                  setClipMenu(false);
+                  getClipboard();
+                }}
+              >
+                Copy the machine's clipboard to mine
+              </button>
+            )}
+          </div>
+        )}
         <div
           className={dropping ? "stage-screen dropping" : "stage-screen"}
           onDragOver={onDragOver}
@@ -783,7 +840,11 @@ function Viewer({
           )}
           {viewing.role === "view" && <span>View only: you can watch this screen but not send it input.</span>}
           {canControl && !input.active && <span>Click the screen to send it your mouse and keyboard.</span>}
-          {canSendFiles && !filesOpen && <span>Drop files on the screen to send them to the machine.</span>}
+          {dropNote !== null ? (
+            <span>{dropNote}</span>
+          ) : (
+            canSendFiles && <span>Drop files on the screen to send them to the machine.</span>
+          )}
           {canReadClipboard && clipboard.access === "sync" && (
             <span>Text copied on the machine comes to your clipboard while this page has focus.</span>
           )}
@@ -805,7 +866,6 @@ function Viewer({
           )}
         </div>
       )}
-      {showFiles && <FilesPanel files={files} actions={fileActions} connected={canSendFiles} />}
       {onScreen && clipPanel !== null && (
         <div className="clip-panel">
           {clipPanel.kind === "paste" ? (
@@ -845,6 +905,148 @@ function Viewer({
               </div>
             </>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type DetailTab = "screen" | "terminal" | "files" | "sharing" | "machine";
+
+// The tabs a role gets: only what it can use. A dev share has no screen, so
+// it starts on the terminal.
+function tabsFor(role: Role): [DetailTab, string][] {
+  const tabs: [DetailTab, string][] = [];
+  if (canView(role)) tabs.push(["screen", "Screen"]);
+  if (canShell(role)) tabs.push(["terminal", "Terminal"]);
+  if (canFiles(role)) tabs.push(["files", "Files"]);
+  if (role === "owner") tabs.push(["sharing", "Sharing"], ["machine", "Machine"]);
+  return tabs;
+}
+
+// Where a view stands, for a tab that needs one and doesn't have it yet.
+function connectionStatus(security: ViewSecurity | null, online: boolean): string {
+  if (!online) return "The machine is offline.";
+  switch (security?.kind) {
+    case "rejected":
+      return `The machine refused this connection: ${security.reason}`;
+    case "untrusted":
+      return "This machine's key couldn't be verified.";
+    case "failed":
+      return `The connection couldn't be secured: ${security.message}`;
+    default:
+      return "Securing the connection…";
+  }
+}
+
+// Whether the view of `machine` is up and end-to-end secured.
+function isSecured(dashboard: Dashboard, machine: Machine, viewing: Machine | null): boolean {
+  return (
+    viewing?.id === machine.id &&
+    machine.online &&
+    dashboard.status === "open" &&
+    dashboard.security?.kind === "secured"
+  );
+}
+
+// What a tab that works over the view shows until the view is up: a way to
+// connect, or where the connection stands.
+function NotConnected({
+  dashboard,
+  machine,
+  viewing,
+  onConnect,
+}: {
+  dashboard: Dashboard;
+  machine: Machine;
+  viewing: Machine | null;
+  onConnect: (machine: Machine) => void;
+}): JSX.Element {
+  if (viewing?.id !== machine.id) {
+    return (
+      <div className="empty tool-connect">
+        <span>{machine.online ? "Connect to this machine to use it." : "The machine is offline."}</span>
+        {machine.online && (
+          <button type="button" className="btn btn-sm btn-accent" onClick={() => onConnect(machine)}>
+            Connect
+          </button>
+        )}
+      </div>
+    );
+  }
+  return <div className="empty">{connectionStatus(dashboard.security, machine.online)}</div>;
+}
+
+// The Files tab: the panel once connected; transfers stay on show while the
+// view is down, so they can be seen waiting to resume.
+function ToolTab({
+  dashboard,
+  machine,
+  viewing,
+  onConnect,
+  children,
+}: {
+  dashboard: Dashboard;
+  machine: Machine;
+  viewing: Machine | null;
+  onConnect: (machine: Machine) => void;
+  children: (connected: boolean) => ReactNode;
+}): JSX.Element {
+  const connected = isSecured(dashboard, machine, viewing) && dashboard.files.enabled;
+  const watching = viewing?.id === machine.id;
+  const hasTransfers = watching && dashboard.files.transfers.length > 0;
+
+  // Fresh listing whenever the tab is opened on a live view.
+  const { list } = dashboard.fileActions;
+  useEffect(() => {
+    if (connected) list();
+  }, [connected, list]);
+
+  return (
+    <div className="tool-wrap">
+      {!isSecured(dashboard, machine, viewing) && (
+        <NotConnected dashboard={dashboard} machine={machine} viewing={viewing} onConnect={onConnect} />
+      )}
+      {isSecured(dashboard, machine, viewing) && !dashboard.files.enabled && (
+        <div className="empty">This machine doesn't allow file transfer. Its owner can turn it on in its config.</div>
+      )}
+      {(connected || hasTransfers) && children(connected)}
+    </div>
+  );
+}
+
+// The Terminal tab. Its panel stays mounted while the view has shells, so
+// switching tabs or machines keeps every terminal's scrollback.
+function ShellTab({
+  dashboard,
+  machine,
+  viewing,
+  shown,
+  onConnect,
+}: {
+  dashboard: Dashboard;
+  machine: Machine | null;
+  viewing: Machine | null;
+  shown: boolean;
+  onConnect: (machine: Machine) => void;
+}): JSX.Element | null {
+  const { shells, shellActions } = dashboard;
+  const live = viewing !== null && isSecured(dashboard, viewing, viewing) && shells.enabled;
+  const mounted = viewing !== null && (live || shells.shells.length > 0);
+  const onThisMachine = machine !== null && viewing?.id === machine.id;
+  return (
+    <div className="tool-wrap" hidden={!shown}>
+      {shown && machine !== null && !isSecured(dashboard, machine, viewing) && (
+        <NotConnected dashboard={dashboard} machine={machine} viewing={viewing} onConnect={onConnect} />
+      )}
+      {shown && onThisMachine && isSecured(dashboard, machine, viewing) && !shells.enabled && (
+        <div className="empty">This machine doesn't allow shells. Its owner can turn them on in its config.</div>
+      )}
+      {mounted && (
+        <div hidden={!onThisMachine}>
+          <Suspense fallback={<div className="empty">Loading the terminal…</div>}>
+            <ShellPanel shells={shells} actions={shellActions} connected={live} visible={shown && onThisMachine} />
+          </Suspense>
         </div>
       )}
     </div>

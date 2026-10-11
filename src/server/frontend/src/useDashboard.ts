@@ -10,6 +10,7 @@ import {
   type Sink,
   type Transfer,
 } from "./fileTransfers.js";
+import { type OutputSink, type ShellInfo, ShellManager, type ShellSender } from "./shellSessions.js";
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
 import type {
@@ -140,6 +141,24 @@ export interface FileActions {
   dismiss: (id: string) => void;
 }
 
+// The open view's shells.
+export interface ShellsState {
+  // Whether the machine lets this viewer open shells.
+  enabled: boolean;
+  shells: ShellInfo[];
+}
+
+const NO_SHELLS: ShellsState = { enabled: false, shells: [] };
+
+export interface ShellActions {
+  // Returns the new shell's id, or null when there's no view to open it on.
+  open: (cols: number, rows: number) => string | null;
+  input: (id: string, text: string) => void;
+  resize: (id: string, cols: number, rows: number) => void;
+  close: (id: string) => void;
+  setSink: (id: string, sink: OutputSink | null) => void;
+}
+
 export interface StreamStats {
   fps: number; // frames shown over the last second
   received: number; // frames that arrived over the last second
@@ -172,6 +191,8 @@ export interface Dashboard {
   clipboard: ClipboardState;
   files: FilesState;
   fileActions: FileActions;
+  shells: ShellsState;
+  shellActions: ShellActions;
   // Owned machines whose enrollment this browser checked: "mismatch" means
   // the key the machine answered with isn't bound to the code made here.
   enrollmentChecks: Record<string, EnrollmentCheck>;
@@ -217,6 +238,14 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   // File messages are opened one at a time, in the order they arrived.
   const fileChainRef = useRef<Promise<void>>(Promise.resolve());
   const fileFrameRef = useRef<number | null>(null);
+  const [shells, setShells] = useState<ShellsState>(NO_SHELLS);
+  const shellsEnabledRef = useRef(false);
+  const shellManagerRef = useRef<ShellManager | null>(null);
+  const shellChainRef = useRef<Promise<void>>(Promise.resolve());
+  const publishShells = useRef((): void => {
+    const manager = shellManagerRef.current;
+    setShells(manager === null ? NO_SHELLS : { enabled: shellsEnabledRef.current, shells: manager.snapshot() });
+  }).current;
   // Progress arrives per chunk; the panel is redrawn at most once a frame.
   const publishFiles = useRef((): void => {
     if (fileFrameRef.current !== null) return;
@@ -269,8 +298,10 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     sessionRef.current?.abandon();
     sessionRef.current = null;
     setClipboard(NO_CLIPBOARD);
-    // Transfers wait for the view to come back rather than fail.
+    // Transfers wait for the view to come back rather than fail; shells
+    // end, since the machine closes them.
     fileManagerRef.current?.attach(null);
+    shellManagerRef.current?.attach(null);
   }).current;
   // Counted per frame, read and reset by the once-a-second stats sample.
   const framesRef = useRef(0);
@@ -493,15 +524,37 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     };
   }, []);
 
-  // A fresh set of transfers for the machine now being viewed (null: none).
-  const resetFiles = useCallback(
+  // Fresh transfers and shells for the machine now being viewed (null: none).
+  const resetTools = useCallback(
     (deviceId: string | null): void => {
       fileManagerRef.current?.close();
       fileManagerRef.current = deviceId === null ? null : new FileManager(publishFiles);
       filesEnabledRef.current = false;
       publishFiles();
+      shellManagerRef.current?.closeAll();
+      shellManagerRef.current = deviceId === null ? null : new ShellManager(publishShells);
+      shellsEnabledRef.current = false;
+      publishShells();
     },
-    [publishFiles],
+    [publishFiles, publishShells],
+  );
+
+  // The same for the shell channel.
+  const shellSender = useCallback(
+    (session: ViewSession, deviceId: string): ShellSender =>
+      (op, header, data) => {
+        if (sessionRef.current !== session) return false;
+        const sealed = session.sealShell(op, header, data);
+        if (sealed === null) return false;
+        inputChainRef.current = inputChainRef.current
+          .then(() => sealed)
+          .then((payload) => {
+            if (sessionRef.current === session) send({ type: "shell", deviceId, sealed: payload });
+          })
+          .catch((error: unknown) => console.error("sealing shell message:", error));
+        return true;
+      },
+    [send],
   );
 
   // Seals file-channel messages for `session` and sends them in order with
@@ -533,8 +586,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     setViewingId(null);
     teardownDecoder();
     clearPicture();
-    resetFiles(null);
-  }, [clearPicture, resetDecodeError, resetFiles, teardownDecoder]);
+    resetTools(null);
+  }, [clearPicture, resetDecodeError, resetTools, teardownDecoder]);
 
   const handleEvent = useCallback(
     (payload: DashboardEvent): void => {
@@ -586,6 +639,10 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
                   manager.attach(payload.files === true ? fileSender(session, payload.deviceId) : null);
                   if (payload.files === true) manager.list();
                 }
+                shellsEnabledRef.current = payload.shell === true;
+                shellManagerRef.current?.attach(
+                  payload.shell === true ? shellSender(session, payload.deviceId) : null,
+                );
               }
             },
             (error: unknown) => {
@@ -634,6 +691,18 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
             .catch((error: unknown) => console.error("file message:", error));
           break;
         }
+        case "shell": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          shellChainRef.current = shellChainRef.current
+            .then(() => session.openShell(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              shellManagerRef.current?.handle(opened.op, opened.header, opened.data);
+            })
+            .catch((error: unknown) => console.error("shell message:", error));
+          break;
+        }
         case "view_rejected":
           if (viewing === payload.deviceId) {
             const machine = machinesRef.current.find((candidate) => candidate.id === payload.deviceId);
@@ -646,7 +715,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
           break;
       }
     },
-    [clearView, fileSender, requestStream, send, teardownDecoder],
+    [clearView, fileSender, requestStream, send, shellSender, teardownDecoder],
   );
 
   // Owned machines not vouched for yet: if this browser made the code a
@@ -763,12 +832,12 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       resetDecodeError();
 
       viewingRef.current = deviceId;
-      resetFiles(deviceId);
+      resetTools(deviceId);
       blockedRef.current = null; // asked for by hand: try again
       setViewingId(deviceId);
       requestStream(deviceId); // while disconnected, the snapshot resumes it
     },
-    [clearPicture, requestStream, resetDecodeError, resetFiles, send, teardownDecoder],
+    [clearPicture, requestStream, resetDecodeError, resetTools, send, teardownDecoder],
   );
 
   useEffect(() => {
@@ -873,6 +942,14 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     dismiss: (id) => fileManagerRef.current?.dismiss(id),
   }).current;
 
+  const shellActions = useRef<ShellActions>({
+    open: (cols, rows) => shellManagerRef.current?.open(cols, rows) ?? null,
+    input: (id, text) => shellManagerRef.current?.input(id, text),
+    resize: (id, cols, rows) => shellManagerRef.current?.resize(id, cols, rows),
+    close: (id) => shellManagerRef.current?.close(id),
+    setSink: (id, sink) => shellManagerRef.current?.setSink(id, sink),
+  }).current;
+
   const stopView = useCallback((): void => {
     if (viewingRef.current === null) return;
     if (streamingRef.current !== null) send({ type: "stop_view", deviceId: streamingRef.current });
@@ -894,6 +971,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     clipboard,
     files,
     fileActions,
+    shells,
+    shellActions,
     enrollmentChecks,
     startView,
     stopView,

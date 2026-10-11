@@ -1,7 +1,29 @@
 // Mirrors relay/src/protocol.rs. Kept as a plain duplicate rather than a
 // shared package since the frontend only ever reads these shapes.
 
-export type Role = "view" | "control" | "owner";
+// What a user may do with a machine. Not a ladder: dev gets a shell and
+// files, but neither the screen nor input.
+export type Role = "view" | "control" | "dev" | "owner";
+
+// Watches the screen.
+export function canView(role: Role): boolean {
+  return role !== "dev";
+}
+
+// Sends mouse and keyboard input.
+export function canControl(role: Role): boolean {
+  return role === "control" || role === "owner";
+}
+
+// Sends files to the machine and downloads from it.
+export function canFiles(role: Role): boolean {
+  return role !== "view";
+}
+
+// Opens shells on the machine.
+export function canShell(role: Role): boolean {
+  return role === "dev" || role === "owner";
+}
 
 // What the machine's config lets a viewer do with its clipboard: nothing,
 // read it when asked (and paste into it, with control), or also have every
@@ -55,13 +77,17 @@ export type DashboardEvent =
       clipboard?: ClipboardAccess;
       // Whether this viewer may send and fetch files.
       files?: boolean;
+      // Whether it may open shells.
+      shell?: boolean;
     }
   | { type: "view_rejected"; deviceId: string; reason: string }
   | { type: "stream_key"; deviceId: string; wrappedKey: string }
   // Clipboard text the machine sealed for this viewer (ViewSession.openClipboard).
   | { type: "clipboard"; deviceId: string; sealed: string }
   // A file-channel message the machine sealed for this viewer (ViewSession.openFile).
-  | { type: "file"; deviceId: string; sealed: string };
+  | { type: "file"; deviceId: string; sealed: string }
+  // A shell-channel message the machine sealed for this viewer (ViewSession.openShell).
+  | { type: "shell"; deviceId: string; sealed: string };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -89,8 +115,10 @@ export type DashboardCommand =
   // A clipboard request, sealed the same way (ViewSession.sealClipboard).
   // Passed on for any role; the machine decides what its config allows.
   | { type: "clipboard"; deviceId: string; sealed: string }
-  // A file-channel message (ViewSession.sealFile); control only.
-  | { type: "file"; deviceId: string; sealed: string };
+  // A file-channel message (ViewSession.sealFile); control, dev and owner.
+  | { type: "file"; deviceId: string; sealed: string }
+  // A shell-channel message (ViewSession.sealShell); dev and owner.
+  | { type: "shell"; deviceId: string; sealed: string };
 
 // One H.264 access unit, once the frame carrying it has been decrypted
 // (ViewSession.openFrame has the frame layout).

@@ -146,7 +146,7 @@ TODO
 - [ ] Multi-factor authentication (TOTP, WebAuthn/passkeys, recovery codes)
 - [ ] Trusted-proxy address resolution, with IP allow/deny lists
 - [ ] Machine analytics (CPU/RAM/GPU/disk/network) and dashboard charts
-- [ ] `dev` role: a shell instead of a video stream, for low bandwidth
+- [x] `dev` role: a shell instead of a video stream, for low bandwidth (ConPTY as the logged-on user)
 - [ ] Signed GUI installer, pre-stamped with relay URL, pin and enroll code
 - [ ] Machine config file, schema-described and synced to the dashboard
 - [ ] Multiple display support (per-display capture, display-aware input)
@@ -273,33 +273,59 @@ stream isn't running.
 * **Alerts** fall out of this almost for free: disk nearly full, a machine
   that has stopped reporting, sustained load, a thermal ceiling.
 
-### `dev` role — a shell, and nothing else
+### `dev` role: a shell, and nothing else (built)
 
 A third share role beside **view** and **control**. It grants a terminal on
-the machine and no video stream at all: a few kilobytes a second instead of
-a few megabits, which makes a machine usable over tethered data, a hotel
-Wi-Fi or a train. For anything that isn't inherently graphical it's also
-simply faster.
+the machine (and file transfer, where the machine allows it) and no video
+stream at all: a few kilobytes a second instead of a few megabits. That
+makes a machine usable over tethered data, hotel Wi-Fi or a train. For
+anything that isn't inherently graphical it's also simply faster. The owner
+gets shells too; control shares don't.
 
-* **How:** a ConPTY (`CreatePseudoConsole`) spawned into the logged-on
-  user's session by the service, bytes relayed both ways over the existing
-  authenticated channel, `xterm.js` in the dashboard. Resize events travel
-  as a control message. Multiple concurrent shells, each its own pipe pair,
-  the same way capture and input already get a pipe each.
+Roles are capabilities, not a ladder:
+
+| | screen | input, clipboard | files | shell |
+|---|---|---|---|---|
+| view | ✓ | read, if `view_pull` | | |
+| control | ✓ | ✓ | ✓ | |
+| dev | | | ✓ | ✓ |
+| owner | ✓ | ✓ | ✓ | ✓ |
+
+The machine enforces this itself, and the relay checks the same table. A
+dev viewer is never given the stream key, so frames are unreadable to it
+whatever the relay forwards, and capture doesn't even start for it.
+
+* **How:** a ConPTY (`CreatePseudoConsole`) running the configured command,
+  with bytes going both ways over the viewer's end-to-end encrypted channel
+  and `xterm.js` in the dashboard (loaded only when a terminal is first
+  opened). Resizes travel as their own message. Each viewer can have 2
+  shells and the machine 4. In the dashboard they're tabs in the Terminal
+  tab, which can go full screen with keyboard lock, so Ctrl+W, Alt+Tab and
+  Esc reach the shell (holding Esc leaves).
 * **Privilege.** This is the sharpest edge in the whole system, so the shell
-  is **not** SYSTEM: it runs as the interactive user by default, or as a
-  dedicated low-privilege account named in the config. The service refuses
-  to spawn it as LocalSystem even if asked.
-* **Machine-side opt-in.** `shell.enabled` defaults to *off* and is one of
-  the settings the machine owner can lock locally, so it can't be turned on
-  from the relay. A machine that hasn't opted in reports the role as
-  unavailable and the dashboard won't offer it.
-* **Accountable.** Every session is logged with who, when and from where,
-  and optionally recorded (input and output, with a size cap) for the
-  owner to read back. Opening one is an MFA step-up action.
-* **No input injection, no capture.** A `dev` share can't watch the screen
-  or move the mouse; the relay checks the role on every message, as it
-  already does for input.
+  is **not** SYSTEM. It runs as the interactive user, with that user's
+  environment and home directory, and the service refuses to open one
+  when nobody is logged on or the token is LocalSystem. Every shell runs
+  in a job object that kills everything it started once the shell closes:
+  the tab closing, the viewer leaving, or the connection dropping.
+* **Flow control.** At most 256 KB of output is unacknowledged per shell,
+  and the dashboard only acknowledges what the terminal has drawn, so a
+  command printing without end can't flood the relay or the viewer.
+* **Machine-side opt-in.** Off unless the machine's config turns it on, and
+  the config is set on the machine, never through the relay:
+
+  ```toml
+  [[shell]]
+  enabled = true
+  command = "powershell.exe -NoLogo"   # pwsh.exe, cmd.exe, ...
+  ```
+
+* **Accountable.** Every shell is logged with who opened it, as which user,
+  for how long and how many bytes each way. Keystrokes are never logged.
+
+Not yet: running shells as a dedicated low-privilege account instead of the
+logged-on user, recording sessions for the owner to read back, and making
+opening a shell an MFA step-up action (once there is MFA).
 
 ### Installer
 
@@ -470,11 +496,11 @@ How it works:
   is one push. What a viewer pasted isn't pushed back.
 
 **File transfer (built).** Drop files on the screen (or use *Send files*
-in the dashboard's Files panel) to send them; the panel lists the machine's
-drop folder to download from. Chunks travel over the viewer's end-to-end
+in the machine's Files tab) to send them; the tab lists the machine's drop
+folder to download from. Chunks travel over the viewer's end-to-end
 encrypted channel, so the relay stores and sees nothing. Both ways need
-**control**; a view share never gets the panel, and the relay and the
-machine both refuse it.
+**control**, **dev** or the owner; a view share never gets the tab, and the
+relay and the machine both refuse it.
 
 * **Into one directory, never an arbitrary path.** A remote write to a path
   the viewer chooses is a privilege escalation with extra steps: the

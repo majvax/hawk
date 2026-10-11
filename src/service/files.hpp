@@ -63,7 +63,7 @@ public:
     FileTransfers& operator=(FileTransfers&&) = delete;
 
     // A message the hub opened for this viewer.
-    void handle(std::uint64_t viewer, FileMessage message);
+    void handle(std::uint64_t viewer, ChannelMessage message);
 
     // The viewer stopped watching: its transfers stop. An upload's partial
     // file is kept, so offering the same file again resumes it.

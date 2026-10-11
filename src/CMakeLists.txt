@@ -16,6 +16,7 @@ add_executable(hawk-service
     service/crypto.cpp
     service/e2e.cpp
     service/files.cpp
+    service/shell.cpp
     service/machine_identity.cpp
     service/machine_key.cpp
     service/websocket/websocket.cpp

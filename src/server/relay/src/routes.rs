@@ -23,17 +23,18 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_SEALED_INPUT_LEN, answer_fits, clipboard_access,
+    MAX_SEALED_INPUT_LEN, MAX_SEALED_SHELL_LEN, answer_fits, clipboard_access,
     machine_auth_message,
 };
 use crate::registry::{Answer, DashboardHandle, DeviceOutbound, Outbound, Registry};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// File-channel messages queued per dashboard before more are dropped. A
-/// machine keeps 8 chunks per download unacknowledged, and a viewer can run
-/// 2 downloads per machine; this leaves room for a few machines at once.
-const VIEWER_FILE_QUEUE: usize = 64;
+/// File and shell messages queued per dashboard before more are dropped. A
+/// machine keeps 8 chunks per download unacknowledged, a viewer can run 2
+/// downloads per machine, and a shell's window is 16 chunks; this leaves
+/// room for a few machines at once.
+const VIEWER_BULK_QUEUE: usize = 128;
 /// About half a second of 60 fps video per viewer before frames are dropped.
 const VIEWER_FRAME_QUEUE: usize = 32;
 
@@ -302,12 +303,13 @@ fn route_device_answer(
     clipboard_budgets: &mut HashMap<u64, Budget>,
 ) {
     let (viewer, answer) = match serde_json::from_str::<DeviceMessage>(text) {
-        Ok(DeviceMessage::ViewerAccept { viewer, statement, signature, wrapped_key, clipboard, files })
+        Ok(DeviceMessage::ViewerAccept { viewer, statement, signature, wrapped_key, clipboard, files, shell })
             if answer_fits(&[&statement, &signature, &wrapped_key]) =>
         {
             let clipboard = clipboard_access(clipboard.as_deref());
             let files = files.unwrap_or(false);
-            (viewer, Answer::Accept { statement, signature, wrapped_key, clipboard, files })
+            let shell = shell.unwrap_or(false);
+            (viewer, Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell })
         }
         Ok(DeviceMessage::ViewerReject { viewer, reason }) => {
             (viewer, Answer::Reject { reason: reason.chars().take(200).collect() })
@@ -323,8 +325,16 @@ fn route_device_answer(
             (viewer, Answer::Clipboard { sealed })
         }
         Ok(DeviceMessage::File { viewer, sealed }) if sealed.len() <= MAX_SEALED_FILE_LEN => {
-            if !registry.forward_file(machine_id, viewer, sealed) {
+            let event = DashboardEvent::File { device_id: machine_id.to_owned(), sealed };
+            if !registry.forward_bulk(machine_id, viewer, event) {
                 debug!(%machine_id, viewer, "relay: dropping file data for a viewer that isn't keeping up");
+            }
+            return;
+        }
+        Ok(DeviceMessage::Shell { viewer, sealed }) if sealed.len() <= MAX_SEALED_SHELL_LEN => {
+            let event = DashboardEvent::Shell { device_id: machine_id.to_owned(), sealed };
+            if !registry.forward_bulk(machine_id, viewer, event) {
+                debug!(%machine_id, viewer, "relay: dropping shell output for a viewer that isn't keeping up");
             }
             return;
         }
@@ -381,11 +391,11 @@ async fn handle_dashboard(
 
     let (events, mut event_rx) = mpsc::unbounded_channel::<Outbound>();
     let (frames, mut frame_rx) = mpsc::channel::<Bytes>(VIEWER_FRAME_QUEUE);
-    let (files, mut file_rx) = mpsc::channel::<DashboardEvent>(VIEWER_FILE_QUEUE);
+    let (bulk, mut bulk_rx) = mpsc::channel::<DashboardEvent>(VIEWER_BULK_QUEUE);
     let handle = DashboardHandle {
         events: events.clone(),
         frames,
-        files,
+        bulk,
         user_id: current.user.id,
         session_id: current.session_id,
         email: current.user.email,
@@ -408,8 +418,9 @@ async fn handle_dashboard(
                     }
                 },
                 Some(frame) = frame_rx.recv() => Message::Binary(frame),
-                // Last: file data fills whatever the picture leaves.
-                Some(file) = file_rx.recv() => match serde_json::to_string(&file) {
+                // Last: file data and shell output fill whatever the
+                // picture leaves.
+                Some(bulk) = bulk_rx.recv() => match serde_json::to_string(&bulk) {
                     Ok(json) => Message::Text(json.into()),
                     Err(_) => continue,
                 },
@@ -424,6 +435,7 @@ async fn handle_dashboard(
     let mut input_budget = Budget::input();
     let mut clipboard_budget = Budget::clipboard();
     let mut file_budget = Budget::file_bytes();
+    let mut shell_budget = Budget::shell_bytes();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -461,6 +473,12 @@ async fn handle_dashboard(
                 // or an ack a few hundred bytes.
                 if sealed.len() <= MAX_SEALED_FILE_LEN && file_budget.take_n(sealed.len() as f64) {
                     registry.file(dashboard_id, &device_id, sealed);
+                }
+            }
+            Ok(DashboardCommand::Shell { device_id, sealed }) => {
+                // Keystrokes, the odd paste, resizes and acks.
+                if sealed.len() <= MAX_SEALED_SHELL_LEN && shell_budget.take_n(sealed.len() as f64) {
+                    registry.shell(dashboard_id, &device_id, sealed);
                 }
             }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
@@ -501,6 +519,12 @@ impl Budget {
     /// through to a machine.
     fn file_bytes() -> Self {
         Self::new(64.0 * 1024.0 * 1024.0, 16.0 * 1024.0 * 1024.0)
+    }
+
+    /// Bytes of sealed shell messages from one dashboard: far beyond typing,
+    /// and room for a large paste.
+    fn shell_bytes() -> Self {
+        Self::new(1024.0 * 1024.0, 1024.0 * 1024.0)
     }
 
     fn new(per_second: f64, burst: f64) -> Self {

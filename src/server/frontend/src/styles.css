@@ -1416,6 +1416,132 @@ select {
   outline-offset: -6px;
 }
 
+.shell-panel {
+  border: 1px solid var(--line);
+  background: #050606;
+}
+
+.shell-tabs {
+  display: flex;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.shell-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-3);
+  font: inherit;
+  font-size: 11.5px;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.shell-tab.active {
+  border-color: var(--line-strong);
+  color: var(--fg);
+}
+
+.shell-status {
+  padding: 6px 10px;
+  color: var(--fg-2);
+  font-size: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.terminal-host {
+  height: 360px;
+  padding: 6px 8px;
+}
+
+/* In full screen the panel is the whole screen, and the terminal fills it. */
+.shell-panel.fullscreen {
+  display: flex;
+  flex-direction: column;
+  border: 0;
+}
+
+.shell-panel.fullscreen .terminal-host {
+  flex: 1;
+  height: auto;
+  min-height: 0;
+}
+
+.shell-hint kbd {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 0 4px;
+  border: 1px solid var(--line-strong);
+  color: var(--fg-2);
+}
+
+/* Terminal and Files: the same frame as the screen's. */
+.tool-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  padding: 14px;
+  gap: 10px;
+}
+
+.tool-wrap[hidden],
+.tool-wrap [hidden] {
+  display: none;
+}
+
+.tool-wrap .terminal-host {
+  height: min(70vh, 720px);
+}
+
+.tool-connect {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* The clipboard menu drops from the stage bar (which clips its overflow). */
+.stage {
+  position: relative;
+}
+
+.stage-menu {
+  position: absolute;
+  top: 28px;
+  right: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 260px;
+  border: 1px solid var(--line-strong);
+  background: var(--rail);
+}
+
+.stage-menu button {
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.stage-menu button:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.stage-menu button:disabled {
+  color: var(--fg-3);
+  cursor: default;
+}
+
+.terminal-host[hidden] {
+  display: none;
+}
+
 .clip-panel {
   display: flex;
   gap: 8px;

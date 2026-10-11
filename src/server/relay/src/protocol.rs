@@ -65,6 +65,9 @@ pub enum DeviceMessage {
         /// Whether this viewer may send and fetch files.
         #[serde(default)]
         files: Option<bool>,
+        /// Whether this viewer may open shells.
+        #[serde(default)]
+        shell: Option<bool>,
     },
     /// The machine refused a viewer (no valid grant, revoked, expired...).
     ViewerReject { viewer: u64, reason: String },
@@ -77,6 +80,9 @@ pub enum DeviceMessage {
     /// A file-channel message sealed for one viewer: a listing, a transfer's
     /// progress, or a chunk of file data. Queued apart from everything else.
     File { viewer: u64, sealed: String },
+    /// A shell-channel message sealed for one viewer: a shell's output, or
+    /// that it opened or exited. Queued with file data.
+    Shell { viewer: u64, sealed: String },
 }
 
 /// Messages the relay sends down to a device.
@@ -115,6 +121,9 @@ pub enum DeviceCommand {
     /// A file-channel message sealed by the viewer (list, offer, a chunk of
     /// an upload, fetch, ack, cancel). Only passed on for control.
     File { viewer: u64, sealed: String },
+    /// A shell-channel message sealed by the viewer (open, keystrokes,
+    /// resize, ack, close). Only passed on for roles that may open shells.
+    Shell { viewer: u64, sealed: String },
     /// Every revocation the owner has signed for this machine.
     Revocations { revocations: Vec<SignedView> },
 }
@@ -156,6 +165,9 @@ pub const MAX_SEALED_CLIPBOARD_LEN: usize = (8 + 1 + 256 * 1024 + 16_usize).div_
 /// a header of up to 64 KB (a listing) and up to 64 KB of file data, and
 /// the tag, in base64.
 pub const MAX_SEALED_FILE_LEN: usize = (8 + 3 + 65_535 + 65_536 + 16_usize).div_ceil(3) * 4;
+/// A sealed shell-channel message, either way: counter, op, header length,
+/// a small header, up to 16 KB of terminal bytes, and the tag, in base64.
+pub const MAX_SEALED_SHELL_LEN: usize = (8 + 3 + 1024 + 16 * 1024 + 16_usize).div_ceil(3) * 4;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
 const MAX_ANSWER_LEN: usize = 2048;
 
@@ -199,6 +211,9 @@ pub enum DashboardCommand {
     /// A sealed file-channel message. Only passed on while viewing the
     /// machine with a control (or owner) role.
     File { device_id: String, sealed: String },
+    /// A sealed shell-channel message. Only passed on while viewing the
+    /// machine with a role that may open shells (dev or owner).
+    Shell { device_id: String, sealed: String },
 }
 
 /// A machine as one dashboard's user sees it.
@@ -266,6 +281,8 @@ pub enum DashboardEvent {
         clipboard: &'static str,
         /// Whether the machine lets this viewer send and fetch files.
         files: bool,
+        /// Whether the machine lets this viewer open shells.
+        shell: bool,
     },
     /// The machine refused to stream to this viewer.
     ViewRejected { device_id: String, reason: String },
@@ -275,6 +292,8 @@ pub enum DashboardEvent {
     Clipboard { device_id: String, sealed: String },
     /// A file-channel message the machine sealed for this viewer.
     File { device_id: String, sealed: String },
+    /// A shell-channel message the machine sealed for this viewer.
+    Shell { device_id: String, sealed: String },
 }
 
 /// Binary video frame produced by hawk-service (BuildVideoFrame):
@@ -375,6 +394,17 @@ mod tests {
         assert!(matches!(message, DeviceMessage::File { viewer: 3, .. }));
         let largest = BASE64.encode(vec![0u8; 8 + 3 + 65_535 + 65_536 + 16]);
         assert!(largest.len() <= MAX_SEALED_FILE_LEN);
+    }
+
+    #[test]
+    fn shell_messages_round_trip() {
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"shell","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::Shell { .. }));
+        let message: DeviceMessage = serde_json::from_str(r#"{"type":"shell","viewer":3,"sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::Shell { viewer: 3, .. }));
+        let largest = BASE64.encode(vec![0u8; 8 + 3 + 1024 + 16 * 1024 + 16]);
+        assert!(largest.len() <= MAX_SEALED_SHELL_LEN);
     }
 
     #[test]

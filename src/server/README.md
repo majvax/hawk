@@ -241,10 +241,18 @@ it says is taken on trust. Formats are in `relay/src/e2e.rs`,
   own associated data. What the machine sends back (listings, progress,
   download chunks) uses a fourth per-viewer key with its own counter,
   because the relay queues it apart from everything else and may deliver it
-  out of order with the rest. Only passed on for control. The relay queues
+  out of order with the rest. Only passed on for control, dev or owner. The relay queues
   file data per dashboard in a bounded queue, written after events and
   video, and drops what overflows. It caps each message at about 171 KB and
   each dashboard at 64 MB/s of uploads.
+- **Shells:** the same scheme with a fifth per-viewer key for output, and
+  their own associated data. Only passed on for roles that may open shells
+  (dev and owner); output shares the bounded per-dashboard queue with file
+  data, and keystrokes are budgeted at 1 MB/s per dashboard.
+- **Roles** are capabilities, not a ladder (see the top-level README): dev
+  gets shells and files but no screen. The machine never gives a dev viewer
+  the stream key, and the relay neither starts capture for it nor forwards
+  it frames.
 - **Limits:** the relay can still refuse service, see who watches what and
   when, and delay a revocation it should pass on, though not past the
   share's expiry. A dashboard served by a compromised relay could be

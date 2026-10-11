@@ -158,7 +158,7 @@ export interface SignedStatement {
 // When and how long a share grants access. All optional: an open-ended
 // share starts now and lasts until revoked.
 export interface ShareTerms {
-  role: "view" | "control";
+  role: "view" | "control" | "dev";
   startsAt: number | null; // unix seconds; null: right away
   expiresAt: number | null; // unix seconds; null: until revoked
   singleView: boolean; // used up once the viewer stops watching

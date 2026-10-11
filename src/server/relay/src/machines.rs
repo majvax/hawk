@@ -235,7 +235,7 @@ pub struct ShareRequest {
 impl ShareRequest {
     fn terms(&self, now: i64) -> Result<ShareTerms, ApiError> {
         if self.role == Role::Owner {
-            return Err(ApiError::bad_request("role must be \"view\" or \"control\""));
+            return Err(ApiError::bad_request("role must be \"view\", \"control\" or \"dev\""));
         }
         let starts_at = self.starts_at.filter(|&starts_at| starts_at > now);
         let begins = starts_at.unwrap_or(now);

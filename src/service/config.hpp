@@ -42,9 +42,17 @@ struct FilesConfig {
     std::uint64_t max_size = default_max_file_size;
 };
 
+struct ShellConfig {
+    // Off unless the machine's owner turns it on.
+    bool enabled = false;
+    // What a shell runs, as the logged-on user (never SYSTEM).
+    std::string command = "powershell.exe -NoLogo";
+};
+
 struct MachineConfig {
     ClipboardConfig clipboard;
     FilesConfig     files;
+    ShellConfig     shell;
 };
 
 // The config, with defaults for what it leaves out (or for a missing file).
@@ -61,6 +69,10 @@ struct MachineConfig {
 //   enabled = false
 //   drop_dir = ""        # empty: %USERPROFILE%\Downloads\Hawk
 //   max_size = 1073741824
+//
+//   [[shell]]
+//   enabled = false
+//   command = "powershell.exe -NoLogo"
 [[nodiscard]] MachineConfig load_machine_config();
 
 }  // namespace hawk::service

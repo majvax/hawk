@@ -3,6 +3,7 @@
 #include "crypto.hpp"
 #include "e2e.hpp"
 #include "files.hpp"
+#include "shell.hpp"
 #include "machine_identity.hpp"
 #include "machine_key.hpp"
 #include "websocket/websocket.hpp"
@@ -20,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <memory>
 #include <optional>
 #include <span>
@@ -90,11 +92,11 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard, file
+    std::string                                  sealed;         // input, clipboard, file, shell
     std::vector<svc::SignedStatement>            revocations;    // revocations
 };
 
@@ -372,6 +374,7 @@ struct Connection {
     Session&                             session;
     std::unique_ptr<svc::ViewerHub>&     hub;
     std::unique_ptr<svc::FileTransfers>& files;
+    std::unique_ptr<svc::ShellSessions>& shells;
     const svc::MachineConfig&            config;
 };
 
@@ -386,8 +389,8 @@ void OpenViewerHub(Connection& connection) {
     }
     auto& client = connection.client;
     connection.hub = std::make_unique<svc::ViewerHub>(
-        connection.session.key, *connection.session.machine_id, std::move(owner_key), connection.config.clipboard,
-        connection.config.files.enabled, [&client](const std::string& text) {
+        connection.session.key, *connection.session.machine_id, std::move(owner_key), connection.config,
+        [&client](const std::string& text) {
             if (text.empty()) {
                 return;
             }
@@ -398,6 +401,9 @@ void OpenViewerHub(Connection& connection) {
     if (connection.config.files.enabled) {
         connection.files = std::make_unique<svc::FileTransfers>(connection.config.files, *connection.hub);
     }
+    if (connection.config.shell.enabled) {
+        connection.shells = std::make_unique<svc::ShellSessions>(connection.config.shell, *connection.hub);
+    }
 }
 
 void HandleRelayCommand(std::string_view text, Connection& connection) {
@@ -406,7 +412,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
-    auto& [client, capture, session, hub, files, config] = connection;
+    auto& [client, capture, session, hub, files, shells, config] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -433,6 +439,9 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         if (files != nullptr) {
             files->drop_viewer(command.viewer);
         }
+        if (shells != nullptr) {
+            shells->drop_viewer(command.viewer);
+        }
     } else if (command.type == "input") {
         if (const auto packet = hub->input(command.viewer, command.sealed); packet.has_value()) {
             ForwardInput(capture, *packet);
@@ -449,6 +458,10 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
     } else if (command.type == "file") {
         if (auto message = hub->file(command.viewer, command.sealed); message.has_value() && files != nullptr) {
             files->handle(command.viewer, std::move(*message));
+        }
+    } else if (command.type == "shell") {
+        if (auto message = hub->shell(command.viewer, command.sealed); message.has_value() && shells != nullptr) {
+            shells->handle(command.viewer, std::move(*message));
         }
     } else if (command.type == "revocations") {
         hub->apply_revocations(command.revocations);
@@ -546,11 +559,13 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
 
         std::unique_ptr<svc::ViewerHub>     hub;
         std::unique_ptr<svc::FileTransfers> files;
+        std::unique_ptr<svc::ShellSessions> shells;
         Connection                          connection{.client = client,
                                                        .capture = capture,
                                                        .session = *session,
                                                        .hub = hub,
                                                        .files = files,
+                                                       .shells = shells,
                                                        .config = config};
         OpenViewerHub(connection);
 
@@ -571,7 +586,8 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         // connection; stop it before the socket it forwards to goes away,
         // and before the viewers it seals frames for.
         capture.stop();
-        files.reset();  // answers through the hub
+        files.reset();  // these answer through the hub
+        shells.reset();
         hub.reset();
         active_client.store(nullptr);
         client.close();
@@ -633,6 +649,7 @@ void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* ar
     spdlog::info("config: clipboard {}{}", to_string(config.clipboard.mode),
                  config.clipboard.view_pull ? ", view shares may read it" : "");
     spdlog::info("config: file transfer {}", config.files.enabled ? "on" : "off");
+    spdlog::info("config: shell {}", config.shell.enabled ? std::format("on (\"{}\")", config.shell.command) : "off");
 
     ServiceContext service;
     service.status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;

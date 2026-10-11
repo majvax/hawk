@@ -69,6 +69,7 @@ fn role_name(role: Role) -> &'static str {
     match role {
         Role::View => "view",
         Role::Control | Role::Owner => "control",
+        Role::Dev => "dev",
     }
 }
 

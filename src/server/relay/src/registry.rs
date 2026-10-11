@@ -51,12 +51,12 @@ pub struct ViewEnded {
 pub struct DashboardHandle {
     pub events: mpsc::UnboundedSender<Outbound>,
     pub frames: mpsc::Sender<Bytes>,
-    /// File-channel messages from machines: bounded like frames, and sent
-    /// after both events and frames, so a download never holds up the
-    /// picture. The machine keeps only a small window unacknowledged, so an
-    /// honest one never fills it; what overflows is dropped, and the
-    /// transfer stalls and is retried from where it got to.
-    pub files: mpsc::Sender<DashboardEvent>,
+    /// File and shell messages from machines: bounded like frames, and sent
+    /// after both events and frames, so a download or a shell's output never
+    /// holds up the picture. The machine keeps only a small window of each
+    /// unacknowledged, so an honest one never fills it; what overflows is
+    /// dropped, and the transfer stalls and is retried from where it got to.
+    pub bulk: mpsc::Sender<DashboardEvent>,
     pub user_id: i64,
     pub session_id: i64,
     pub email: String,
@@ -77,6 +77,11 @@ struct Dashboard {
 struct Viewer {
     frames: mpsc::Sender<Bytes>,
     email: String,
+    // Whether this viewer's role watches the screen. A dev share is a
+    // viewer for its shell and files only: it neither starts capture nor
+    // gets frames (which it couldn't decrypt anyway: the machine never
+    // gives it the stream key).
+    video: bool,
     // Set for a new viewer and whenever its queue overflowed: a dropped
     // frame breaks every delta after it, so skip ahead to the next keyframe.
     awaiting_keyframe: bool,
@@ -99,7 +104,14 @@ impl Device {
 
 /// What the machine sent for one of its viewers.
 pub enum Answer {
-    Accept { statement: String, signature: String, wrapped_key: String, clipboard: &'static str, files: bool },
+    Accept {
+        statement: String,
+        signature: String,
+        wrapped_key: String,
+        clipboard: &'static str,
+        files: bool,
+        shell: bool,
+    },
     Reject { reason: String },
     StreamKey { wrapped_key: String },
     Clipboard { sealed: String },
@@ -160,11 +172,9 @@ impl Inner {
     /// leaving stops capture. Returns whether it was watching.
     fn detach(&mut self, dashboard: DashboardId, machine_id: &str) -> bool {
         let Some(device) = self.devices.get_mut(machine_id) else { return false };
-        if device.viewers.remove(&dashboard).is_none() {
-            return false;
-        }
+        let Some(left) = device.viewers.remove(&dashboard) else { return false };
         device.send(DeviceCommand::ViewerLeft { viewer: dashboard });
-        if device.viewers.is_empty() {
+        if left.video && !device.viewers.values().any(|viewer| viewer.video) {
             device.send(DeviceCommand::StopCapture);
         }
         self.publish(machine_id); // the owner's viewer list changed
@@ -295,7 +305,7 @@ impl Registry {
         let keyframe = is_keyframe(&frame);
         let mut inner = self.lock();
         let Some(device) = inner.devices.get_mut(machine_id) else { return };
-        for viewer in device.viewers.values_mut() {
+        for viewer in device.viewers.values_mut().filter(|viewer| viewer.video) {
             if viewer.awaiting_keyframe && !keyframe {
                 continue;
             }
@@ -363,13 +373,16 @@ impl Registry {
         let Some(dashboard) = inner.dashboards.get(&dashboard_id) else { return false };
         let Some(row) = dashboard.access.get(machine_id) else { return false };
         let grant = row.grant.as_ref().map(SignedView::from);
+        let video = row.role.can_view();
         let viewer = Viewer {
             frames: dashboard.handle.frames.clone(),
             email: dashboard.handle.email.clone(),
+            video,
             awaiting_keyframe: true,
         };
         let Some(device) = inner.devices.get_mut(machine_id) else { return false };
-        let was_idle = device.viewers.is_empty();
+        // Capture starts with the first viewer that watches the screen.
+        let was_idle = video && !device.viewers.values().any(|viewer| viewer.video);
         // Asked again while already watching (a fresh key exchange): start
         // over from the next keyframe.
         device.viewers.entry(dashboard_id).and_modify(|viewer| viewer.awaiting_keyframe = true).or_insert(viewer);
@@ -396,7 +409,7 @@ impl Registry {
             .dashboards
             .get(&dashboard_id)
             .and_then(|dashboard| dashboard.access.get(machine_id))
-            .is_some_and(|row| row.role >= Role::Control);
+            .is_some_and(|row| row.role.can_control());
         if !may_control {
             return false;
         }
@@ -427,28 +440,44 @@ impl Registry {
     /// Passes a sealed file-channel message on to the machine if this
     /// dashboard may control it and is watching it. Returns whether it was.
     pub fn file(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        self.pass_on(dashboard_id, machine_id, Role::can_files, DeviceCommand::File { viewer: dashboard_id, sealed })
+    }
+
+    /// Passes a sealed shell-channel message on to the machine if this
+    /// dashboard may open shells there and is watching it.
+    pub fn shell(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        self.pass_on(dashboard_id, machine_id, Role::can_shell, DeviceCommand::Shell { viewer: dashboard_id, sealed })
+    }
+
+    fn pass_on(
+        &self,
+        dashboard_id: DashboardId,
+        machine_id: &str,
+        allowed: fn(Role) -> bool,
+        command: DeviceCommand,
+    ) -> bool {
         let inner = self.lock();
-        let may_control = inner
+        let may = inner
             .dashboards
             .get(&dashboard_id)
             .and_then(|dashboard| dashboard.access.get(machine_id))
-            .is_some_and(|row| row.role >= Role::Control);
+            .is_some_and(|row| allowed(row.role));
         let Some(device) = inner.devices.get(machine_id) else { return false };
-        if !may_control || !device.viewers.contains_key(&dashboard_id) {
+        if !may || !device.viewers.contains_key(&dashboard_id) {
             return false;
         }
-        device.send(DeviceCommand::File { viewer: dashboard_id, sealed });
+        device.send(command);
         true
     }
 
-    /// Queues a machine's file-channel message for one of its viewers,
-    /// without waiting: false when that viewer isn't watching or its file
-    /// queue is full.
-    pub fn forward_file(&self, machine_id: &str, viewer: DashboardId, sealed: String) -> bool {
+    /// Queues a machine's file or shell message for one of its viewers,
+    /// without waiting: false when that viewer isn't watching or its queue
+    /// is full.
+    pub fn forward_bulk(&self, machine_id: &str, viewer: DashboardId, event: DashboardEvent) -> bool {
         let inner = self.lock();
         let watching = inner.devices.get(machine_id).is_some_and(|device| device.viewers.contains_key(&viewer));
         let Some(dashboard) = inner.dashboards.get(&viewer).filter(|_| watching) else { return false };
-        dashboard.handle.files.try_send(DashboardEvent::File { device_id: machine_id.to_owned(), sealed }).is_ok()
+        dashboard.handle.bulk.try_send(event).is_ok()
     }
 
     /// Routes the machine's answer to one of its viewers. A refused viewer
@@ -461,8 +490,8 @@ impl Registry {
         }
         let device_id = machine_id.to_owned();
         let event = match answer {
-            Answer::Accept { statement, signature, wrapped_key, clipboard, files } => {
-                DashboardEvent::ViewAccepted { device_id, statement, signature, wrapped_key, clipboard, files }
+            Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell } => {
+                DashboardEvent::ViewAccepted { device_id, statement, signature, wrapped_key, clipboard, files, shell }
             }
             Answer::StreamKey { wrapped_key } => DashboardEvent::StreamKey { device_id, wrapped_key },
             Answer::Clipboard { sealed } => DashboardEvent::Clipboard { device_id, sealed },
@@ -605,11 +634,11 @@ mod tests {
     fn handle(user_id: i64) -> (DashboardHandle, mpsc::UnboundedReceiver<Outbound>) {
         let (events, events_rx) = mpsc::unbounded_channel();
         let (frames, _) = mpsc::channel(1);
-        let (files, _) = mpsc::channel(1);
+        let (bulk, _) = mpsc::channel(1);
         let handle = DashboardHandle {
             events,
             frames,
-            files,
+            bulk,
             user_id,
             session_id: user_id,
             email: format!("user{user_id}@example.com"),
@@ -772,19 +801,71 @@ mod tests {
         let registry = Registry::default();
         let (events, _events_rx) = mpsc::unbounded_channel();
         let (frames, _frames_rx) = mpsc::channel(1);
-        let (files, mut files_rx) = mpsc::channel(2);
+        let (bulk, mut files_rx) = mpsc::channel(2);
         let handle =
-            DashboardHandle { events, frames, files, user_id: 2, session_id: 2, email: "user2@example.com".to_owned() };
+            DashboardHandle { events, frames, bulk, user_id: 2, session_id: 2, email: "user2@example.com".to_owned() };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Control)]);
         let (outbound, _device_rx) = mpsc::unbounded_channel();
         registry.add_device(MACHINE, 1, outbound);
-        assert!(!registry.forward_file(MACHINE, dashboard, "early".to_owned()));
+        let file = |sealed: &str| DashboardEvent::File { device_id: MACHINE.to_owned(), sealed: sealed.to_owned() };
+        assert!(!registry.forward_bulk(MACHINE, dashboard, file("early")));
         assert!(registry.start_view(dashboard, MACHINE, join()));
 
-        assert!(registry.forward_file(MACHINE, dashboard, "a".to_owned()));
-        assert!(registry.forward_file(MACHINE, dashboard, "b".to_owned()));
-        assert!(!registry.forward_file(MACHINE, dashboard, "c".to_owned()));
+        assert!(registry.forward_bulk(MACHINE, dashboard, file("a")));
+        assert!(registry.forward_bulk(MACHINE, dashboard, file("b")));
+        assert!(!registry.forward_bulk(MACHINE, dashboard, file("c")));
         assert!(matches!(files_rx.try_recv(), Ok(DashboardEvent::File { ref sealed, .. }) if sealed == "a"));
+    }
+
+    /// A dev share is a viewer for its shell and files: it doesn't start
+    /// capture, gets no frames, and can't send input.
+    #[test]
+    fn dev_shares_get_a_shell_and_no_video() {
+        let registry = Registry::default();
+        let (handle, _events) = handle(2);
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::Dev)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
+        assert!(next(&mut device_rx).is_none(), "no capture for a dev share");
+
+        assert!(!registry.input(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(registry.shell(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Shell { .. })));
+        assert!(registry.file(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::File { .. })));
+
+        registry.stop_view(dashboard, MACHINE);
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerLeft { .. })));
+        assert!(next(&mut device_rx).is_none(), "nothing to stop");
+    }
+
+    /// Control has video and input, and no shell.
+    #[test]
+    fn control_shares_get_no_shell() {
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
+        assert!(!registry.shell(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Owner);
+        assert!(registry.shell(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Shell { .. })));
+    }
+
+    /// Capture stops when the last viewer that watches leaves, even with a
+    /// dev share still there for its shell.
+    #[test]
+    fn capture_stops_with_the_last_video_viewer() {
+        let (registry, watcher, mut device_rx, _events) = watching(Role::Control);
+        let (handle, _dev_events) = handle(3);
+        let mut dev_row = row(Role::Dev);
+        dev_row.owner_id = 1;
+        let dev = registry.add_dashboard(handle, vec![dev_row]);
+        assert!(registry.start_view(dev, MACHINE, join()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
+        registry.stop_view(watcher, MACHINE);
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerLeft { .. })));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StopCapture)));
     }
 
     /// Answers only go to a dashboard that is watching that machine.
