@@ -230,6 +230,13 @@ it says is taken on trust. Formats are in `relay/src/e2e.rs`,
   leaves, everyone else moves to a new stream key.
 - **Input:** AES-256-GCM under a key only that viewer and the machine
   share, with a counter the machine requires to keep increasing.
+- **Clipboard:** a viewer's paste or read request is sealed like input
+  (same key, same counter, its own associated data, so neither can be
+  replayed as the other). The machine's answer is sealed under a third
+  per-viewer key, the reply key, with its own counter. The relay passes
+  requests on for any role while the viewer is watching, and leaves the
+  rest to the machine. Each message is at most about 342 KB, and there are
+  at most 2 a second per dashboard and per viewer.
 - **Limits:** the relay can still refuse service, see who watches what and
   when, and delay a revocation it should pass on, though not past the
   share's expiry. A dashboard served by a compromised relay could be

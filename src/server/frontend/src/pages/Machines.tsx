@@ -9,8 +9,8 @@ import {
 } from "../api.js";
 import { createEnrollment } from "../e2e.js";
 import type { Identity } from "../keys.js";
-import type { Machine, Role } from "../protocol.js";
-import { Alert, CodeBlock, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
+import { MAX_CLIPBOARD_BYTES, type Machine, type Role } from "../protocol.js";
+import { Alert, CodeBlock, CopyButton, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
 import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
 import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
@@ -474,6 +474,19 @@ interface KeyboardLock {
 }
 const keyboardLock = (): KeyboardLock | undefined => (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard;
 
+// What the clipboard panel under the screen shows, if anything: text to
+// paste typed by hand (when the browser won't hand its clipboard over),
+// or the machine's text (when the browser won't take it).
+type ClipboardPanel = { kind: "paste"; text: string } | { kind: "received"; text: string } | null;
+
+function byteSize(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+function formatSize(bytes: number): string {
+  return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
+}
+
 function Viewer({
   dashboard,
   shown,
@@ -489,10 +502,12 @@ function Viewer({
   status: Dashboard["status"];
   onConnect: (machine: Machine) => void;
 }): JSX.Element {
-  const { canvasRef, picture, stats, decodeError, security, sendInput, stopView } = dashboard;
+  const { canvasRef, picture, stats, decodeError, security, clipboard, sendInput, sendClipboard } = dashboard;
   const stageRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [keysLocked, setKeysLocked] = useState(false);
+  const [clipPanel, setClipPanel] = useState<ClipboardPanel>(null);
+  const [clipNote, setClipNote] = useState<string | null>(null);
 
   const onScreen = shown && viewing !== null && selected?.id === viewing.id;
   // Nothing to send input to unless a picture is actually up, and the relay
@@ -505,7 +520,90 @@ function Viewer({
     picture !== null &&
     security?.kind === "secured" &&
     security.role !== "view";
-  const input = useRemoteInput(canvasRef, canControl, sendInput);
+  // The machine checks every clipboard request for itself; these only
+  // decide which buttons make sense to show.
+  const secured = onScreen && viewing.online && status === "open" && security?.kind === "secured";
+  const canReadClipboard = secured && clipboard.access !== "off";
+  const canPaste = canReadClipboard && security.role !== "view";
+
+  // A new view, or none: whatever the panel held was for the last one.
+  useEffect(() => {
+    setClipPanel(null);
+    setClipNote(null);
+  }, [viewing?.id, canReadClipboard]);
+
+  // Text from the machine: straight onto this computer's clipboard where
+  // the browser allows it, otherwise shown to copy by hand.
+  const latest = clipboard.latest;
+  useEffect(() => {
+    if (latest === null) return;
+    if (latest.text === "") {
+      if (!latest.pushed) setClipNote("The machine's clipboard has no text.");
+      return;
+    }
+    const what = latest.pushed ? "Copied on the machine" : "The machine's clipboard";
+    const size = formatSize(byteSize(latest.text));
+    if (!document.hasFocus()) {
+      setClipPanel({ kind: "received", text: latest.text });
+      setClipNote(`${what} (${size}); copy it below.`);
+      return;
+    }
+    navigator.clipboard.writeText(latest.text).then(
+      () => {
+        setClipPanel((prev) => (prev?.kind === "received" ? null : prev));
+        setClipNote(`${what} is on your clipboard (${size}).`);
+      },
+      () => {
+        setClipPanel({ kind: "received", text: latest.text });
+        setClipNote(`${what} (${size}); this browser won't let the page copy it, so copy it below.`);
+      },
+    );
+  }, [latest]);
+
+  const pasteText = (text: string): void => {
+    if (text === "") {
+      setClipNote("There's no text to paste.");
+      return;
+    }
+    const size = byteSize(text);
+    if (size > MAX_CLIPBOARD_BYTES) {
+      setClipNote(`That's ${formatSize(size)}; the most the machine takes is ${formatSize(MAX_CLIPBOARD_BYTES)}.`);
+      return;
+    }
+    if (sendClipboard(text)) {
+      setClipPanel(null);
+      setClipNote(`Sent ${formatSize(size)} to the machine's clipboard. Paste it there with Ctrl+V.`);
+    }
+  };
+
+  const pasteFromClipboard = async (): Promise<void> => {
+    let text: string;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      // Not allowed, or not supported: let it be pasted in by hand.
+      setClipPanel({ kind: "paste", text: "" });
+      setClipNote("This browser won't hand the page your clipboard; paste the text below.");
+      return;
+    }
+    pasteText(text);
+  };
+
+  // Ctrl+V on the screen: this computer's text goes first, quietly; a
+  // problem with it still shows below the screen.
+  const pasteOnKey = (text: string): boolean => {
+    const size = byteSize(text);
+    if (size > MAX_CLIPBOARD_BYTES) {
+      setClipNote(`Not pasted: ${formatSize(size)} is more than the machine takes (${formatSize(MAX_CLIPBOARD_BYTES)}).`);
+      return false;
+    }
+    return sendClipboard(text);
+  };
+  const input = useRemoteInput(canvasRef, canControl, sendInput, canPaste ? pasteOnKey : null);
+
+  const getClipboard = (): void => {
+    if (sendClipboard(null)) setClipNote(null);
+  };
 
   useEffect(() => {
     const onChange = (): void => {
@@ -590,6 +688,25 @@ function Viewer({
               Release
             </button>
           )}
+          {canPaste && (
+            <button
+              type="button"
+              onClick={() => void pasteFromClipboard()}
+              title="Send your clipboard's text to the machine's clipboard"
+            >
+              Paste to machine
+            </button>
+          )}
+          {canReadClipboard && (
+            <button
+              type="button"
+              onClick={getClipboard}
+              disabled={clipboard.waiting}
+              title="Copy the machine's clipboard to yours"
+            >
+              {clipboard.waiting ? "Getting…" : "Get clipboard"}
+            </button>
+          )}
           {onScreen && (
             <button type="button" onClick={() => void toggleFullscreen()}>
               {fullscreen ? "Exit full screen" : "Full screen"}
@@ -624,6 +741,10 @@ function Viewer({
           )}
           {viewing.role === "view" && <span>View only: you can watch this screen but not send it input.</span>}
           {canControl && !input.active && <span>Click the screen to send it your mouse and keyboard.</span>}
+          {canReadClipboard && clipboard.access === "sync" && (
+            <span>Text copied on the machine comes to your clipboard while this page has focus.</span>
+          )}
+          {clipNote !== null && <span>{clipNote}</span>}
           {input.active && (
             <span>
               The machine's own pointer isn't in the picture; yours stands in for it.{" "}
@@ -638,6 +759,47 @@ function Viewer({
                 </>
               )}
             </span>
+          )}
+        </div>
+      )}
+      {onScreen && clipPanel !== null && (
+        <div className="clip-panel">
+          {clipPanel.kind === "paste" ? (
+            <>
+              <textarea
+                className="input"
+                value={clipPanel.text}
+                onChange={(e) => setClipPanel({ kind: "paste", text: e.target.value })}
+                placeholder="Text for the machine's clipboard"
+                aria-label="Text for the machine's clipboard"
+                rows={3}
+                autoFocus
+              />
+              <div className="clip-actions">
+                <button type="button" className="btn btn-sm btn-primary" onClick={() => pasteText(clipPanel.text)}>
+                  Send
+                </button>
+                <button type="button" className="btn btn-sm btn-ghost" onClick={() => setClipPanel(null)}>
+                  Cancel
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <textarea
+                className="input"
+                value={clipPanel.text}
+                readOnly
+                rows={3}
+                aria-label="The machine's clipboard"
+              />
+              <div className="clip-actions">
+                <CopyButton value={clipPanel.text} small />
+                <button type="button" className="btn btn-sm btn-ghost" onClick={() => setClipPanel(null)}>
+                  Dismiss
+                </button>
+              </div>
+            </>
           )}
         </div>
       )}

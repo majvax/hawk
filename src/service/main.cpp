@@ -1,4 +1,5 @@
 #include "capture_host.hpp"
+#include "config.hpp"
 #include "crypto.hpp"
 #include "e2e.hpp"
 #include "machine_identity.hpp"
@@ -88,11 +89,11 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input
+    std::string                                  sealed;         // input, clipboard
     std::vector<svc::SignedStatement>            revocations;    // revocations
 };
 
@@ -280,13 +281,21 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
 }
 
 // Launches hawk-capture in the logged-on user's session and forwards every
-// packet it produces to the relay, sealed for the machine's viewers.
-void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::ViewerHub& hub) {
+// packet it produces to the relay, sealed for the machine's viewers. With
+// the clipboard allowed, what hawk-capture reads off it goes to the viewers
+// that asked (or, in sync mode, everyone who may read it).
+void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::ViewerHub& hub,
+                  const svc::ClipboardConfig& clipboard) {
     if (capture.is_running()) {
         spdlog::info("relay: start_capture ignored, capture already running");
         return;
     }
 
+    const svc::CaptureOptions options{.clipboard = clipboard.mode != svc::ClipboardMode::off,
+                                      .clipboard_listen = clipboard.mode == svc::ClipboardMode::sync};
+    auto on_clipboard = [&hub](ipc::ClipboardKind kind, std::string_view text) {
+        hub.deliver_clipboard(text, kind == ipc::ClipboardKind::changed);
+    };
     auto started = capture.start([&client, &hub](const svc::CapturePacket& packet) {
         // Frames come steadily, so this is where shares that ran out are
         // noticed and their viewers cut off.
@@ -298,7 +307,7 @@ void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::
         if (auto sent = client.send_binary(frame); !sent.has_value()) {
             spdlog::warn("relay: failed to forward video packet: {}", net::to_string(sent.error()));
         }
-    });
+    }, options, on_clipboard);
     if (!started.has_value()) {
         spdlog::error("relay: failed to start capture: {}", svc::to_string(started.error()));
     }
@@ -357,10 +366,11 @@ bool CompleteEnrollment(Session& session, const RelayCommand& command) {
 
 // Everything one relay connection works with.
 struct Connection {
-    net::WebSocketClient&          client;
-    svc::CaptureHost&              capture;
-    Session&                       session;
+    net::WebSocketClient&            client;
+    svc::CaptureHost&                capture;
+    Session&                         session;
     std::unique_ptr<svc::ViewerHub>& hub;
+    const svc::MachineConfig&        config;
 };
 
 // The connection's viewers, once the machine knows its id.
@@ -374,7 +384,8 @@ void OpenViewerHub(Connection& connection) {
     }
     auto& client = connection.client;
     connection.hub = std::make_unique<svc::ViewerHub>(
-        connection.session.key, *connection.session.machine_id, std::move(owner_key), [&client](const std::string& text) {
+        connection.session.key, *connection.session.machine_id, std::move(owner_key), connection.config.clipboard,
+        [&client](const std::string& text) {
             if (text.empty()) {
                 return;
             }
@@ -390,7 +401,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
-    auto& [client, capture, session, hub] = connection;
+    auto& [client, capture, session, hub, config] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -404,7 +415,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         // Not enrolled, or the owner key didn't check out: nothing to serve.
         spdlog::debug("relay: ignoring \"{}\" before enrollment", command.type);
     } else if (command.type == "start_capture") {
-        StartCapture(client, capture, *hub);
+        StartCapture(client, capture, *hub, config.clipboard);
     } else if (command.type == "stop_capture") {
         capture.stop();
     } else if (command.type == "viewer_join") {
@@ -417,6 +428,15 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
     } else if (command.type == "input") {
         if (const auto packet = hub->input(command.viewer, command.sealed); packet.has_value()) {
             ForwardInput(capture, *packet);
+        }
+    } else if (command.type == "clipboard") {
+        if (const auto request = hub->clipboard(command.viewer, command.sealed); request.has_value()) {
+            const auto kind = request->op == svc::ClipboardRequest::Op::set ? ipc::ClipboardKind::set
+                                                                             : ipc::ClipboardKind::get;
+            if (!capture.is_running() || !capture.send_clipboard(kind, request->text)) {
+                spdlog::info("relay: the clipboard request from viewer {} couldn't reach hawk-capture",
+                             command.viewer);
+            }
         }
     } else if (command.type == "revocations") {
         hub->apply_revocations(command.revocations);
@@ -454,7 +474,8 @@ void SleepUnlessStopped(const std::stop_token& stop_token, std::chrono::seconds 
     }
 }
 
-void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClient*>& active_client) {
+void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClient*>& active_client,
+               const svc::MachineConfig& config) {
     net::WebSocketClient client;
     // Declared after `client` so it's destroyed (stopped) first: its reader
     // thread sends through `client`.
@@ -512,7 +533,8 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         }
 
         std::unique_ptr<svc::ViewerHub> hub;
-        Connection                      connection{.client = client, .capture = capture, .session = *session, .hub = hub};
+        Connection                      connection{
+            .client = client, .capture = capture, .session = *session, .hub = hub, .config = config};
         OpenViewerHub(connection);
 
         std::optional<std::uint16_t> close_code;
@@ -575,8 +597,23 @@ DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, [[maybe_unused]] DWORD event_type,
     return NO_ERROR;
 }
 
+[[nodiscard]] std::string_view to_string(svc::ClipboardMode mode) {
+    switch (mode) {
+        case svc::ClipboardMode::off:
+            return "off";
+        case svc::ClipboardMode::pull:
+            return "pull";
+        case svc::ClipboardMode::sync:
+            return "sync";
+    }
+    return "unknown";
+}
+
 void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* argv) {
     InitLogging();
+    const svc::MachineConfig config = svc::load_machine_config();
+    spdlog::info("config: clipboard {}{}", to_string(config.clipboard.mode),
+                 config.clipboard.view_pull ? ", view shares may read it" : "");
 
     ServiceContext service;
     service.status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
@@ -596,7 +633,7 @@ void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* ar
     SetServiceStatus(service.status_handle, &service.status);
 
     std::jthread relay_thread(
-        [&service] { RelayLoop(service.stop_source.get_token(), service.active_client); });
+        [&service, &config] { RelayLoop(service.stop_source.get_token(), service.active_client, config); });
 
     WaitForSingleObject(service.stop_event, INFINITE);
     relay_thread.join();

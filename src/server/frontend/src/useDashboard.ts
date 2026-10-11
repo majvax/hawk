@@ -4,7 +4,15 @@ import { getSession } from "./api.js";
 import { type EnrollmentCheck, type MachineTrust, ViewSession, checkEnrollment, trustMachine } from "./e2e.js";
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
-import type { DashboardCommand, DashboardEvent, InputEvent, Machine, ParsedVideoFrame, Role } from "./protocol.js";
+import type {
+  ClipboardAccess,
+  DashboardCommand,
+  DashboardEvent,
+  InputEvent,
+  Machine,
+  ParsedVideoFrame,
+  Role,
+} from "./protocol.js";
 
 // "reconnecting": the link dropped and the next attempt is scheduled;
 // "closed": the session is over, nothing more will be tried.
@@ -87,6 +95,23 @@ export type ViewSecurity =
 // ?debug in the URL adds the decoder's readout to the stream stats.
 const DEBUG = new URLSearchParams(window.location.search).has("debug");
 
+// The open view's clipboard: what the machine lets this viewer do with it,
+// and the latest text it sent.
+export interface ClipboardState {
+  access: ClipboardAccess;
+  // Set while a read is on its way.
+  waiting: boolean;
+  // The latest text from the machine: the answer to a read, or a copy made
+  // there (sync mode). `id` changes with every new one.
+  latest: { id: number; text: string; pushed: boolean } | null;
+}
+
+const NO_CLIPBOARD: ClipboardState = { access: "off", waiting: false, latest: null };
+
+// A read the machine hasn't answered by then (hawk-capture still starting,
+// or the request was dropped) stops showing as underway.
+const CLIPBOARD_WAIT_MS = 5000;
+
 export interface StreamStats {
   fps: number; // frames shown over the last second
   received: number; // frames that arrived over the last second
@@ -116,6 +141,7 @@ export interface Dashboard {
   decodeError: string | null;
   // The open view's end-to-end handshake; null with no view open.
   security: ViewSecurity | null;
+  clipboard: ClipboardState;
   // Owned machines whose enrollment this browser checked: "mismatch" means
   // the key the machine answered with isn't bound to the code made here.
   enrollmentChecks: Record<string, EnrollmentCheck>;
@@ -125,6 +151,10 @@ export interface Dashboard {
   // unless this user may control that machine, so a view-only viewer can
   // call this all it likes and nothing happens.
   sendInput: (event: InputEvent) => void;
+  // Pastes text into the machine's clipboard (control only), or with null
+  // asks for what's on it; the answer lands in `clipboard.latest`. Returns
+  // false when there's no secured view to send it to.
+  sendClipboard: (text: string | null) => boolean;
   // Skip the rest of the backoff and try now.
   reconnectNow: () => void;
 }
@@ -145,6 +175,10 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const [stats, setStats] = useState<StreamStats | null>(null);
   const [decodeError, setDecodeError] = useState<string | null>(null);
   const [security, setSecurity] = useState<ViewSecurity | null>(null);
+  const [clipboard, setClipboard] = useState<ClipboardState>(NO_CLIPBOARD);
+  // Numbers what the machine sends, so the same text twice still counts
+  // as new.
+  const clipboardIdRef = useRef(0);
   const [enrollmentChecks, setEnrollmentChecks] = useState<Record<string, EnrollmentCheck>>({});
 
   const socketRef = useRef<WebSocket | null>(null);
@@ -178,6 +212,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const dropSession = useRef((): void => {
     sessionRef.current?.abandon();
     sessionRef.current = null;
+    setClipboard(NO_CLIPBOARD);
   }).current;
   // Counted per frame, read and reset by the once-a-second stats sample.
   const framesRef = useRef(0);
@@ -454,6 +489,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
             () => {
               if (sessionRef.current === session && session.role !== null) {
                 setSecurity({ kind: "secured", role: session.role });
+                // A relay from before the clipboard says nothing: none, then.
+                setClipboard({ access: payload.clipboard ?? "off", waiting: false, latest: null });
               }
             },
             (error: unknown) => {
@@ -477,6 +514,17 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
           frameChainRef.current = frameChainRef.current
             .then(() => session.addStreamKey(payload.wrappedKey))
             .catch((error: unknown) => console.error("stream key:", error));
+          break;
+        }
+        case "clipboard": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          void session.openClipboard(payload.sealed).then((opened) => {
+            if (opened === null || sessionRef.current !== session) return;
+            clipboardIdRef.current += 1;
+            const latest = { id: clipboardIdRef.current, ...opened };
+            setClipboard((prev) => ({ ...prev, waiting: false, latest }));
+          });
           break;
         }
         case "view_rejected":
@@ -680,6 +728,32 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [send],
   );
 
+  const sendClipboard = useCallback(
+    (text: string | null): boolean => {
+      const deviceId = streamingRef.current;
+      const session = sessionRef.current;
+      if (deviceId === null || session === null || !session.accepted) return false;
+      const sealed = session.sealClipboard(text);
+      if (sealed === null) return false;
+      if (text === null) {
+        setClipboard((prev) => ({ ...prev, waiting: true }));
+        window.setTimeout(() => {
+          if (sessionRef.current === session) setClipboard((prev) => ({ ...prev, waiting: false }));
+        }, CLIPBOARD_WAIT_MS);
+      }
+      // Through the input chain: both are numbered from one counter, so
+      // they must reach the machine in the order they were sealed.
+      inputChainRef.current = inputChainRef.current
+        .then(() => sealed)
+        .then((payload) => {
+          if (sessionRef.current === session) send({ type: "clipboard", deviceId, sealed: payload });
+        })
+        .catch((error: unknown) => console.error("sealing clipboard:", error));
+      return true;
+    },
+    [send],
+  );
+
   const stopView = useCallback((): void => {
     if (viewingRef.current === null) return;
     if (streamingRef.current !== null) send({ type: "stop_view", deviceId: streamingRef.current });
@@ -698,10 +772,12 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     stats,
     decodeError,
     security,
+    clipboard,
     enrollmentChecks,
     startView,
     stopView,
     sendInput,
+    sendClipboard,
     reconnectNow,
   };
 }

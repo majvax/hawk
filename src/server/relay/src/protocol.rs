@@ -51,13 +51,26 @@ pub enum DeviceMessage {
         signature: String,
     },
     /// The machine accepted a viewer: its signed half of the key exchange,
-    /// and the stream key wrapped for that viewer alone.
-    ViewerAccept { viewer: u64, statement: String, signature: String, wrapped_key: String },
+    /// and the stream key wrapped for that viewer alone. `clipboard` is what
+    /// the machine's config lets this viewer do with its clipboard ("off",
+    /// "pull" or "sync"), for the dashboard's buttons; absent from a machine
+    /// that predates it.
+    ViewerAccept {
+        viewer: u64,
+        statement: String,
+        signature: String,
+        wrapped_key: String,
+        #[serde(default)]
+        clipboard: Option<String>,
+    },
     /// The machine refused a viewer (no valid grant, revoked, expired...).
     ViewerReject { viewer: u64, reason: String },
     /// A new stream key, wrapped for one viewer: sent to every remaining
     /// viewer when one leaves, so the one who left can't read what follows.
     StreamKey { viewer: u64, wrapped_key: String },
+    /// Clipboard text sealed for one viewer: the answer to its request, or
+    /// a copy made on the machine (sync mode). The relay can't read it.
+    Clipboard { viewer: u64, sealed: String },
 }
 
 /// Messages the relay sends down to a device.
@@ -90,6 +103,9 @@ pub enum DeviceCommand {
     ViewerLeft { viewer: u64 },
     /// Input sealed by the viewer for the machine; the relay can't read it.
     Input { viewer: u64, sealed: String },
+    /// A clipboard request sealed by the viewer (set or get); the machine
+    /// decides whether the viewer's role and its config allow it.
+    Clipboard { viewer: u64, sealed: String },
     /// Every revocation the owner has signed for this machine.
     Revocations { revocations: Vec<SignedView> },
 }
@@ -124,8 +140,21 @@ pub const MAX_STATEMENT_LEN: usize = 1024;
 /// A sealed input event: a JSON event of a few dozen bytes, plus counter
 /// and tag, in base64.
 pub const MAX_SEALED_INPUT_LEN: usize = 512;
+/// A sealed clipboard message, either way: counter, one byte saying what it
+/// is, up to 256 KB of text and the tag, in base64.
+pub const MAX_SEALED_CLIPBOARD_LEN: usize = (8 + 1 + 256 * 1024 + 16_usize).div_ceil(3) * 4;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
 const MAX_ANSWER_LEN: usize = 2048;
+
+/// What the machine said a viewer may do with its clipboard, as the
+/// dashboard is told it: anything unexpected (or nothing) is "off".
+pub fn clipboard_access(said: Option<&str>) -> &'static str {
+    match said {
+        Some("pull") => "pull",
+        Some("sync") => "sync",
+        _ => "off",
+    }
+}
 
 /// True when everything the machine sent for a viewer is of a sane size;
 /// the relay passes it on without reading it.
@@ -150,6 +179,10 @@ pub enum DashboardCommand {
     /// Sealed for the machine. Only passed on while viewing the machine
     /// with a control (or owner) role; the machine checks that again.
     Input { device_id: String, sealed: String },
+    /// A sealed clipboard request. Passed on while viewing the machine with
+    /// any role: whether a view share may read the clipboard is the
+    /// machine's config to say, and the machine checks every request.
+    Clipboard { device_id: String, sealed: String },
 }
 
 /// A machine as one dashboard's user sees it.
@@ -207,11 +240,21 @@ pub enum DashboardEvent {
     CaptureEnded { device_id: String },
     /// The machine's answer to this dashboard's join: its signed half of the
     /// key exchange and the stream key, wrapped for this viewer.
-    ViewAccepted { device_id: String, statement: String, signature: String, wrapped_key: String },
+    ViewAccepted {
+        device_id: String,
+        statement: String,
+        signature: String,
+        wrapped_key: String,
+        /// "off", "pull" or "sync": what the machine lets this viewer do
+        /// with its clipboard. Only for showing the right buttons.
+        clipboard: &'static str,
+    },
     /// The machine refused to stream to this viewer.
     ViewRejected { device_id: String, reason: String },
     /// The stream moved to a new key, wrapped for this viewer.
     StreamKey { device_id: String, wrapped_key: String },
+    /// Clipboard text the machine sealed for this viewer.
+    Clipboard { device_id: String, sealed: String },
 }
 
 /// Binary video frame produced by hawk-service (BuildVideoFrame):
@@ -264,6 +307,43 @@ mod tests {
         let message: DeviceMessage =
             serde_json::from_str(r#"{"type":"viewer_reject","viewer":3,"reason":"no grant"}"#).unwrap();
         assert!(matches!(message, DeviceMessage::ViewerReject { viewer: 3, .. }));
+    }
+
+    #[test]
+    fn clipboard_messages_round_trip() {
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"clipboard","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::Clipboard { .. }));
+        let json = serde_json::to_value(DeviceCommand::Clipboard { viewer: 7, sealed: "x".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"clipboard","viewer":7,"sealed":"x"}));
+        let message: DeviceMessage =
+            serde_json::from_str(r#"{"type":"clipboard","viewer":3,"sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::Clipboard { viewer: 3, .. }));
+        let json = serde_json::to_value(DashboardEvent::Clipboard { device_id: "m1".into(), sealed: "x".into() })
+            .unwrap();
+        assert_eq!(json, serde_json::json!({"type":"clipboard","deviceId":"m1","sealed":"x"}));
+    }
+
+    #[test]
+    fn accepts_carry_clipboard_access() {
+        let message: DeviceMessage = serde_json::from_str(
+            r#"{"type":"viewer_accept","viewer":1,"statement":"s","signature":"g","wrapped_key":"k"}"#,
+        )
+        .unwrap();
+        let DeviceMessage::ViewerAccept { clipboard, .. } = message else { panic!("not an accept") };
+        assert_eq!(clipboard_access(clipboard.as_deref()), "off");
+        assert_eq!(clipboard_access(Some("sync")), "sync");
+        assert_eq!(clipboard_access(Some("everything")), "off");
+    }
+
+    /// The largest text the dashboard or the machine sends fits; a byte
+    /// more of ciphertext doesn't.
+    #[test]
+    fn clipboard_cap_fits_the_largest_text() {
+        let largest = BASE64.encode(vec![0u8; 8 + 1 + 256 * 1024 + 16]);
+        assert!(largest.len() <= MAX_SEALED_CLIPBOARD_LEN);
+        let over = BASE64.encode(vec![0u8; 8 + 1 + 256 * 1024 + 16 + 3]);
+        assert!(over.len() > MAX_SEALED_CLIPBOARD_LEN);
     }
 
     #[test]

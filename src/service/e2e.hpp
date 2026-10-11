@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/input_pipe.hpp"
+#include "config.hpp"
 #include "crypto.hpp"
 #include "machine_key.hpp"
 
@@ -52,6 +53,14 @@ struct SignedStatement {
 
 // --- Viewers -------------------------------------------------------------------
 
+// What a viewer asked of the machine's clipboard, once ViewerHub checked
+// that its role and the machine's config allow it.
+struct ClipboardRequest {
+    enum class Op : std::uint8_t { set, get };
+    Op          op = Op::get;
+    std::string text;  // set: valid UTF-8, within the configured max_size
+};
+
 // Every viewer of this machine on the current relay connection: who the
 // owner's signatures let in, each one's session keys, the stream key the
 // frames are sealed with, and what each one's input is holding down.
@@ -66,7 +75,8 @@ public:
 
     // `owner_key` is empty for a machine enrolled before end-to-end
     // encryption, which refuses every viewer until it's enrolled again.
-    ViewerHub(const MachineKey& key, std::string machine_id, std::optional<crypto::Bytes> owner_key, Sender send);
+    ViewerHub(const MachineKey& key, std::string machine_id, std::optional<crypto::Bytes> owner_key,
+              ClipboardConfig clipboard, Sender send);
     ~ViewerHub();
     ViewerHub(const ViewerHub&) = delete;
     ViewerHub& operator=(const ViewerHub&) = delete;
@@ -84,6 +94,17 @@ public:
     // Opens one sealed input event; returns it, ready for hawk-capture, if
     // it's genuine, new, and from a viewer whose role allows control.
     [[nodiscard]] std::optional<ipc::InputPacket> input(std::uint64_t viewer, std::string_view sealed);
+
+    // Opens one sealed clipboard request; returns it if it's genuine, new,
+    // and allowed: setting needs control, reading needs control or the
+    // config's view_pull, and neither works with the clipboard off. A get
+    // is remembered, and answered by the next deliver_clipboard().
+    [[nodiscard]] std::optional<ClipboardRequest> clipboard(std::uint64_t viewer, std::string_view sealed);
+
+    // Text read off the machine's clipboard, sealed for each viewer it's
+    // for: those waiting on a get, or with `pushed` (a copy on the machine,
+    // sync mode only) everyone allowed to read it. Truncated to max_size.
+    void deliver_clipboard(std::string_view text, bool pushed);
 
     // Every revocation the owner has signed: remembered, and any viewer
     // they cut off is refused on the spot.

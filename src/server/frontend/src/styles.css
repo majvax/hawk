@@ -1360,6 +1360,30 @@ select {
   flex-wrap: wrap;
 }
 
+.clip-panel {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.clip-panel textarea.input {
+  height: auto;
+  min-height: 56px;
+  padding: 6px 10px;
+  resize: vertical;
+}
+
+.clip-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stage-bar button:disabled {
+  color: var(--fg-3);
+  cursor: default;
+}
+
 .stage-foot kbd {
   font-family: var(--mono);
   font-size: 10.5px;

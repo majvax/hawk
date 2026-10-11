@@ -18,6 +18,14 @@ const KEY_CODE = /^[A-Za-z0-9]{1,31}$/;
 // Wheel deltas reach us in whatever unit the browser feels like. A notch is
 // about 100 pixels in Chrome and Firefox, three lines where lines are used,
 // and a page is near enough one notch for scrolling to feel right.
+// How long the V of a Ctrl+V waits after the text it pastes. The text and
+// the keystroke reach the machine down different pipes, so without the wait
+// the paste can beat the text and paste what was there before.
+const PASTE_KEY_DELAY_MS = 200;
+// How long to wait for the browser's paste event after Ctrl+V before
+// sending the keystroke on its own.
+const PASTE_EVENT_WAIT_MS = 250;
+
 function wheelUnits(delta: number, mode: number): number {
   const notches = mode === 1 ? delta / 3 : mode === 2 ? delta : delta / 100;
   return Math.round(notches * WHEEL_DELTA);
@@ -47,14 +55,24 @@ export interface RemoteInput {
 // has a keyboard lock, which the dashboard takes in full screen), and
 // Ctrl+Alt+Del is the secure attention sequence, which nothing but Windows
 // itself can send.
+//
+// With `onPaste`, Ctrl+V pastes this computer's clipboard: the browser hands
+// the page its text with the paste the viewer just pressed for, `onPaste`
+// puts it on the machine's clipboard, and the V follows a moment later.
+// `onPaste` returns false when it didn't send anything (no text, too long),
+// and the machine then pastes whatever it already had.
 export function useRemoteInput(
   canvasRef: RefObject<HTMLCanvasElement>,
   enabled: boolean,
   sendInput: (event: InputEvent) => void,
+  onPaste: ((text: string) => boolean) | null = null,
 ): RemoteInput {
   const [active, setActive] = useState(false);
   const sendInputRef = useRef(sendInput);
   sendInputRef.current = sendInput;
+  const onPasteRef = useRef(onPaste);
+  onPasteRef.current = onPaste;
+  const pasting = onPaste !== null;
 
   const release = useCallback((): void => canvasRef.current?.blur(), [canvasRef]);
 
@@ -160,7 +178,49 @@ export function useRemoteInput(
       if (dx !== 0 || dy !== 0) send({ kind: "wheel", dx, dy });
     };
 
+    // A Ctrl+V waiting for its paste event, and the V taps still to come.
+    let pasteWait: number | null = null;
+    const pasteTaps = new Set<number>();
+    const tapV = (delay: number): void => {
+      const timer = window.setTimeout(() => {
+        pasteTaps.delete(timer);
+        // A quick Ctrl+V lets go of Ctrl before the wait is over: hold it
+        // for the V here, or the machine just gets a "v".
+        const ctrlHeld = keysHeld.has("ControlLeft") || keysHeld.has("ControlRight");
+        if (!ctrlHeld) send({ kind: "key", code: "ControlLeft", down: true });
+        send({ kind: "key", code: "KeyV", down: true });
+        send({ kind: "key", code: "KeyV", down: false });
+        if (!ctrlHeld) send({ kind: "key", code: "ControlLeft", down: false });
+      }, delay);
+      pasteTaps.add(timer);
+    };
+
+    const onPaste = (event: ClipboardEvent): void => {
+      if (pasteWait === null || document.activeElement !== canvas) return;
+      event.preventDefault();
+      window.clearTimeout(pasteWait);
+      pasteWait = null;
+      const text = event.clipboardData?.getData("text/plain") ?? "";
+      const sent = text !== "" && (onPasteRef.current?.(text) ?? false);
+      tapV(sent ? PASTE_KEY_DELAY_MS : 0);
+    };
+
     const onKeyDown = (event: KeyboardEvent): void => {
+      const isPaste = event.code === "KeyV" && event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey;
+      if (pasting && isPaste) {
+        // Left to the browser, which answers with a paste event (above)
+        // carrying this computer's clipboard; the V is sent from there.
+        if (event.repeat || pasteWait !== null) {
+          event.preventDefault();
+          return;
+        }
+        pasteWait = window.setTimeout(() => {
+          // No paste event (the browser kept it): paste the machine's own.
+          pasteWait = null;
+          tapV(0);
+        }, PASTE_EVENT_WAIT_MS);
+        return;
+      }
       event.preventDefault(); // Tab, F-keys and space are the machine's now
       if (!KEY_CODE.test(event.code)) return;
       // Repeats are passed on as they come: that's what makes a held key
@@ -172,6 +232,8 @@ export function useRemoteInput(
     const onKeyUp = (event: KeyboardEvent): void => {
       event.preventDefault();
       if (!KEY_CODE.test(event.code)) return;
+      // A pasting V was tapped on its own; this one was never sent down.
+      if (pasting && event.code === "KeyV" && !keysHeld.has("KeyV")) return;
       keysHeld.delete(event.code);
       send({ kind: "key", code: event.code, down: false });
     };
@@ -201,6 +263,7 @@ export function useRemoteInput(
     canvas.addEventListener("focus", onFocus);
     canvas.addEventListener("blur", onBlur);
     window.addEventListener("blur", onWindowBlur);
+    if (pasting) document.addEventListener("paste", onPaste);
     setActive(document.activeElement === canvas);
 
     return () => {
@@ -216,11 +279,14 @@ export function useRemoteInput(
       canvas.removeEventListener("focus", onFocus);
       canvas.removeEventListener("blur", onBlur);
       window.removeEventListener("blur", onWindowBlur);
+      document.removeEventListener("paste", onPaste);
+      if (pasteWait !== null) window.clearTimeout(pasteWait);
+      for (const timer of pasteTaps) window.clearTimeout(timer);
       if (moveFrame !== null) window.cancelAnimationFrame(moveFrame);
       releaseHeld();
       setActive(false);
     };
-  }, [canvasRef, enabled]);
+  }, [canvasRef, enabled, pasting]);
 
   return { active, release };
 }

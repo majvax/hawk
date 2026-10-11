@@ -1,6 +1,7 @@
 #include "capture_host.hpp"
 
 #include "common/capture_pipe.hpp"
+#include "common/clipboard_pipe.hpp"
 #include "common/input_pipe.hpp"
 
 #include <windows.h>
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <thread>
@@ -49,6 +51,16 @@ constexpr DWORD capture_client_access = FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
 // The same, for hawk-capture's end of the input pipe, which it only reads.
 // Keep this in sync with the CreateFileA call in capture/input.cpp.
 constexpr DWORD input_client_access = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+
+// And for the clipboard pipe, which hawk-capture both reads and writes.
+// Keep this in sync with the CreateFileA call in capture/clipboard.cpp.
+constexpr DWORD clipboard_client_access = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+// Each way: a quarter of the largest text, which hawk-capture's reader
+// drains as it arrives.
+constexpr DWORD clipboard_buffer_size = 64 * 1024;
+// A paste is sent from the relay thread too; the same reasoning as
+// input_write_timeout_ms, with room for the larger write.
+constexpr DWORD clipboard_write_timeout_ms = 2000;
 
 [[nodiscard]] CaptureHostError make_error(CaptureHostError::Code code, DWORD native_code, std::string_view context) {
     return CaptureHostError{
@@ -199,7 +211,9 @@ private:
 
 [[nodiscard]] std::expected<UniqueHandle, CaptureHostError> launch_capture(DWORD               session,
                                                                             const std::wstring& pipe_name,
-                                                                            const std::wstring& input_pipe_name) {
+                                                                            const std::wstring& input_pipe_name,
+                                                                            const std::wstring& clipboard_pipe_name,
+                                                                            bool                clipboard_listen) {
     auto directory = service_directory();
     if (!directory.has_value()) {
         return std::unexpected(directory.error());
@@ -207,6 +221,12 @@ private:
     const std::wstring executable = *directory + std::wstring(capture_executable);
     std::wstring       command_line =
         std::format(L"\"{}\" --pipe {} --input-pipe {}", executable, pipe_name, input_pipe_name);
+    if (!clipboard_pipe_name.empty()) {
+        command_line += std::format(L" --clipboard-pipe {}", clipboard_pipe_name);
+        if (clipboard_listen) {
+            command_line += L" --clipboard-listen";
+        }
+    }
     std::wstring desktop = L"winsta0\\default";
 
     auto token = system_token_for_session(session);
@@ -275,6 +295,52 @@ private:
     return NO_ERROR;
 }
 
+// Waits for hawk-capture to open `pipe`, then checks it's really
+// hawk-capture that did. `io_event` is the caller's OVERLAPPED event.
+[[nodiscard]] DWORD connect_pipe(HANDLE pipe, HANDLE io_event, HANDLE stop_event, HANDLE process) {
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = io_event;
+    ResetEvent(io_event);
+    if (ConnectNamedPipe(pipe, &overlapped) == FALSE) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_IO_PENDING) {
+            DWORD transferred = 0;
+            if (const DWORD result = finish_overlapped(pipe, overlapped, stop_event, process, transferred);
+                result != NO_ERROR) {
+                return result;
+            }
+        } else if (error != ERROR_PIPE_CONNECTED) {
+            return error;
+        }
+    }
+    return verify_client(pipe, process);
+}
+
+// Fills `out` from `pipe`, however many reads that takes.
+[[nodiscard]] DWORD read_exact(HANDLE pipe, HANDLE io_event, HANDLE stop_event, HANDLE process,
+                               std::span<std::byte> out) {
+    std::size_t done = 0;
+    while (done < out.size()) {
+        const auto chunk =
+            static_cast<DWORD>(std::min<std::size_t>(out.size() - done, std::numeric_limits<DWORD>::max()));
+        OVERLAPPED overlapped{};
+        overlapped.hEvent = io_event;
+        ResetEvent(io_event);
+
+        DWORD transferred = 0;
+        if (ReadFile(pipe, out.subspan(done).data(), chunk, nullptr, &overlapped) != FALSE) {
+            GetOverlappedResult(pipe, &overlapped, &transferred, FALSE);
+        } else if (const DWORD error = GetLastError(); error != ERROR_IO_PENDING) {
+            return error;
+        } else if (const DWORD result = finish_overlapped(pipe, overlapped, stop_event, process, transferred);
+                   result != NO_ERROR) {
+            return result;
+        }
+        done += transferred;
+    }
+    return NO_ERROR;
+}
+
 }  // namespace
 
 std::string_view to_string(CaptureHostError::Code code) noexcept {
@@ -312,6 +378,16 @@ struct CaptureHost::Impl {
     // It lives here, not on a stack, because it stays in flight across calls.
     OVERLAPPED   input_connect{};
     bool         input_connect_pending = false;
+
+    // The clipboard pipe, when the config allows the clipboard: read on its
+    // own thread (which also waits for hawk-capture to connect it), written
+    // from the thread that sends input, each with an OVERLAPPED event.
+    UniqueHandle      clipboard_pipe;
+    UniqueHandle      clipboard_read_event;
+    UniqueHandle      clipboard_write_event;
+    std::jthread      clipboard_reader;
+    std::atomic<bool> clipboard_connected{false};
+    bool              clipboard_failed = false;
 
     // Whether hawk-capture has opened the input pipe yet, without waiting for
     // it: it does so only once its D3D device and duplication are up, which
@@ -400,52 +476,91 @@ struct CaptureHost::Impl {
         return transferred == sizeof(packet);
     }
 
-    [[nodiscard]] DWORD connect() {
-        OVERLAPPED overlapped{};
-        overlapped.hEvent = io_event.get();
-        ResetEvent(io_event.get());
-        if (ConnectNamedPipe(pipe.get(), &overlapped) == FALSE) {
-            const DWORD error = GetLastError();
-            if (error == ERROR_IO_PENDING) {
-                DWORD transferred = 0;
-                if (const DWORD result =
-                        finish_overlapped(pipe.get(), overlapped, stop_event.get(), process.get(), transferred);
-                    result != NO_ERROR) {
-                    return result;
-                }
-            } else if (error != ERROR_PIPE_CONNECTED) {
-                return error;
-            }
-        }
-        return verify_client(pipe.get(), process.get());
+    [[nodiscard]] DWORD read_exact(std::span<std::byte> out) {
+        return hawk::service::read_exact(pipe.get(), io_event.get(), stop_event.get(), process.get(), out);
     }
 
-    [[nodiscard]] DWORD read_exact(std::span<std::byte> out) {
-        std::size_t done = 0;
-        while (done < out.size()) {
-            const auto chunk =
-                static_cast<DWORD>(std::min<std::size_t>(out.size() - done, std::numeric_limits<DWORD>::max()));
-            OVERLAPPED overlapped{};
-            overlapped.hEvent = io_event.get();
-            ResetEvent(io_event.get());
-
-            DWORD transferred = 0;
-            if (ReadFile(pipe.get(), out.subspan(done).data(), chunk, nullptr, &overlapped) != FALSE) {
-                GetOverlappedResult(pipe.get(), &overlapped, &transferred, FALSE);
-            } else if (const DWORD error = GetLastError(); error != ERROR_IO_PENDING) {
-                return error;
-            } else if (const DWORD result =
-                           finish_overlapped(pipe.get(), overlapped, stop_event.get(), process.get(), transferred);
-                       result != NO_ERROR) {
-                return result;
-            }
-            done += transferred;
+    // header || UTF-8 text, in one write. Never blocks on a hawk-capture
+    // that hasn't connected yet; a write that fails or times out closes
+    // the clipboard for the rest of the run, as with input.
+    [[nodiscard]] bool write_clipboard(ipc::ClipboardKind kind, std::string_view text) {
+        if (!clipboard_pipe || clipboard_failed) {
+            return false;
         }
-        return NO_ERROR;
+        if (!clipboard_connected.load()) {
+            spdlog::info("capture: hawk-capture hasn't opened the clipboard pipe yet; dropping the request");
+            return false;
+        }
+        if (text.size() > ipc::max_clipboard_size) {
+            return false;
+        }
+        const ipc::ClipboardPacketHeader header{.size = static_cast<std::uint32_t>(text.size()),
+                                                .kind = static_cast<std::uint8_t>(kind)};
+        std::vector<std::byte> message(sizeof(header) + text.size());
+        std::memcpy(message.data(), &header, sizeof(header));
+        std::memcpy(message.data() + sizeof(header), text.data(), text.size());
+
+        OVERLAPPED overlapped{};
+        overlapped.hEvent = clipboard_write_event.get();
+        ResetEvent(clipboard_write_event.get());
+        DWORD transferred = 0;
+        DWORD result = NO_ERROR;
+        if (WriteFile(clipboard_pipe.get(), message.data(), static_cast<DWORD>(message.size()), nullptr,
+                      &overlapped) != FALSE) {
+            GetOverlappedResult(clipboard_pipe.get(), &overlapped, &transferred, FALSE);
+        } else if (result = GetLastError(); result == ERROR_IO_PENDING) {
+            result = finish_overlapped(clipboard_pipe.get(), overlapped, stop_event.get(), process.get(), transferred,
+                                       clipboard_write_timeout_ms);
+        }
+        if (result != NO_ERROR || transferred != message.size()) {
+            spdlog::warn("capture: sending the clipboard to hawk-capture failed (Win32 error {}); giving up on the "
+                         "clipboard until capture restarts",
+                         result);
+            clipboard_failed = true;
+            return false;
+        }
+        return true;
+    }
+
+    void read_clipboard(const ClipboardHandler& on_clipboard) {
+        const HANDLE pipe_handle = clipboard_pipe.get();
+        const HANDLE event = clipboard_read_event.get();
+        DWORD        result = connect_pipe(pipe_handle, event, stop_event.get(), process.get());
+        if (result == NO_ERROR) {
+            clipboard_connected.store(true);
+        }
+        std::string text;
+        while (result == NO_ERROR) {
+            ipc::ClipboardPacketHeader header{};
+            result = hawk::service::read_exact(pipe_handle, event, stop_event.get(), process.get(),
+                                               std::as_writable_bytes(std::span(&header, 1)));
+            if (result != NO_ERROR) {
+                break;
+            }
+            const auto kind = static_cast<ipc::ClipboardKind>(header.kind);
+            if (header.magic != ipc::clipboard_packet_magic || header.size > ipc::max_clipboard_size ||
+                (kind != ipc::ClipboardKind::text && kind != ipc::ClipboardKind::changed)) {
+                spdlog::error("capture: malformed clipboard message from hawk-capture, closing the clipboard");
+                break;
+            }
+            text.resize(header.size);
+            result = hawk::service::read_exact(pipe_handle, event, stop_event.get(), process.get(),
+                                               std::as_writable_bytes(std::span(text)));
+            if (result != NO_ERROR) {
+                break;
+            }
+            if (on_clipboard) {
+                on_clipboard(kind, text);
+            }
+        }
+        if (result != NO_ERROR && result != ERROR_OPERATION_ABORTED && result != ERROR_BROKEN_PIPE) {
+            spdlog::warn("capture: reading the clipboard from hawk-capture failed: Win32 error {}", result);
+        }
+        clipboard_connected.store(false);
     }
 
     void read_packets(const PacketHandler& on_packet) {
-        DWORD result = connect();
+        DWORD result = connect_pipe(pipe.get(), io_event.get(), stop_event.get(), process.get());
         if (result == NO_ERROR) {
             spdlog::info("capture: hawk-capture connected");
         }
@@ -495,7 +610,8 @@ CaptureHost::~CaptureHost() {
     stop();
 }
 
-std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet) {
+std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet, CaptureOptions options,
+                                                         ClipboardHandler on_clipboard) {
     if (impl_->running.load()) {
         return std::unexpected(CaptureHostError{
             .code = CaptureHostError::Code::already_running, .native_code = 0, .message = "capture already running"});
@@ -524,6 +640,9 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
         std::format(L"\\\\.\\pipe\\hawk-capture-{}-{}", GetCurrentProcessId(), serial);
     const std::wstring input_pipe_name =
         std::format(L"\\\\.\\pipe\\hawk-input-{}-{}", GetCurrentProcessId(), serial);
+    const std::wstring clipboard_pipe_name =
+        options.clipboard ? std::format(L"\\\\.\\pipe\\hawk-clip-{}-{}", GetCurrentProcessId(), serial)
+                          : std::wstring{};
 
     auto pipe = create_pipe(pipe_name, PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
                             capture_client_access, 0, pipe_buffer_size);
@@ -536,15 +655,27 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
     if (!input_pipe.has_value()) {
         return std::unexpected(input_pipe.error());
     }
+    UniqueHandle clipboard_pipe;
+    if (options.clipboard) {
+        auto created = create_pipe(clipboard_pipe_name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+                                   clipboard_client_access, clipboard_buffer_size, clipboard_buffer_size);
+        if (!created.has_value()) {
+            return std::unexpected(created.error());
+        }
+        clipboard_pipe = std::move(*created);
+    }
 
     UniqueHandle stop_event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     UniqueHandle io_event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     UniqueHandle input_event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    if (!stop_event || !io_event || !input_event) {
+    UniqueHandle clipboard_read_event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    UniqueHandle clipboard_write_event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!stop_event || !io_event || !input_event || !clipboard_read_event || !clipboard_write_event) {
         return std::unexpected(make_error(CaptureHostError::Code::pipe_failed, GetLastError(), "CreateEventW"));
     }
 
-    auto process = launch_capture(session, pipe_name, input_pipe_name);
+    auto process =
+        launch_capture(session, pipe_name, input_pipe_name, clipboard_pipe_name, options.clipboard_listen);
     if (!process.has_value()) {
         return std::unexpected(process.error());
     }
@@ -556,8 +687,17 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
     impl_->input_pipe = std::move(*input_pipe);
     impl_->input_event = std::move(input_event);
     impl_->input_connected = false;
+    impl_->clipboard_pipe = std::move(clipboard_pipe);
+    impl_->clipboard_read_event = std::move(clipboard_read_event);
+    impl_->clipboard_write_event = std::move(clipboard_write_event);
+    impl_->clipboard_connected.store(false);
+    impl_->clipboard_failed = false;
     impl_->running.store(true);
     impl_->reader = std::jthread([impl = impl_.get(), handler = std::move(on_packet)] { impl->read_packets(handler); });
+    if (impl_->clipboard_pipe) {
+        impl_->clipboard_reader = std::jthread(
+            [impl = impl_.get(), handler = std::move(on_clipboard)] { impl->read_clipboard(handler); });
+    }
 
     spdlog::info("capture: launched hawk-capture in session {}", session);
     return {};
@@ -570,6 +710,13 @@ bool CaptureHost::send_input(const ipc::InputPacket& packet) {
     return impl_->write_input(packet);
 }
 
+bool CaptureHost::send_clipboard(ipc::ClipboardKind kind, std::string_view text) {
+    if (!impl_->running.load()) {
+        return false;
+    }
+    return impl_->write_clipboard(kind, text);
+}
+
 void CaptureHost::stop() noexcept {
     if (!impl_->process) {
         return;
@@ -579,6 +726,12 @@ void CaptureHost::stop() noexcept {
     if (impl_->reader.joinable()) {
         impl_->reader.join();
     }
+    if (impl_->clipboard_reader.joinable()) {
+        impl_->clipboard_reader.join();
+    }
+    impl_->clipboard_pipe.reset();
+    impl_->clipboard_read_event.reset();
+    impl_->clipboard_write_event.reset();
 
     // Closing the input pipe is also what tells hawk-capture's input reader
     // to let go of whatever it is still holding down.

@@ -93,9 +93,10 @@ impl Device {
 
 /// What the machine sent for one of its viewers.
 pub enum Answer {
-    Accept { statement: String, signature: String, wrapped_key: String },
+    Accept { statement: String, signature: String, wrapped_key: String, clipboard: &'static str },
     Reject { reason: String },
     StreamKey { wrapped_key: String },
+    Clipboard { sealed: String },
 }
 
 #[derive(Default)]
@@ -401,6 +402,22 @@ impl Registry {
         true
     }
 
+    /// Passes a sealed clipboard request on to the machine if this dashboard
+    /// is watching it, whatever its role: the machine's config decides
+    /// whether a view share may read the clipboard, and the machine checks
+    /// every request. Returns whether it was passed on.
+    pub fn clipboard(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
+        let has_access =
+            inner.dashboards.get(&dashboard_id).is_some_and(|dashboard| dashboard.access.contains_key(machine_id));
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !has_access || !device.viewers.contains_key(&dashboard_id) {
+            return false;
+        }
+        device.send(DeviceCommand::Clipboard { viewer: dashboard_id, sealed });
+        true
+    }
+
     /// Routes the machine's answer to one of its viewers. A refused viewer
     /// stops being sent frames, and is told why.
     pub fn answer(&self, machine_id: &str, viewer: DashboardId, answer: Answer) {
@@ -411,10 +428,11 @@ impl Registry {
         }
         let device_id = machine_id.to_owned();
         let event = match answer {
-            Answer::Accept { statement, signature, wrapped_key } => {
-                DashboardEvent::ViewAccepted { device_id, statement, signature, wrapped_key }
+            Answer::Accept { statement, signature, wrapped_key, clipboard } => {
+                DashboardEvent::ViewAccepted { device_id, statement, signature, wrapped_key, clipboard }
             }
             Answer::StreamKey { wrapped_key } => DashboardEvent::StreamKey { device_id, wrapped_key },
+            Answer::Clipboard { sealed } => DashboardEvent::Clipboard { device_id, sealed },
             Answer::Reject { reason } => {
                 inner.detach(viewer, machine_id);
                 DashboardEvent::ViewRejected { device_id, reason }
@@ -661,6 +679,35 @@ mod tests {
         }
         assert!(rejected);
         assert!(!registry.is_watching(2, MACHINE));
+    }
+
+    /// A view share's request still reaches the machine, which decides from
+    /// its config; it needs an open view all the same.
+    #[test]
+    fn clipboard_requests_need_an_open_view() {
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::View);
+        assert!(registry.clipboard(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Clipboard { viewer, .. }) if viewer == dashboard));
+        registry.stop_view(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.clipboard(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// Clipboard text goes to the viewer it was sealed for, and nobody else.
+    #[test]
+    fn clipboard_text_reaches_only_its_viewer() {
+        let (registry, dashboard, _device_rx, mut events) = watching(Role::Control);
+        let (handle, mut other_events) = handle(3);
+        let other = registry.add_dashboard(handle, vec![row(Role::Control)]);
+        assert!(registry.start_view(other, MACHINE, join()));
+        while events.try_recv().is_ok() {}
+        while other_events.try_recv().is_ok() {}
+
+        registry.answer(MACHINE, dashboard, Answer::Clipboard { sealed: "text".to_owned() });
+        let Ok(Outbound::Event(event)) = events.try_recv() else { panic!("no clipboard event") };
+        assert!(matches!(*event, DashboardEvent::Clipboard { ref sealed, .. } if sealed == "text"));
+        assert!(other_events.try_recv().is_err());
     }
 
     /// Answers only go to a dashboard that is watching that machine.

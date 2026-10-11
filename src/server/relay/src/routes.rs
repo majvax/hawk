@@ -1,5 +1,6 @@
 //! WebSocket endpoints for devices and dashboards.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,8 @@ use crate::db::{self, EnrollmentOwner, MachineAuth};
 use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
-    DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_INPUT_LEN, answer_fits,
+    DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_INPUT_LEN,
+    answer_fits, clipboard_access,
     machine_auth_message,
 };
 use crate::registry::{Answer, DashboardHandle, DeviceOutbound, Outbound, Registry};
@@ -266,10 +268,11 @@ async fn handle_device(socket: WebSocket, state: AppState) {
         }
     });
 
+    let mut clipboard_budgets = HashMap::new();
     while let Some(Ok(message)) = stream.next().await {
         match message {
             Message::Binary(frame) => state.registry.forward_frame(&machine_id, frame),
-            Message::Text(text) => route_device_answer(&state.registry, &machine_id, &text),
+            Message::Text(text) => route_device_answer(&state.registry, &machine_id, &text, &mut clipboard_budgets),
             Message::Close(_) => break,
             _ => {}
         }
@@ -285,19 +288,34 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     info!(%machine_id, "relay: machine disconnected");
 }
 
-/// Passes the machine's answer to one of its viewers on, unread.
-fn route_device_answer(registry: &Registry, machine_id: &str, text: &str) {
+/// Passes the machine's answer to one of its viewers on, unread. Clipboard
+/// text is held to a budget per viewer, so a machine in sync mode copying
+/// in a loop can't flood a dashboard.
+fn route_device_answer(
+    registry: &Registry,
+    machine_id: &str,
+    text: &str,
+    clipboard_budgets: &mut HashMap<u64, Budget>,
+) {
     let (viewer, answer) = match serde_json::from_str::<DeviceMessage>(text) {
-        Ok(DeviceMessage::ViewerAccept { viewer, statement, signature, wrapped_key })
+        Ok(DeviceMessage::ViewerAccept { viewer, statement, signature, wrapped_key, clipboard })
             if answer_fits(&[&statement, &signature, &wrapped_key]) =>
         {
-            (viewer, Answer::Accept { statement, signature, wrapped_key })
+            let clipboard = clipboard_access(clipboard.as_deref());
+            (viewer, Answer::Accept { statement, signature, wrapped_key, clipboard })
         }
         Ok(DeviceMessage::ViewerReject { viewer, reason }) => {
             (viewer, Answer::Reject { reason: reason.chars().take(200).collect() })
         }
         Ok(DeviceMessage::StreamKey { viewer, wrapped_key }) if answer_fits(&[&wrapped_key]) => {
             (viewer, Answer::StreamKey { wrapped_key })
+        }
+        Ok(DeviceMessage::Clipboard { viewer, sealed }) if sealed.len() <= MAX_SEALED_CLIPBOARD_LEN => {
+            if !clipboard_budgets.entry(viewer).or_insert_with(Budget::clipboard).take() {
+                debug!(%machine_id, viewer, "relay: dropping clipboard text over the budget");
+                return;
+            }
+            (viewer, Answer::Clipboard { sealed })
         }
         _ => {
             debug!(%machine_id, "relay: ignoring an unexpected message from a machine");
@@ -385,7 +403,8 @@ async fn handle_dashboard(
         }
     });
 
-    let mut input_budget = InputBudget::new();
+    let mut input_budget = Budget::input();
+    let mut clipboard_budget = Budget::clipboard();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -411,6 +430,13 @@ async fn handle_dashboard(
                     registry.input(dashboard_id, &device_id, sealed);
                 }
             }
+            Ok(DashboardCommand::Clipboard { device_id, sealed }) => {
+                // Dropped quietly too. A person pastes or asks for the
+                // clipboard by hand, a few times a minute at most.
+                if sealed.len() <= MAX_SEALED_CLIPBOARD_LEN && clipboard_budget.take() {
+                    registry.clipboard(dashboard_id, &device_id, sealed);
+                }
+            }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
                 warn!(%error, "dashboard: received invalid command (further ones are logged at debug)")
             }
@@ -422,26 +448,36 @@ async fn handle_dashboard(
     writer.abort();
 }
 
-/// Token bucket on one dashboard's input events. A person moving a mouse
-/// sends at most one move per display frame plus the odd key, far below
-/// this; anything above it is dropped.
-struct InputBudget {
+/// Token bucket on one kind of message from one connection; anything above
+/// it is dropped.
+struct Budget {
     tokens: f64,
     refilled: Instant,
+    per_second: f64,
+    burst: f64,
 }
 
-impl InputBudget {
-    const PER_SECOND: f64 = 500.0;
-    const BURST: f64 = 1000.0;
+impl Budget {
+    /// A dashboard's input events. A person moving a mouse sends at most one
+    /// move per display frame plus the odd key, far below this.
+    fn input() -> Self {
+        Self::new(500.0, 1000.0)
+    }
 
-    fn new() -> Self {
-        Self { tokens: Self::BURST, refilled: Instant::now() }
+    /// Clipboard messages, each up to 256 KB: a dashboard's requests, or the
+    /// text a machine sends one viewer.
+    fn clipboard() -> Self {
+        Self::new(2.0, 5.0)
+    }
+
+    fn new(per_second: f64, burst: f64) -> Self {
+        Self { tokens: burst, refilled: Instant::now(), per_second, burst }
     }
 
     fn take(&mut self) -> bool {
         let now = Instant::now();
-        let refill = now.duration_since(self.refilled).as_secs_f64() * Self::PER_SECOND;
-        self.tokens = (self.tokens + refill).min(Self::BURST);
+        let refill = now.duration_since(self.refilled).as_secs_f64() * self.per_second;
+        self.tokens = (self.tokens + refill).min(self.burst);
         self.refilled = now;
         if self.tokens < 1.0 {
             return false;

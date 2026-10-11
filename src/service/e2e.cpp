@@ -34,6 +34,15 @@ constexpr std::string_view kRevokeContext = "hawk-revoke-v1";
 constexpr std::string_view kAcceptContext = "hawk-accept-v1";
 constexpr std::string_view kStreamKeyAad = "hawk-stream-key-v1";
 constexpr std::string_view kInputAad = "hawk-input-v1";
+constexpr std::string_view kClipboardAad = "hawk-clipboard-v1";
+
+// The first byte of a sealed clipboard message; UTF-8 text follows it.
+// Viewer to machine: set (with text) or get (without). Machine to viewer:
+// text (answering a get) or push (a copy on the machine, sync mode).
+constexpr std::byte kClipboardSet{1};
+constexpr std::byte kClipboardGet{2};
+constexpr std::byte kClipboardText{3};
+constexpr std::byte kClipboardPush{4};
 
 // A single-view grant still admits its viewer this long after their
 // viewing ends, so a dashboard that dropped and reconnects isn't refused.
@@ -235,6 +244,10 @@ struct AcceptMessage {
     std::string   statement;
     std::string   signature;
     std::string   wrapped_key;
+    // What this viewer may do with the clipboard: "off", "pull" or "sync".
+    // For the dashboard to show the right buttons; the machine checks for
+    // itself on every request.
+    std::string clipboard;
 };
 
 struct RejectMessage {
@@ -247,6 +260,12 @@ struct StreamKeyMessage {
     std::string   type = "stream_key";
     std::uint64_t viewer = 0;
     std::string   wrapped_key;
+};
+
+struct ClipboardMessage {
+    std::string   type = "clipboard";
+    std::uint64_t viewer = 0;
+    std::string   sealed;
 };
 
 }  // namespace
@@ -264,7 +283,7 @@ template <>
 struct glz::meta<hawk::service::AcceptMessage> {
     using T                     = hawk::service::AcceptMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "statement", &T::statement,
-                                         "signature", &T::signature, "wrapped_key", &T::wrapped_key);
+                                         "signature", &T::signature, "wrapped_key", &T::wrapped_key, "clipboard", &T::clipboard);
 };
 
 template <>
@@ -277,6 +296,12 @@ template <>
 struct glz::meta<hawk::service::StreamKeyMessage> {
     using T                     = hawk::service::StreamKeyMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "wrapped_key", &T::wrapped_key);
+};
+
+template <>
+struct glz::meta<hawk::service::ClipboardMessage> {
+    using T                     = hawk::service::ClipboardMessage;
+    static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "sealed", &T::sealed);
 };
 
 namespace hawk::service {
@@ -384,6 +409,62 @@ void put_u64_be(crypto::Bytes& out, std::uint64_t value) {
     return nonce;
 }
 
+// True for well-formed UTF-8 without overlongs, surrogates or anything past
+// U+10FFFF: what the clipboard is handed is text the machine can convert.
+[[nodiscard]] bool is_utf8(std::string_view text) {
+    constexpr std::array<std::uint32_t, 5> kSmallest{0, 0, 0x80, 0x800, 0x10000};
+    std::size_t                            i = 0;
+    while (i < text.size()) {
+        const auto    lead = static_cast<unsigned char>(text[i]);
+        std::size_t   length = 0;
+        std::uint32_t point = 0;
+        if (lead < 0x80U) {
+            ++i;
+            continue;
+        }
+        if ((lead & 0xE0U) == 0xC0U) {
+            length = 2;
+            point = lead & 0x1FU;
+        } else if ((lead & 0xF0U) == 0xE0U) {
+            length = 3;
+            point = lead & 0x0FU;
+        } else if ((lead & 0xF8U) == 0xF0U) {
+            length = 4;
+            point = lead & 0x07U;
+        } else {
+            return false;
+        }
+        if (i + length > text.size()) {
+            return false;
+        }
+        for (std::size_t k = 1; k < length; ++k) {
+            const auto next = static_cast<unsigned char>(text[i + k]);
+            if ((next & 0xC0U) != 0x80U) {
+                return false;
+            }
+            point = (point << 6U) | (next & 0x3FU);
+        }
+        if (point < kSmallest[length] || point > 0x10FFFFU || (point >= 0xD800U && point <= 0xDFFFU)) {
+            return false;
+        }
+        i += length;
+    }
+    return true;
+}
+
+// The longest prefix of `text` within `limit` bytes that doesn't cut a
+// character in half.
+[[nodiscard]] std::string_view utf8_prefix(std::string_view text, std::size_t limit) {
+    if (text.size() <= limit) {
+        return text;
+    }
+    std::size_t end = limit;
+    while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0U) == 0x80U) {
+        --end;
+    }
+    return text.substr(0, end);
+}
+
 struct StreamKey {
     std::uint32_t                 id = 0;
     crypto::Bytes                 raw;
@@ -401,14 +482,22 @@ struct StreamKey {
 struct Viewer {
     std::string                  viewer_key;  // base64 identity key
     std::string                  role;        // "owner", "control" or "view"
+    std::string                  fingerprint;  // of viewer_key, for the log
     crypto::AesGcm               input_key;
     crypto::AesGcm               wrap_key;
+    // Seals what the machine sends this viewer alone (clipboard text),
+    // under nonces from its own counter.
+    crypto::AesGcm               reply_key;
+    std::uint64_t                reply_counter = 0;
+    // Shared by input and clipboard requests, which the dashboard numbers
+    // from one counter.
     std::uint64_t                last_counter = 0;
     std::int64_t                 grant_issued = 0;  // 0 for the owner
     std::optional<std::int64_t>  not_after;         // unix seconds
     std::optional<std::string>   single_view_grant;
     std::set<std::string, std::less<>> held;
     bool                         sent_input = false;
+    bool                         awaiting_clipboard = false;
     // Refused after it joined (revoked, expired): waits for the relay's
     // viewer_left to let go of its input, and gets nothing meanwhile.
     bool refused = false;
@@ -474,6 +563,7 @@ struct ViewerHub::Impl {
     std::string                  machine_id;
     std::optional<crypto::Bytes> owner_key;
     std::string                  owner_key_text;
+    ClipboardConfig              clipboard;
     Sender                       send;
 
     std::mutex                       mutex;
@@ -482,12 +572,71 @@ struct ViewerHub::Impl {
     StreamKey                        stream = new_stream_key(1);
     std::chrono::steady_clock::time_point last_expiry_check{};
 
-    Impl(const MachineKey& key, std::string id, std::optional<crypto::Bytes> owner, Sender sender)
+    Impl(const MachineKey& key, std::string id, std::optional<crypto::Bytes> owner, ClipboardConfig clipboard_config,
+         Sender sender)
         : machine_key(key),
           machine_id(std::move(id)),
           owner_key(std::move(owner)),
           owner_key_text(owner_key.has_value() ? crypto::base64_encode(*owner_key) : std::string{}),
+          clipboard(clipboard_config),
           send(std::move(sender)) {}
+
+    [[nodiscard]] bool may_set_clipboard(const Viewer& viewer) const {
+        return clipboard.mode != ClipboardMode::off && viewer.role != "view";
+    }
+
+    [[nodiscard]] bool may_read_clipboard(const Viewer& viewer) const {
+        return clipboard.mode != ClipboardMode::off && (viewer.role != "view" || clipboard.view_pull);
+    }
+
+    // What the dashboard is told this viewer may do with the clipboard.
+    [[nodiscard]] std::string clipboard_access(const Viewer& viewer) const {
+        if (!may_read_clipboard(viewer)) {
+            return "off";
+        }
+        return clipboard.mode == ClipboardMode::sync ? "sync" : "pull";
+    }
+
+    // counter || AES-GCM(reply key, op || text), base64: for one viewer.
+    [[nodiscard]] static std::string seal_reply(Viewer& viewer, std::byte op, std::string_view text) {
+        crypto::Bytes plain;
+        plain.reserve(1 + text.size());
+        plain.push_back(op);
+        const auto bytes = std::as_bytes(std::span(text));
+        plain.insert(plain.end(), bytes.begin(), bytes.end());
+        const auto    counter = ++viewer.reply_counter;
+        crypto::Bytes out;
+        put_u64_be(out, counter);
+        const auto sealed = viewer.reply_key.encrypt(counter_nonce(counter), plain, crypto::as_bytes(kClipboardAad));
+        out.insert(out.end(), sealed.begin(), sealed.end());
+        return crypto::base64_encode(out);
+    }
+
+    // Opens counter || ciphertext from a viewer, sealed under its input key
+    // with `aad`: the plaintext if it's genuine and its counter is newer
+    // than any before. Input and clipboard requests share the counter.
+    [[nodiscard]] static std::optional<crypto::Bytes> open_request(Viewer& viewer, std::string_view sealed,
+                                                                   std::string_view aad) {
+        const auto bytes = crypto::base64_decode(sealed);
+        if (!bytes.has_value() || bytes->size() < 8 + crypto::gcm_tag_size) {
+            return std::nullopt;
+        }
+        std::uint64_t counter = 0;
+        for (std::size_t i = 0; i < 8; ++i) {
+            counter = (counter << 8U) | std::to_integer<std::uint64_t>((*bytes)[i]);
+        }
+        // Each counter once, in order: the relay can't replay a keystroke.
+        if (counter <= viewer.last_counter) {
+            return std::nullopt;
+        }
+        auto plain =
+            viewer.input_key.decrypt(counter_nonce(counter), std::span(*bytes).subspan(8), crypto::as_bytes(aad));
+        if (!plain.has_value()) {
+            return std::nullopt;
+        }
+        viewer.last_counter = counter;
+        return plain;
+    }
 
     void reject(std::uint64_t viewer, std::string reason) {
         spdlog::info("e2e: refusing viewer {}: {}", viewer, reason);
@@ -599,8 +748,8 @@ struct ViewerHub::Impl {
 };
 
 ViewerHub::ViewerHub(const MachineKey& key, std::string machine_id, std::optional<crypto::Bytes> owner_key,
-                     Sender send)
-    : impl_(std::make_unique<Impl>(key, std::move(machine_id), std::move(owner_key), std::move(send))) {}
+                     ClipboardConfig clipboard, Sender send)
+    : impl_(std::make_unique<Impl>(key, std::move(machine_id), std::move(owner_key), clipboard, std::move(send))) {}
 
 ViewerHub::~ViewerHub() = default;
 
@@ -642,14 +791,17 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
         return;
     }
     const auto join_hash = crypto::sha256(crypto::as_bytes(request.statement));
-    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 64);
+    // HKDF output is a prefix of any longer output: the first 64 bytes are
+    // the input and wrap keys whatever length is asked for.
+    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 96);
     auto input_key = crypto::AesGcm::create(std::span(keys).first(32));
-    auto wrap_key = crypto::AesGcm::create(std::span(keys).subspan(32));
+    auto wrap_key = crypto::AesGcm::create(std::span(keys).subspan(32, 32));
+    auto reply_key = crypto::AesGcm::create(std::span(keys).subspan(64, 32));
     const auto accept = std::format("{}\nmachine={}\njoin={}\nephemeral={}\nrole={}", kAcceptContext, impl.machine_id,
                                     crypto::base64_encode(join_hash), crypto::base64_encode(exchange->public_key()),
                                     admission->role);
     const auto signature = impl.machine_key.sign(crypto::as_bytes(accept));
-    if (!input_key.has_value() || !wrap_key.has_value() || !signature.has_value()) {
+    if (!input_key.has_value() || !wrap_key.has_value() || !reply_key.has_value() || !signature.has_value()) {
         impl.reject(viewer, "the machine couldn't sign its answer");
         return;
     }
@@ -658,8 +810,10 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     Viewer session{
         .viewer_key = viewer_key_text,
         .role = admission->role,
+        .fingerprint = fingerprint(*viewer_key),
         .input_key = std::move(*input_key),
         .wrap_key = std::move(*wrap_key),
+        .reply_key = std::move(*reply_key),
         .grant_issued = admission->grant_issued,
         .not_after = admission->not_after,
         .single_view_grant = admission->single_view_grant,
@@ -671,12 +825,14 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
         session.sent_input = previous->second.sent_input;
     }
     const auto wrapped = impl.wrap_stream_key(session);
+    auto       clipboard = impl.clipboard_access(session);
+    spdlog::info("e2e: viewer {} ({}) admitted as {}", viewer, session.fingerprint, admission->role);
     impl.viewers.insert_or_assign(viewer, std::move(session));
-    spdlog::info("e2e: viewer {} admitted as {}", viewer, admission->role);
     impl.send(to_json(AcceptMessage{.viewer = viewer,
                                     .statement = accept,
                                     .signature = crypto::base64_encode(*signature),
-                                    .wrapped_key = wrapped}));
+                                    .wrapped_key = wrapped,
+                                    .clipboard = std::move(clipboard)}));
 }
 
 std::vector<ipc::InputPacket> ViewerHub::leave(std::uint64_t viewer) {
@@ -726,24 +882,10 @@ std::optional<ipc::InputPacket> ViewerHub::input(std::uint64_t viewer, std::stri
         return std::nullopt;
     }
     Viewer&    session = found->second;
-    const auto bytes = crypto::base64_decode(sealed);
-    if (!bytes.has_value() || bytes->size() < 8 + crypto::gcm_tag_size) {
-        return std::nullopt;
-    }
-    std::uint64_t counter = 0;
-    for (std::size_t i = 0; i < 8; ++i) {
-        counter = (counter << 8U) | std::to_integer<std::uint64_t>((*bytes)[i]);
-    }
-    // Each counter once, in order: the relay can't replay a keystroke.
-    if (counter <= session.last_counter) {
-        return std::nullopt;
-    }
-    const auto plain =
-        session.input_key.decrypt(counter_nonce(counter), std::span(*bytes).subspan(8), crypto::as_bytes(kInputAad));
+    const auto plain = Impl::open_request(session, sealed, kInputAad);
     if (!plain.has_value()) {
         return std::nullopt;
     }
-    session.last_counter = counter;
 
     InputMessage event;
     const std::string json(reinterpret_cast<const char*>(plain->data()), plain->size());
@@ -763,6 +905,59 @@ std::optional<ipc::InputPacket> ViewerHub::input(std::uint64_t viewer, std::stri
         }
     }
     return packet;
+}
+
+std::optional<ClipboardRequest> ViewerHub::clipboard(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused || !impl.may_read_clipboard(found->second)) {
+        return std::nullopt;
+    }
+    Viewer&    session = found->second;
+    const auto plain = Impl::open_request(session, sealed, kClipboardAad);
+    if (!plain.has_value() || plain->empty()) {
+        return std::nullopt;
+    }
+    const auto op = plain->front();
+    const auto text = std::string_view(reinterpret_cast<const char*>(plain->data()) + 1, plain->size() - 1);
+    if (op == kClipboardGet && text.empty()) {
+        session.awaiting_clipboard = true;
+        spdlog::info("clipboard: viewer {} ({}) asked for the clipboard", viewer, session.fingerprint);
+        return ClipboardRequest{.op = ClipboardRequest::Op::get, .text = {}};
+    }
+    if (op == kClipboardSet && impl.may_set_clipboard(session)) {
+        if (text.size() > impl.clipboard.max_size || !is_utf8(text)) {
+            spdlog::warn("clipboard: viewer {} ({}) sent {} bytes that aren't text within the limit; ignored", viewer,
+                         session.fingerprint, text.size());
+            return std::nullopt;
+        }
+        spdlog::info("clipboard: viewer {} ({}) set the clipboard ({} bytes)", viewer, session.fingerprint,
+                     text.size());
+        return ClipboardRequest{.op = ClipboardRequest::Op::set, .text = std::string(text)};
+    }
+    spdlog::warn("clipboard: viewer {} ({}) asked for something its role doesn't allow; ignored", viewer,
+                 session.fingerprint);
+    return std::nullopt;
+}
+
+void ViewerHub::deliver_clipboard(std::string_view text, bool pushed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    if (pushed && impl.clipboard.mode != ClipboardMode::sync) {
+        return;
+    }
+    const auto prefix = utf8_prefix(text, impl.clipboard.max_size);
+    for (auto& [id, viewer] : impl.viewers) {
+        if (viewer.refused || !impl.may_read_clipboard(viewer) || (!pushed && !viewer.awaiting_clipboard)) {
+            continue;
+        }
+        viewer.awaiting_clipboard = false;
+        spdlog::info("clipboard: {} viewer {} ({}) the clipboard ({} bytes)", pushed ? "pushed to" : "sent", id,
+                     viewer.fingerprint, prefix.size());
+        impl.send(to_json(ClipboardMessage{
+            .viewer = id, .sealed = Impl::seal_reply(viewer, pushed ? kClipboardPush : kClipboardText, prefix)}));
+    }
 }
 
 void ViewerHub::apply_revocations(const std::vector<SignedStatement>& revocations) {

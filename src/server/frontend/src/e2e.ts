@@ -216,6 +216,12 @@ const FRAME_HEADER_SIZE = FRAME_AAD_SIZE + 12;
 
 const STREAM_KEY_AAD = utf8("hawk-stream-key-v1");
 const INPUT_AAD = utf8("hawk-input-v1");
+const CLIPBOARD_AAD = utf8("hawk-clipboard-v1");
+// The first byte of a sealed clipboard message; UTF-8 text follows it.
+const CLIPBOARD_SET = 1;
+const CLIPBOARD_GET = 2;
+const CLIPBOARD_TEXT = 3;
+const CLIPBOARD_PUSH = 4;
 // Stream keys kept around after a newer one arrives, for frames already in
 // flight under the old one.
 const KEEP_STREAM_KEYS = 2;
@@ -233,8 +239,13 @@ export class ViewSession {
   });
   private inputKey: CryptoKey | null = null;
   private wrapKey: CryptoKey | null = null;
+  // Opens what the machine sends this viewer alone (clipboard text).
+  private replyKey: CryptoKey | null = null;
   private readonly streamKeys = new Map<number, CryptoKey>();
+  // Numbers input events and clipboard requests alike: the machine keeps
+  // one counter for both.
   private inputCounter = 0n;
+  private replyCounter = 0n;
 
   private constructor(
     private readonly machineId: string,
@@ -281,9 +292,10 @@ export class ViewSession {
       throw new Error("the machine's answer doesn't match this request");
     }
     const shared = await exchange(this.exchangeKey.privateKey, fromBase64(ephemeral));
-    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 64);
+    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 96);
     this.inputKey = await aesKey(keys.slice(0, 32), ["encrypt"]);
     this.wrapKey = await aesKey(keys.slice(32, 64), ["decrypt"]);
+    this.replyKey = await aesKey(keys.slice(64, 96), ["decrypt"]);
     this.role = role;
     await this.addStreamKey(answer.wrappedKey);
     this.settle(true);
@@ -337,14 +349,47 @@ export class ViewSession {
   // The counter numbers events in the order they're sealed, which is the
   // order they must be sent in; the machine refuses any it has seen.
   sealInput(event: InputEvent): Promise<string> | null {
+    return this.sealRequest(utf8(JSON.stringify(event)), INPUT_AAD);
+  }
+
+  // Seals a clipboard request: text to paste into the machine, or (with
+  // no text) a request to read its clipboard. Numbered from the same
+  // counter as input, so it must be sent in the same order too.
+  sealClipboard(text: string | null): Promise<string> | null {
+    const op = new Uint8Array([text === null ? CLIPBOARD_GET : CLIPBOARD_SET]);
+    return this.sealRequest(text === null ? op : concat(op, utf8(text)), CLIPBOARD_AAD);
+  }
+
+  // Clipboard text the machine sealed for this viewer: `pushed` for a copy
+  // made on the machine (sync mode), otherwise the answer to a request.
+  // null for anything that doesn't open, or that was seen before.
+  async openClipboard(sealed: string): Promise<{ text: string; pushed: boolean } | null> {
+    const key = this.replyKey;
+    if (key === null) return null;
+    try {
+      const bytes = fromBase64(sealed);
+      if (bytes.length < 8 + 16) return null;
+      const counter = new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(0);
+      if (counter <= this.replyCounter) return null;
+      const iv = concat(bytes.slice(0, 8), new Uint8Array(4));
+      const plain = await aesDecrypt(key, iv, bytes.slice(8), CLIPBOARD_AAD);
+      if (counter <= this.replyCounter) return null; // another one got there first
+      const op = plain[0];
+      if (op !== CLIPBOARD_TEXT && op !== CLIPBOARD_PUSH) return null;
+      this.replyCounter = counter;
+      return { text: new TextDecoder().decode(plain.slice(1)), pushed: op === CLIPBOARD_PUSH };
+    } catch {
+      return null;
+    }
+  }
+
+  private sealRequest(plain: Uint8Array<ArrayBuffer>, aad: Uint8Array<ArrayBuffer>): Promise<string> | null {
     const key = this.inputKey;
     if (key === null) return null;
     this.inputCounter += 1n;
     const counter = new Uint8Array(8);
     new DataView(counter.buffer).setBigUint64(0, this.inputCounter);
     const iv = concat(counter, new Uint8Array(4));
-    return aesEncrypt(key, iv, utf8(JSON.stringify(event)), INPUT_AAD).then((sealed) =>
-      toBase64(concat(counter, sealed)),
-    );
+    return aesEncrypt(key, iv, plain, aad).then((sealed) => toBase64(concat(counter, sealed)));
   }
 }

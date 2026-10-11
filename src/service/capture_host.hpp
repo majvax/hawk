@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/clipboard_pipe.hpp"
 #include "common/input_pipe.hpp"
 
 #include <chrono>
@@ -37,6 +38,14 @@ struct CapturePacket {
     std::chrono::microseconds  timestamp{0};
 };
 
+// What hawk-capture is started with besides capture and input.
+struct CaptureOptions {
+    // Open the clipboard pipe, so viewers can paste and read the clipboard.
+    bool clipboard = false;
+    // Have hawk-capture report every copy made on the machine (sync mode).
+    bool clipboard_listen = false;
+};
+
 // Runs hawk-capture.exe inside the active console session and receives its
 // encoded packets over a private named pipe.
 //
@@ -47,11 +56,15 @@ struct CapturePacket {
 //
 // Like WebSocketClient, no Windows type crosses this interface.
 //
-// Thread-safety: start(), stop() and send_input() must all be called from
-// the same thread. The PacketHandler runs on an internal reader thread.
+// Thread-safety: start(), stop(), send_input() and send_clipboard() must
+// all be called from the same thread. The PacketHandler and the
+// ClipboardHandler each run on an internal reader thread of their own.
 class CaptureHost {
 public:
     using PacketHandler = std::function<void(const CapturePacket&)>;
+    // Clipboard text from hawk-capture: `text` answering a get, or
+    // `changed` for a copy made on the machine. Only valid during the call.
+    using ClipboardHandler = std::function<void(ipc::ClipboardKind kind, std::string_view text)>;
 
     CaptureHost();
     ~CaptureHost();
@@ -61,7 +74,8 @@ public:
     CaptureHost(CaptureHost&&) = delete;
     CaptureHost& operator=(CaptureHost&&) = delete;
 
-    [[nodiscard]] std::expected<void, CaptureHostError> start(PacketHandler on_packet);
+    [[nodiscard]] std::expected<void, CaptureHostError> start(PacketHandler on_packet, CaptureOptions options = {},
+                                                              ClipboardHandler on_clipboard = {});
 
     // Sends one input event to hawk-capture, which replays it into the
     // session with SendInput. Returns false when capture isn't running, or
@@ -70,6 +84,12 @@ public:
     // most a couple of seconds, and only once per run: a pipe that fails is
     // closed until capture restarts.
     [[nodiscard]] bool send_input(const ipc::InputPacket& packet);
+
+    // Asks hawk-capture to set (`set`, with `text`) or read (`get`) the
+    // clipboard; a read is answered through the ClipboardHandler. Returns
+    // false, logged, when the clipboard pipe isn't open or isn't connected
+    // yet; like input, it never waits for hawk-capture to start up.
+    [[nodiscard]] bool send_clipboard(ipc::ClipboardKind kind, std::string_view text = {});
 
     // Stops the reader thread and hawk-capture. Once it returns, the
     // PacketHandler is never called again. Safe to call when not running.

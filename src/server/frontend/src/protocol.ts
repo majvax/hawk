@@ -3,6 +3,14 @@
 
 export type Role = "view" | "control" | "owner";
 
+// What the machine's config lets a viewer do with its clipboard: nothing,
+// read it when asked (and paste into it, with control), or also have every
+// copy made on the machine pushed to them.
+export type ClipboardAccess = "off" | "pull" | "sync";
+
+// The most clipboard text sent either way, in UTF-8 bytes.
+export const MAX_CLIPBOARD_BYTES = 256 * 1024;
+
 // A machine as the logged-in user sees it.
 export interface Machine {
   id: string;
@@ -38,9 +46,18 @@ export type DashboardEvent =
   | { type: "capture_ended"; deviceId: string }
   // The machine's signed answer to this dashboard's join, and the stream
   // key wrapped for it (see e2e.ts).
-  | { type: "view_accepted"; deviceId: string; statement: string; signature: string; wrappedKey: string }
+  | {
+      type: "view_accepted";
+      deviceId: string;
+      statement: string;
+      signature: string;
+      wrappedKey: string;
+      clipboard?: ClipboardAccess;
+    }
   | { type: "view_rejected"; deviceId: string; reason: string }
-  | { type: "stream_key"; deviceId: string; wrappedKey: string };
+  | { type: "stream_key"; deviceId: string; wrappedKey: string }
+  // Clipboard text the machine sealed for this viewer (ViewSession.openClipboard).
+  | { type: "clipboard"; deviceId: string; sealed: string };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -64,7 +81,10 @@ export type DashboardCommand =
   | { type: "start_view"; deviceId: string; join: { statement: string; signature: string } }
   | { type: "stop_view"; deviceId: string }
   // Sealed for the machine (ViewSession.sealInput); the relay can't read it.
-  | { type: "input"; deviceId: string; sealed: string };
+  | { type: "input"; deviceId: string; sealed: string }
+  // A clipboard request, sealed the same way (ViewSession.sealClipboard).
+  // Passed on for any role; the machine decides what its config allows.
+  | { type: "clipboard"; deviceId: string; sealed: string };
 
 // One H.264 access unit, once the frame carrying it has been decrypted
 // (ViewSession.openFrame has the frame layout).

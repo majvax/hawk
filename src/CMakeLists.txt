@@ -12,6 +12,7 @@ enable_language(RC)
 add_executable(hawk-service
     service/main.cpp
     service/capture_host.cpp
+    service/config.cpp
     service/crypto.cpp
     service/e2e.cpp
     service/machine_identity.cpp
@@ -59,6 +60,7 @@ add_executable(hawk-capture
     capture/encoder.cpp
     capture/input.cpp
     capture/desktop.cpp
+    capture/clipboard.cpp
     capture/capture.rc  # embeds capture.manifest (DPI awareness, asInvoker)
 )
 

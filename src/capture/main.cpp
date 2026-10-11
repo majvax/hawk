@@ -1,3 +1,4 @@
+#include "clipboard.hpp"
 #include "common/capture_pipe.hpp"
 #include "desktop.hpp"
 #include "duplication.hpp"
@@ -11,6 +12,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -125,7 +127,9 @@ private:
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
 };
 
-// hawk-service launches us with `--pipe <name> --input-pipe <name>`.
+// hawk-service launches us with `--pipe <name> --input-pipe <name>`, and
+// `--clipboard-pipe <name>` (plus `--clipboard-listen`) when its config
+// allows the clipboard.
 [[nodiscard]] std::optional<std::string> option_value(std::span<char* const> args, std::string_view option) {
     for (std::size_t i = 1; i + 1 < args.size(); ++i) {
         if (std::string_view(args[i]) == option) {
@@ -133,6 +137,10 @@ private:
         }
     }
     return std::nullopt;
+}
+
+[[nodiscard]] bool has_flag(std::span<char* const> args, std::string_view flag) {
+    return std::ranges::any_of(args.subspan(1), [flag](const char* arg) { return std::string_view(arg) == flag; });
 }
 
 // Launched by hawk-service there is no console to log to, so log to
@@ -169,6 +177,7 @@ int main(int argc, char* argv[]) {
     const auto args = std::span(argv, static_cast<std::size_t>(argc));
     const auto pipe_name = option_value(args, "--pipe");
     const auto input_pipe_name = option_value(args, "--input-pipe");
+    const auto clipboard_pipe_name = option_value(args, "--clipboard-pipe");
     init_logging(pipe_name.has_value());
 
     PacketPipe pipe;
@@ -209,6 +218,13 @@ int main(int argc, char* argv[]) {
     capture::InputChannel input;
     if (input_pipe_name.has_value() && !input.open(*input_pipe_name, duplicator.bounds())) {
         spdlog::warn("capture: continuing without input");
+    }
+
+    // Best-effort too, and only there when hawk-service's config allows it.
+    capture::ClipboardChannel clipboard;
+    if (clipboard_pipe_name.has_value() &&
+        !clipboard.open(*clipboard_pipe_name, has_flag(args, "--clipboard-listen"))) {
+        spdlog::warn("capture: continuing without the clipboard");
     }
 
     capture::H264Encoder encoder;

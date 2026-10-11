@@ -151,7 +151,8 @@ TODO
 - [ ] Machine config file, schema-described and synced to the dashboard
 - [ ] Multiple display support (per-display capture, display-aware input)
 - [ ] Audio (WASAPI loopback, Opus) alongside the video stream
-- [ ] Clipboard sync and file transfer
+- [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
+- [ ] File transfer
 - [ ] Remote power actions, reboot-and-reconnect, Wake-on-LAN via a LAN peer
 - [ ] Relay operations: container image, health endpoints, metrics, backups
 - [ ] Trusted devices (remember a browser after MFA)
@@ -420,22 +421,53 @@ video, a call or an alert in it.
 The two things people reach for within a minute of getting a remote
 desktop, and the two with the sharpest privacy and privilege edges.
 
-**Clipboard.** `CF_UNICODETEXT` first, with images (`CF_DIBV5`) later only
-if they turn out to be worth the size. The clipboard belongs to the
-interactive session, so the helper there owns the listener
-(`AddClipboardFormatListener`). The directions are *not* symmetrical and
-shouldn't be treated as such:
+**Clipboard (built).** Text only (`CF_UNICODETEXT`); images (`CF_DIBV5`)
+may come later if they turn out to be worth the size. The directions are
+*not* symmetrical:
 
 * **Viewer → machine** (paste into the machine) requires **control**; it's
   an input event in everything but name.
 * **Machine → viewer** is a leak if it streams: the machine's user copies a
   password manager entry and it lands on a watcher's machine without anyone
-  deciding to send it. So the default is **pull** — the viewer presses
-  *Get clipboard* and that single read is logged. `clipboard.mode =
-  off | pull | sync` in the config, defaulting to `pull`, and `sync` is
-  something the machine's owner opts into.
-* Size-capped (256 KB of text), rate-limited, and never offered to a
-  **view** share unless the config says so.
+  deciding to send it. So the default is **pull**: the viewer presses
+  *Get clipboard*, and that single read is logged. **sync** (every copy on
+  the machine is pushed to viewers allowed to read it) is something the
+  machine's owner opts into.
+* Capped at 256 KB of UTF-8, rate-limited by the relay, and never offered
+  to a **view** share unless `view_pull` says so.
+
+It's set in the machine's own `C:\ProgramData\HawkService\config.toml`,
+read once when the service starts:
+
+```toml
+[[clipboard]]
+mode = "pull"        # off | pull | sync
+max_size = 262144    # bytes of UTF-8, at most 262144
+view_pull = false    # let view-only shares read it too
+```
+
+A missing file, or one with no `[[clipboard]]` table, means these defaults.
+A file that doesn't parse, an unknown mode, or a second `[[clipboard]]`
+table turns the clipboard **off** and logs why. A typo never opens up more
+than the defaults would.
+
+How it works:
+
+* The clipboard belongs to the interactive session, so hawk-capture is the
+  one that touches it. It does this on a thread of its own, with a
+  message-only window and `AddClipboardFormatListener`; that thread stays
+  on the default desktop while capture and input follow the secure one. It
+  talks to the service over a third SYSTEM-only pipe (`hawk-clip-*`, framed
+  as in `src/common/clipboard_pipe.hpp`). That pipe is only created when the
+  config doesn't say `off`, and the listener only runs in `sync` mode.
+  hawk-capture only runs while someone is watching, so the clipboard is
+  reachable only then too.
+* Requests are sealed end to end (see the relay's README). The machine
+  checks every one against the viewer's role and the config, whatever the
+  dashboard showed. It logs who did what and how many bytes, never the
+  text.
+* In sync mode, a copy is reported once the clipboard settles, so one copy
+  is one push. What a viewer pasted isn't pushed back.
 
 **File transfer.** Drag a file onto the dashboard to send it; chunked over
 the existing authenticated channel, encrypted end-to-end like frames, so
