@@ -119,7 +119,7 @@ export function LoginPage({ onLogin }: { onLogin: (entered: Entered) => void }):
       </button>
       <p className="auth-foot">
         Accounts are by invitation only. Ask this server's admin for an invite link. Your password never leaves this
-        browser: it unlocks the key your screen is encrypted with.
+        browser: it unlocks the key your screen is encrypted with. Setting up? Read the <a href="/docs">docs</a>.
       </p>
     </AuthFrame>
   );

@@ -460,6 +460,9 @@ function Enrollment({ enrollment, onDone }: { enrollment: EnrollmentCode; onDone
     <div className="enroll" role="region" aria-label="Add a machine">
       <div className="block-head">
         <h2 style={{ flex: 1 }}>Add a machine</h2>
+        <a className="btn btn-ghost btn-sm" href="/docs/machine" target="_blank" rel="noopener">
+          Setup guide
+        </a>
         <button type="button" className="btn btn-sm" onClick={onDone}>
           Done
         </button>

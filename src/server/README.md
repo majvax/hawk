@@ -7,7 +7,9 @@ Rust relay + React/Vite dashboard:
   stream H.264 frames up; dashboards connect to `/v1/dashboard` to see who's
   connected and to start/stop watching a device. It also serves the built
   dashboard from `frontend/dist`.
-- `frontend/` — the dashboard UI (a bun workspace).
+- `frontend/` — the dashboard UI (a bun workspace). `frontend/docs/` is the
+  user documentation served at `/docs`, one Markdown file per page; keep it
+  in step when a feature or a setup step changes.
 
 Each viewer gets a bounded frame queue. A viewer that falls behind loses
 frames until the next keyframe instead of making the relay buffer video for

@@ -162,7 +162,9 @@ TODO
 - [ ] Relay installer (Linux): `systemd` service, Let's Encrypt or self-signed TLS with a stable pinned key, frontend modes, first admin
 - [ ] GitHub Pages workflow for hosting the dashboard on its own
 - [ ] Native dashboard app (Tauri): signed updates, full keyboard capture, identity key in the OS keychain
-- [ ] `/docs` and `/about` pages in the dashboard (late: once features and the name settle)
+- [x] `/docs` in the dashboard: setup and usage guide, public, Markdown rendered at build time
+- [ ] `/docs` follow-ups: prerendered HTML, search, generated reference tables, help links in context
+- [ ] `/about` page (late: once features and the name settle)
 
 Each of the unchecked items is described under [Planned Features](#planned-features).
 
@@ -727,13 +729,20 @@ never.
 
 ### Documentation and about pages
 
-Late in the project, on purpose: both pages describe the finished shape,
-and written now they'd go stale with every feature above — and with the
-project's name still open. The dashboard routes by path already (only
-`/invite/<token>` today) and the relay falls back to `index.html` for
+`/about` stays late, on purpose: it describes the finished shape, and
+written now it would go stale with every feature above — and with the
+project's name still open. The relay falls back to `index.html` for
 unknown paths, so neither page needs anything new on the server.
 
-**`/docs` — the full documentation, served by the dashboard.**
+**`/docs` — the full documentation, served by the dashboard (first pass
+built).** It's public, and covers getting started, running the relay,
+adding a machine, the machine config file, accounts and two-factor, using
+and sharing a machine, the security model and troubleshooting. The pages
+are Markdown in `src/server/frontend/docs/`, turned into HTML at build time
+(`vite.config.ts`) and loaded as their own chunk, so the dashboard doesn't
+carry them. The login page, the top bar and *Add machine* link to it. Still
+to come, from the design below: prerendering to static HTML, search,
+generated reference tables, and more help links in context.
 
 * **Written for the people using it**, not for the people building it.
   This README stays the design document; the docs cover using the

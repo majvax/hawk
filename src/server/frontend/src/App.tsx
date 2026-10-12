@@ -144,6 +144,10 @@ function Console({
           <span className="whoami" title={user.email}>
             <span className="email truncate">{user.email}</span>
           </span>
+          {/* A new tab, so a live view stays open. */}
+          <a className="btn btn-ghost btn-sm" href="/docs" target="_blank" rel="noopener">
+            Docs
+          </a>
           <button
             type="button"
             className="btn btn-ghost btn-sm"
