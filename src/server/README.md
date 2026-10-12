@@ -54,10 +54,18 @@ bun run start   # serves the built frontend and runs the relay on :8080
 
 Configuration is by environment variable: `HOST` (default `127.0.0.1`),
 `PORT` (default `8080`), `FRONTEND_DIST`, `TLS_CERT_PATH`, `TLS_KEY_PATH`,
-`HAWK_DB_PATH` (default `data/hawk.db`), `PUBLIC_URL` (the address people
-reach the dashboard at, used in links the relay logs), and
-`HAWK_SERVER_ROOT` (the directory the default paths are relative to;
-defaults to this directory). `RUST_LOG` controls log verbosity.
+`HAWK_DB_PATH` (default `data/hawk.db`), `HAWK_SECRET_KEY_PATH` (default
+`secret.key` beside the database), `PUBLIC_URL` (the address people reach
+the dashboard at, used in links the relay logs and emails), `HAWK_SMTP_URL`
+and `HAWK_MAIL_FROM` (see "Email" below), and `HAWK_SERVER_ROOT` (the
+directory the default paths are relative to; defaults to this directory).
+`RUST_LOG` controls log verbosity.
+
+**Back up the secret key with the database.** The relay creates
+`secret.key` (32 random bytes, readable by its owner only) on first start
+and seals every TOTP seed under it, so a copy of the database alone doesn't
+give the seeds away. Without the key, a restored database still works, but
+every authenticator has to be removed by the admin and set up again.
 
 ## Accounts
 
@@ -90,11 +98,70 @@ Accounts are invite-only; there is no open sign-up.
   and invite tokens are 32 random bytes; the database stores only their
   SHA-256.
 - Sessions: `hawk_session` cookie, `HttpOnly`, `SameSite=Strict`, `Secure`
-  under TLS, valid 30 days. Every `/api/*` route except login, signup and
-  invite lookup requires one, as does the `/v1/dashboard` socket, which also
-  rejects a cross-origin `Origin`.
+  under TLS, valid 30 days. Every `/api/*` route except login, signup,
+  invite lookup and email verification requires one, as does the
+  `/v1/dashboard` socket, which also rejects a cross-origin `Origin`.
 - Failed logins are throttled per client IP (10 per 15 minutes). Behind a
   reverse proxy all clients share the proxy's IP, so this is a coarse brake.
+
+### Two-factor authentication
+
+- **Authenticator apps (TOTP, RFC 6238):** SHA-1, 6 digits, 30-second
+  steps, one step of clock drift either way. Settings shows a QR code and
+  the key to type in by hand. A code from the app proves it was set up
+  right before anything is stored. An account can have up to 8, and any of
+  them signs in, so losing one phone isn't a lockout. Each factor remembers
+  the last time step it accepted, so a code can't be used twice.
+- **Recovery codes:** the first authenticator comes with 10 single-use
+  codes (80 random bits each), shown once. Only their SHA-256 is stored.
+  Settings can replace the whole set. Signing in with one sends a notice.
+- **Login** takes two steps for an account with a factor: the password
+  gets a ticket (in memory, 5 minutes, 5 tries), and a code trades it for
+  the session. Wrong codes count against the client IP and against the
+  account (10 per 15 minutes wherever they come from).
+- **Step-up:** some actions need a factor proved in the last 5 minutes,
+  checked by the relay on each request: enrolling, renaming, endorsing and
+  removing a machine, sharing and unsharing, changing the password, adding
+  and removing factors, new recovery codes, and every change in the Admin
+  tab (reading it doesn't). A refused request answers 403 with
+  `"stepUp": true`; the dashboard asks for a code (`POST
+  /api/account/step-up`) and tries again. Signing in with a code counts as
+  stepping up.
+- **Control, files and shells** need the same over the dashboard socket.
+  The relay can't read sealed messages, so it gates whole channels: a view
+  is *elevated* when it starts inside the window, or later on `elevate`, and
+  stays elevated until it ends. Until then the relay drops the view's
+  input, file and shell messages (watching and the clipboard aren't
+  affected), and the dashboard shows **Confirm to control**.
+- **Adding or removing a factor** ends every other session. The first
+  factor is confirmed with the password, later ones by stepping up, so a
+  stolen session can't quietly add its own.
+- **Admin:** the Users table shows who has two-factor on. **Reset
+  two-factor** removes every factor and recovery code of an account that
+  lost them all, and signs it out. **Require two-factor** (only once the
+  admin has it) confines every account without a factor to setting one up
+  after signing in, and keeps anyone from removing their last one.
+- Security notices (a factor added or removed, new recovery codes, a
+  recovery-code sign-in, a password change, a reset by the admin) go to the
+  account's email address when a mailer is configured.
+
+### Email
+
+Optional. With `HAWK_SMTP_URL` (`smtps://user:password@host:465`, or
+`smtp://user:password@host:587?tls=required` for STARTTLS) and
+`HAWK_MAIL_FROM` (`Hawk <hawk@example.com>`), the relay sends:
+
+- **Verification links.** A new account gets a link (valid 24 hours, only
+  its hash stored) to confirm its address. It works in any browser, signed
+  in or not. Until it's opened, the account can sign in, but no one can
+  share a machine with it and it can't enroll one. The dashboard can send
+  the link again, at most once a minute and 5 times an hour.
+- **Security notices**, listed above. They never contain a link to act on.
+
+With neither variable set there is no mailer: addresses are taken as
+given, and nothing is sent. Accounts that existed before verification are
+taken as confirmed. Mail goes out in the background, so a broken mail
+server shows in the log, not in the dashboard.
 
 ## Machines
 

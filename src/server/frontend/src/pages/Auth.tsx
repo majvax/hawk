@@ -1,7 +1,8 @@
 import { type FormEvent, type JSX, type ReactNode, useEffect, useState } from "react";
 
-import { ApiError, type InviteInfo, type User, getInvite } from "../api.js";
-import { type Identity, logIn, logOut, signUp, unlock } from "../keys.js";
+import { ApiError, type InviteInfo, type User, getInvite, verifyEmail } from "../api.js";
+import { type Entered, type Identity, logIn, logOut, signUp, unlock } from "../keys.js";
+import { CodeField } from "../stepUp.js";
 import { Alert, Corners, Logo } from "../ui.js";
 
 const MIN_PASSWORD_LENGTH = 10; // mirrors auth::MIN_PASSWORD_LEN
@@ -50,26 +51,42 @@ function AuthFrame({
   );
 }
 
-type Entered = { user: User; identity: Identity };
-
 export function LoginPage({ onLogin }: { onLogin: (entered: Entered) => void }): JSX.Element {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Set once the password was right and a code is still needed.
+  const [finish, setFinish] = useState<((code: string) => Promise<Entered>) | null>(null);
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      onLogin(await logIn(email, password));
+      const step = await logIn(email, password);
+      if (step.kind === "entered") onLogin(step.entered);
+      else setFinish(() => step.finish);
     } catch (caught) {
       setError(caught instanceof ApiError && caught.status === 403 ? "this account is disabled" : errorMessage(caught));
     } finally {
       setBusy(false);
     }
   };
+
+  if (finish !== null) {
+    return (
+      <SecondStep
+        email={email}
+        finish={finish}
+        onLogin={onLogin}
+        onRestart={() => {
+          setFinish(null);
+          setPassword("");
+        }}
+      />
+    );
+  }
 
   return (
     <AuthFrame title="Sign in" onSubmit={(e) => void submit(e)}>
@@ -104,6 +121,91 @@ export function LoginPage({ onLogin }: { onLogin: (entered: Entered) => void }):
         Accounts are by invitation only. Ask this server's admin for an invite link. Your password never leaves this
         browser: it unlocks the key your screen is encrypted with.
       </p>
+    </AuthFrame>
+  );
+}
+
+// The password was right; the account has a second factor too.
+function SecondStep({
+  email,
+  finish,
+  onLogin,
+  onRestart,
+}: {
+  email: string;
+  finish: (code: string) => Promise<Entered>;
+  onLogin: (entered: Entered) => void;
+  onRestart: () => void;
+}): JSX.Element {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event: FormEvent): Promise<void> => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      onLogin(await finish(code));
+    } catch (caught) {
+      setError(caught instanceof ApiError && caught.status === 403 ? "this account is disabled" : errorMessage(caught));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <AuthFrame title="Two-factor code" onSubmit={(e) => void submit(e)}>
+      <p className="prose">
+        Signing in as <span className="mono">{email}</span>. Enter the code your authenticator app shows for this
+        server.
+      </p>
+      <CodeField
+        value={code}
+        onChange={setCode}
+        hint="Lost your phone? Enter one of the recovery codes you saved instead."
+      />
+      {error !== null && <Alert>{error}</Alert>}
+      <button type="submit" className="btn btn-primary btn-block" disabled={busy}>
+        {busy ? "Checking…" : "Sign in"}
+      </button>
+      <button type="button" className="btn btn-ghost btn-block" onClick={onRestart}>
+        Start over
+      </button>
+    </AuthFrame>
+  );
+}
+
+// A verification link from an email, opened in whichever browser: it
+// needs no session.
+export function VerifyEmailPage({ token, onDone }: { token: string; onDone: () => void }): JSX.Element {
+  const [state, setState] = useState<"checking" | "done" | string>("checking");
+
+  useEffect(() => {
+    verifyEmail(token).then(
+      () => setState("done"),
+      (caught: unknown) => setState(errorMessage(caught)),
+    );
+  }, [token]);
+
+  if (state === "checking") {
+    return (
+      <AuthFrame title="Confirming your email">
+        <p className="muted">One moment…</p>
+      </AuthFrame>
+    );
+  }
+  return (
+    <AuthFrame title={state === "done" ? "Email confirmed" : "Link not valid"}>
+      {state === "done" ? (
+        <Alert ok>Your email address is confirmed. Machines can now be shared with this account.</Alert>
+      ) : (
+        <p className="prose">
+          {state}. Sign in and ask for a new link from the notice at the top of the dashboard.
+        </p>
+      )}
+      <button type="button" className="btn btn-primary btn-block" onClick={onDone}>
+        Continue
+      </button>
     </AuthFrame>
   );
 }

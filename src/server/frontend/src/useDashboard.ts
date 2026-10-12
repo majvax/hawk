@@ -196,6 +196,11 @@ export interface Dashboard {
   // Owned machines whose enrollment this browser checked: "mismatch" means
   // the key the machine answered with isn't bound to the code made here.
   enrollmentChecks: Record<string, EnrollmentCheck>;
+  // Whether the relay passes this view's input, files and shells on. An
+  // account with a second factor has to have proved it in the last few
+  // minutes; then `elevate` asks again.
+  elevated: boolean;
+  elevate: () => void;
   startView: (deviceId: string) => void;
   stopView: () => void;
   // Sends one input event to the machine being watched. The relay drops it
@@ -265,6 +270,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     });
   }).current;
   const [enrollmentChecks, setEnrollmentChecks] = useState<Record<string, EnrollmentCheck>>({});
+  const [elevated, setElevated] = useState(false);
 
   const socketRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -583,6 +589,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     viewingRef.current = null;
     streamingRef.current = null;
     dropSession();
+    setElevated(false);
     setViewingId(null);
     teardownDecoder();
     clearPicture();
@@ -703,6 +710,12 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
             .catch((error: unknown) => console.error("shell message:", error));
           break;
         }
+        case "elevation":
+          if (viewing !== payload.deviceId) break;
+          setElevated(payload.elevated);
+          // The listing asked for when the view opened went nowhere.
+          if (payload.elevated && filesEnabledRef.current) fileManagerRef.current?.list();
+          break;
         case "view_rejected":
           if (viewing === payload.deviceId) {
             const machine = machinesRef.current.find((candidate) => candidate.id === payload.deviceId);
@@ -958,6 +971,10 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
 
   const reconnectNow = useCallback((): void => reconnectNowRef.current(), []);
 
+  const elevate = useCallback((): void => {
+    if (streamingRef.current !== null) send({ type: "elevate", deviceId: streamingRef.current });
+  }, [send]);
+
   return {
     machines,
     status,
@@ -974,6 +991,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     shells,
     shellActions,
     enrollmentChecks,
+    elevated,
+    elevate,
     startView,
     stopView,
     sendInput,

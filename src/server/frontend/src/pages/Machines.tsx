@@ -21,6 +21,7 @@ import {
 import { Alert, CodeBlock, CopyButton, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
 import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
+import { useStepUp } from "../stepUp.js";
 import { FilesPanel } from "./FilesPanel.js";
 import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
 
@@ -543,7 +544,9 @@ function Viewer({
     fileActions,
     sendInput,
     sendClipboard,
+    elevated,
   } = dashboard;
+  const requestStepUp = useStepUp();
   const stageRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [keysLocked, setKeysLocked] = useState(false);
@@ -563,14 +566,23 @@ function Viewer({
     status === "open" &&
     picture !== null &&
     security?.kind === "secured" &&
-    roleCanControl(security.role);
+    roleCanControl(security.role) &&
+    elevated;
+  // Could control it, once a fresh second factor is proved.
+  const controlLocked =
+    onScreen &&
+    viewing.online &&
+    status === "open" &&
+    security?.kind === "secured" &&
+    roleCanControl(security.role) &&
+    !elevated;
   // The machine checks every clipboard request for itself; these only
   // decide which buttons make sense to show.
   const secured = onScreen && viewing.online && status === "open" && security?.kind === "secured";
   const canReadClipboard = secured && clipboard.access !== "off";
   const canPaste = canReadClipboard && roleCanControl(security.role);
 
-  const canSendFiles = secured && files.enabled;
+  const canSendFiles = secured && files.enabled && elevated;
   // Dropping files on the screen sends them; the Files tab follows them.
   const onDragOver = (event: DragEvent): void => {
     if (!canSendFiles || !event.dataTransfer.types.includes("Files")) return;
@@ -757,6 +769,11 @@ function Viewer({
           {onScreen && stats !== null && <span className="wide">{formatBitrate(stats.kbps)}</span>}
           <span className="spacer" />
           {onScreen && viewing.role === "view" && <span>View only</span>}
+          {controlLocked && (
+            <button type="button" onClick={() => void requestStepUp().then((ok) => ok && dashboard.elevate())}>
+              Confirm to control
+            </button>
+          )}
           {canControl && (
             <span className={input.active ? "control live" : "control"}>
               {input.active ? (keysLocked ? "Input + keyboard lock" : "Input captured") : "Click to control"}
@@ -977,6 +994,24 @@ function NotConnected({
   return <div className="empty">{connectionStatus(dashboard.security, machine.online)}</div>;
 }
 
+// Over a secured view the session hasn't stepped up for: files and shells
+// wait for a fresh code.
+function StepUpNeeded({ dashboard, what }: { dashboard: Dashboard; what: string }): JSX.Element {
+  const requestStepUp = useStepUp();
+  return (
+    <div className="empty tool-connect">
+      <span>{what} needs a fresh code from your authenticator.</span>
+      <button
+        type="button"
+        className="btn btn-sm btn-accent"
+        onClick={() => void requestStepUp().then((ok) => ok && dashboard.elevate())}
+      >
+        Confirm
+      </button>
+    </div>
+  );
+}
+
 // The Files tab: the panel once connected; transfers stay on show while the
 // view is down, so they can be seen waiting to resume.
 function ToolTab({
@@ -992,7 +1027,7 @@ function ToolTab({
   onConnect: (machine: Machine) => void;
   children: (connected: boolean) => ReactNode;
 }): JSX.Element {
-  const connected = isSecured(dashboard, machine, viewing) && dashboard.files.enabled;
+  const connected = isSecured(dashboard, machine, viewing) && dashboard.files.enabled && dashboard.elevated;
   const watching = viewing?.id === machine.id;
   const hasTransfers = watching && dashboard.files.transfers.length > 0;
 
@@ -1009,6 +1044,9 @@ function ToolTab({
       )}
       {isSecured(dashboard, machine, viewing) && !dashboard.files.enabled && (
         <div className="empty">This machine doesn't allow file transfer. Its owner can turn it on in its config.</div>
+      )}
+      {isSecured(dashboard, machine, viewing) && dashboard.files.enabled && !dashboard.elevated && (
+        <StepUpNeeded dashboard={dashboard} what="Transferring files" />
       )}
       {(connected || hasTransfers) && children(connected)}
     </div>
@@ -1031,7 +1069,7 @@ function ShellTab({
   onConnect: (machine: Machine) => void;
 }): JSX.Element | null {
   const { shells, shellActions } = dashboard;
-  const live = viewing !== null && isSecured(dashboard, viewing, viewing) && shells.enabled;
+  const live = viewing !== null && isSecured(dashboard, viewing, viewing) && shells.enabled && dashboard.elevated;
   const mounted = viewing !== null && (live || shells.shells.length > 0);
   const onThisMachine = machine !== null && viewing?.id === machine.id;
   return (
@@ -1041,6 +1079,9 @@ function ShellTab({
       )}
       {shown && onThisMachine && isSecured(dashboard, machine, viewing) && !shells.enabled && (
         <div className="empty">This machine doesn't allow shells. Its owner can turn them on in its config.</div>
+      )}
+      {shown && onThisMachine && isSecured(dashboard, machine, viewing) && shells.enabled && !dashboard.elevated && (
+        <StepUpNeeded dashboard={dashboard} what="Opening a shell" />
       )}
       {mounted && (
         <div hidden={!onThisMachine}>

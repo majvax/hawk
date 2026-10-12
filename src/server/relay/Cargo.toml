@@ -12,6 +12,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 futures-util = "0.3.34"
 getrandom = "0.4.3"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "pool", "hostname", "tokio1-rustls-tls"] }
 ring = "0.17"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }

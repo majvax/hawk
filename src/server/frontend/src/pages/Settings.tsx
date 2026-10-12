@@ -13,12 +13,21 @@ import { fingerprint } from "../crypto.js";
 import { type Identity, changePassword } from "../keys.js";
 import { ACCENT_PRESETS, DEFAULT_ACCENT, applyAccent, isAccent, loadAccent, saveAccent } from "../theme.js";
 import { Alert, ConfirmButton, Dot, Tag, errorMessage } from "../ui.js";
+import { TwoFactorSection } from "./TwoFactor.js";
 
 const MIN_PASSWORD_LENGTH = 10; // mirrors auth::MIN_PASSWORD_LEN
 
 // Every user's own settings: the look of this dashboard, identity key,
-// password and sign-in sessions.
-export function SettingsPage({ user, identity }: { user: User; identity: Identity }): JSX.Element {
+// second factors, password and sign-in sessions.
+export function SettingsPage({
+  user,
+  identity,
+  onAccountChanged,
+}: {
+  user: User;
+  identity: Identity;
+  onAccountChanged: () => void;
+}): JSX.Element {
   const [sessions, setSessions] = useState<Session[] | null>(null);
 
   const refreshSessions = useCallback(async (): Promise<void> => {
@@ -32,6 +41,14 @@ export function SettingsPage({ user, identity }: { user: User; identity: Identit
       </div>
       <AccentSection />
       <KeySection identity={identity} />
+      <TwoFactorSection
+        user={user}
+        onChanged={() => {
+          onAccountChanged();
+          // Adding or removing a factor signs out every other session.
+          void refreshSessions().catch(() => {});
+        }}
+      />
       <SessionsSection sessions={sessions} refresh={refreshSessions} />
       <PasswordSection user={user} onChanged={refreshSessions} />
     </div>

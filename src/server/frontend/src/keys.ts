@@ -101,15 +101,35 @@ async function upgrade(user: api.User, password: string): Promise<Identity> {
   return remember(user, key.pkcs8, key.publicKey);
 }
 
-export async function logIn(email: string, password: string): Promise<{ user: api.User; identity: Identity }> {
+export type Entered = { user: api.User; identity: Identity };
+
+// What a correct password leads to: in, or for an account with a second
+// factor, a code to enter first. `finish` keeps what the password unlocked
+// in memory until then.
+export type LoginStep =
+  | { kind: "entered"; entered: Entered }
+  | { kind: "code"; finish: (code: string) => Promise<Entered> };
+
+export async function logIn(email: string, password: string): Promise<LoginStep> {
   const params = await api.loginParams(email);
-  if (params.kdf === "legacy") {
-    const user = await api.login(email, password);
-    return { user, identity: await upgrade(user, password) };
-  }
-  const { authKey, wrapKey } = await stretch(password, email, params.iterations);
-  const user = await api.login(email, authKey);
-  return { user, identity: await unwrapStored(user, wrapKey) };
+  const legacy = params.kdf === "legacy";
+  const stretched = legacy ? null : await stretch(password, email, params.iterations);
+  const enter = (user: api.User): Promise<Entered> =>
+    (stretched === null ? upgrade(user, password) : unwrapStored(user, stretched.wrapKey)).then((identity) => ({
+      user,
+      identity,
+    }));
+  const result = await api.login(email, stretched?.authKey ?? password);
+  if (!("mfaRequired" in result)) return { kind: "entered", entered: await enter(result) };
+  return { kind: "code", finish: async (code) => enter(await api.loginMfa(result.ticket, code)) };
+}
+
+// The derived auth key, which is what confirms an action with the password
+// (adding the first second factor).
+export async function authKeyFor(user: api.User, password: string): Promise<string> {
+  const params = await api.loginParams(user.email);
+  if (params.kdf === "legacy") return password;
+  return (await stretch(password, user.email, params.iterations)).authKey;
 }
 
 // Signed in, but this browser doesn't hold the identity key (cleared site

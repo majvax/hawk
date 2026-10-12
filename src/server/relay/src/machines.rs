@@ -20,7 +20,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::AppState;
-use crate::auth::{self, CurrentUser};
+use crate::api;
+use crate::auth::{self, CurrentUser, SteppedUp};
 use crate::db::{self, Role, ShareError, ShareTerms, Signed};
 use crate::e2e;
 use crate::error::ApiError;
@@ -52,7 +53,7 @@ pub struct EnrollmentCode {
 /// account.
 pub async fn create_enrollment_code(
     State(state): State<AppState>,
-    current: CurrentUser,
+    SteppedUp(current): SteppedUp,
     Json(body): Json<EnrollmentRequest>,
 ) -> Result<Json<EnrollmentCode>, ApiError> {
     let invalid = || ApiError::bad_request("invalid enrollment code");
@@ -60,6 +61,9 @@ pub async fn create_enrollment_code(
     let binding = BASE64.decode(&body.owner_binding).map_err(|_| invalid())?;
     if hash.len() != 32 || binding.len() != 32 {
         return Err(invalid());
+    }
+    if !api::email_verified(&state, current.account) {
+        return Err(ApiError::Conflict("confirm your email address first: check your inbox".into()));
     }
     let owner_id = current.user.id;
     if state.db.call(move |conn| db::user_key(conn, owner_id)).await?.is_none() {
@@ -83,7 +87,7 @@ pub struct Endorsement {
 /// owner compared fingerprints.
 pub async fn endorse(
     State(state): State<AppState>,
-    current: CurrentUser,
+    SteppedUp(current): SteppedUp,
     Path(machine_id): Path<String>,
     Json(body): Json<Endorsement>,
 ) -> Result<StatusCode, ApiError> {
@@ -132,7 +136,7 @@ pub struct Rename {
 
 pub async fn rename(
     State(state): State<AppState>,
-    current: CurrentUser,
+    SteppedUp(current): SteppedUp,
     Path(machine_id): Path<String>,
     Json(body): Json<Rename>,
 ) -> Result<StatusCode, ApiError> {
@@ -155,7 +159,7 @@ pub async fn rename(
 /// and everyone it was shared with loses it.
 pub async fn remove(
     State(state): State<AppState>,
-    current: CurrentUser,
+    SteppedUp(current): SteppedUp,
     Path(machine_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let owner_id = current.user.id;
@@ -258,7 +262,7 @@ impl ShareRequest {
 /// an existing share. A share that starts later is granted when it starts.
 pub async fn share(
     State(state): State<AppState>,
-    current: CurrentUser,
+    SteppedUp(current): SteppedUp,
     Path(machine_id): Path<String>,
     Json(body): Json<ShareRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -269,11 +273,14 @@ pub async fn share(
     let owner_id = current.user.id;
 
     let lookup = email.clone();
+    let require_verified = state.mailer.is_some();
     let (user_id, viewer_key) = state
         .db
-        .call(move |conn| db::public_key_by_email(conn, &lookup))
+        .call(move |conn| db::public_key_by_email(conn, &lookup, require_verified))
         .await?
-        .ok_or_else(|| ApiError::bad_request("no account with that email; ask the admin to invite them first"))?;
+        .ok_or_else(|| {
+            ApiError::bad_request("no account with a confirmed email at that address; ask the admin to invite them first")
+        })?;
     let viewer_key = viewer_key.ok_or_else(|| {
         ApiError::bad_request("that account hasn't set up its key yet; ask them to log in once, then share again")
     })?;
@@ -317,7 +324,7 @@ pub struct UnshareRequest {
 /// and the machine is handed the signed revocation.
 pub async fn unshare(
     State(state): State<AppState>,
-    current: CurrentUser,
+    SteppedUp(current): SteppedUp,
     Path((machine_id, user_id)): Path<(String, i64)>,
     Json(body): Json<UnshareRequest>,
 ) -> Result<StatusCode, ApiError> {

@@ -6,11 +6,21 @@ export interface User {
   id: number;
   email: string;
   isAdmin: boolean;
+  mfa: boolean; // has a second factor
+  emailVerified: boolean; // always true on a relay that doesn't send email
+  // The admin requires a second factor and this account has none: setting
+  // one up is all the relay allows until it does.
+  mfaSetupRequired: boolean;
 }
 
-export interface AdminUserRow extends User {
+export interface AdminUserRow {
+  id: number;
+  email: string;
+  isAdmin: boolean;
   disabled: boolean;
   createdAt: number; // unix seconds
+  mfa: boolean;
+  emailVerified: boolean;
 }
 
 export interface InviteInfo {
@@ -32,12 +42,22 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    // The action needs a second factor proved in the last few minutes.
+    readonly stepUp = false,
   ) {
     super(message);
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+// Asks the user for a code and steps the session up; resolves false when
+// they cancel. Set by the signed-in console (see StepUpProvider).
+let stepUpHandler: (() => Promise<boolean>) | null = null;
+
+export function setStepUpHandler(handler: (() => Promise<boolean>) | null): void {
+  stepUpHandler = handler;
+}
+
+async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
     method,
     headers: body === undefined ? undefined : { "content-type": "application/json" },
@@ -45,15 +65,29 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   });
   if (!response.ok) {
     let message = `request failed (${response.status})`;
+    let stepUp = false;
     try {
-      const payload = (await response.json()) as { error?: string };
+      const payload = (await response.json()) as { error?: string; stepUp?: boolean };
       if (payload.error !== undefined) message = payload.error;
+      stepUp = payload.stepUp === true;
     } catch {
       // not JSON; keep the generic message
     }
-    throw new ApiError(response.status, message);
+    throw new ApiError(response.status, message, stepUp);
   }
   return response.status === 204 ? (undefined as T) : ((await response.json()) as T);
+}
+
+// A request that, when the relay wants a fresh second factor first, asks
+// for one and tries once more.
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  try {
+    return await send<T>(method, path, body);
+  } catch (error) {
+    if (!(error instanceof ApiError && error.stepUp) || stepUpHandler === null) throw error;
+    if (!(await stepUpHandler())) throw new ApiError(error.status, "cancelled: this needs a code from your authenticator");
+    return send<T>(method, path, body);
+  }
 }
 
 // Resolves to null when not logged in.
@@ -82,8 +116,14 @@ export interface KeyUpload {
 }
 
 export const loginParams = (email: string) => request<LoginParams>("POST", "/api/login/params", { email });
+// A correct password on an account with a second factor gets a ticket to
+// trade for a session with a code, rather than a session.
+export type LoginResult = User | { mfaRequired: true; ticket: string };
 // `password` is the derived auth key, or for a legacy account the password.
-export const login = (email: string, password: string) => request<User>("POST", "/api/login", { email, password });
+export const login = (email: string, password: string) =>
+  request<LoginResult>("POST", "/api/login", { email, password });
+// `code`: from an authenticator app, or a recovery code.
+export const loginMfa = (ticket: string, code: string) => request<User>("POST", "/api/login/mfa", { ticket, code });
 export const logout = () => request<void>("POST", "/api/logout");
 export const getInvite = (token: string) => request<InviteInfo>("GET", `/api/invites/${encodeURIComponent(token)}`);
 export const signup = (token: string, email: string, password: string, key: KeyUpload) =>
@@ -108,6 +148,34 @@ export interface Session {
 export const changePassword = (currentPassword: string, newPassword: string, wrappedKey: string) =>
   request<void>("POST", "/api/account/password", { currentPassword, newPassword, wrappedKey });
 export const listSessions = () => request<Session[]>("GET", "/api/sessions");
+
+// Proves a second factor for this session for the next few minutes.
+export const stepUp = (code: string) => send<{ until: number }>("POST", "/api/account/step-up", { code });
+export const verifyEmail = (token: string) => request<void>("POST", "/api/account/verify-email", { token });
+export const resendVerification = () => request<void>("POST", "/api/account/verify-email/resend");
+
+export interface Factor {
+  id: number;
+  label: string;
+  createdAt: number;
+  lastUsedAt: number | null;
+}
+
+export interface Factors {
+  factors: Factor[];
+  recoveryCodesLeft: number;
+  required: boolean; // the admin requires a second factor
+}
+
+export const listFactors = () => request<Factors>("GET", "/api/account/mfa");
+// A fresh authenticator seed: base32 to type in, and the otpauth:// URI for a QR code.
+export const totpSetup = () => request<{ secret: string; uri: string }>("POST", "/api/account/mfa/totp/setup");
+// `password` (the derived auth key) is needed for the first factor only.
+export const addTotp = (secret: string, code: string, label: string, password?: string) =>
+  request<{ recoveryCodes: string[] | null }>("POST", "/api/account/mfa/totp", { secret, code, label, password });
+export const removeFactor = (id: number) => request<void>("DELETE", `/api/account/mfa/${id}`);
+export const regenerateRecoveryCodes = () =>
+  request<{ recoveryCodes: string[] }>("POST", "/api/account/mfa/recovery-codes");
 export const revokeSession = (id: number) => request<void>("DELETE", `/api/sessions/${id}`);
 export const revokeOtherSessions = () => request<void>("POST", "/api/sessions/revoke-others");
 
@@ -142,6 +210,10 @@ export const setUserDisabled = (id: number, disabled: boolean) =>
 export const listInvites = () => request<PendingInvite[]>("GET", "/api/admin/invites");
 export const createInvite = () => request<CreatedInvite>("POST", "/api/admin/invites");
 export const deleteInvite = (id: number) => request<void>("DELETE", `/api/admin/invites/${id}`);
+export const resetUserMfa = (id: number) => request<void>("POST", `/api/admin/users/${id}/reset-mfa`);
+export const getPolicy = () => request<{ requireMfa: boolean }>("GET", "/api/admin/policy");
+export const setPolicy = (requireMfa: boolean) =>
+  request<{ requireMfa: boolean }>("PUT", "/api/admin/policy", { requireMfa });
 
 export interface EnrollmentCode {
   code: string; // made in this browser; the relay only ever sees its hash

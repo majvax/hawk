@@ -1,6 +1,7 @@
 //! Passwords, tokens, the session cookie, and login throttling.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 
 use crate::AppState;
-use crate::db::{self, User};
+use crate::db::{self, AccountFlags, User};
 use crate::error::ApiError;
 
 pub const SESSION_COOKIE: &str = "hawk_session";
@@ -104,24 +105,53 @@ pub fn check_password_policy(password: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// How long a proved second factor covers step-up actions.
+pub const STEP_UP_WINDOW: i64 = 5 * 60;
+
 /// The logged-in user behind the request's session cookie. Rejects with 401
-/// when there's no valid session.
+/// when there's no valid session, and while the admin requires a second
+/// factor this account hasn't set up (see [`SessionUser`] for the routes
+/// that stay open then).
 pub struct CurrentUser {
     pub user: User,
     pub session_id: i64,
+    /// When this session last proved a second factor.
+    pub step_up_at: Option<i64>,
+    pub account: AccountFlags,
+}
+
+impl CurrentUser {
+    /// True when step-up actions need a fresh code first: the account has a
+    /// second factor and this session hasn't proved it lately.
+    pub fn needs_step_up(&self, now: i64) -> bool {
+        self.account.mfa && self.step_up_at.is_none_or(|at| now - at >= STEP_UP_WINDOW)
+    }
+
+    /// Whether the admin's policy confines this session to setting up a
+    /// second factor.
+    pub fn must_set_up_mfa(&self) -> bool {
+        self.account.mfa_required && !self.account.mfa
+    }
+}
+
+async fn load_session(parts: &Parts, state: &AppState) -> Result<CurrentUser, ApiError> {
+    let jar = CookieJar::from_headers(&parts.headers);
+    let token = jar.get(SESSION_COOKIE).ok_or(ApiError::Unauthorized)?.value().to_owned();
+    let hash = token_hash(&token);
+    let now = now();
+    let session = state.db.call(move |conn| db::find_session(conn, &hash, now)).await?.ok_or(ApiError::Unauthorized)?;
+    Ok(CurrentUser { user: session.user, session_id: session.id, step_up_at: session.step_up_at, account: session.account })
 }
 
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let jar = CookieJar::from_headers(&parts.headers);
-        let token = jar.get(SESSION_COOKIE).ok_or(ApiError::Unauthorized)?.value().to_owned();
-        let hash = token_hash(&token);
-        let now = now();
-        let (session_id, user) =
-            state.db.call(move |conn| db::find_session(conn, &hash, now)).await?.ok_or(ApiError::Unauthorized)?;
-        Ok(Self { user, session_id })
+        let current = load_session(parts, state).await?;
+        if current.must_set_up_mfa() {
+            return Err(ApiError::MfaSetupRequired);
+        }
+        Ok(current)
     }
 }
 
@@ -139,7 +169,50 @@ impl OptionalFromRequestParts<AppState> for CurrentUser {
     }
 }
 
-/// A CurrentUser who is the instance admin; 403 otherwise.
+/// Any signed-in session, including one the admin's MFA policy confines to
+/// setting up a factor: for the session itself, logout, email
+/// verification and second-factor setup.
+pub struct SessionUser(pub CurrentUser);
+
+impl FromRequestParts<AppState> for SessionUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        load_session(parts, state).await.map(Self)
+    }
+}
+
+impl OptionalFromRequestParts<AppState> for SessionUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Option<Self>, Self::Rejection> {
+        match load_session(parts, state).await {
+            Ok(current) => Ok(Some(Self(current))),
+            Err(ApiError::Unauthorized) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// A CurrentUser who has proved a second factor in the last few minutes
+/// (or has none to prove): for what a stolen session shouldn't be enough
+/// for. The check is here on the relay, per request.
+pub struct SteppedUp(pub CurrentUser);
+
+impl FromRequestParts<AppState> for SteppedUp {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let current = <CurrentUser as FromRequestParts<AppState>>::from_request_parts(parts, state).await?;
+        if current.needs_step_up(now()) {
+            return Err(ApiError::StepUpRequired);
+        }
+        Ok(Self(current))
+    }
+}
+
+/// A CurrentUser who is the instance admin; 403 otherwise. Enough for
+/// reading the Admin tab; changing anything there takes [`SteppedUpAdmin`].
 pub struct AdminUser(pub CurrentUser);
 
 impl FromRequestParts<AppState> for AdminUser {
@@ -154,47 +227,86 @@ impl FromRequestParts<AppState> for AdminUser {
     }
 }
 
-/// Per-IP throttle on failed logins. Behind a reverse proxy every client
-/// shares the proxy's IP, so this is a coarse brake, not account lockout.
-#[derive(Default)]
-pub struct LoginLimiter {
-    failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+/// The admin, stepped up.
+pub struct SteppedUpAdmin(pub CurrentUser);
+
+impl FromRequestParts<AppState> for SteppedUpAdmin {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let AdminUser(current) = AdminUser::from_request_parts(parts, state).await?;
+        if current.needs_step_up(now()) {
+            return Err(ApiError::StepUpRequired);
+        }
+        Ok(Self(current))
+    }
 }
 
-impl LoginLimiter {
-    const MAX_FAILURES: u32 = 10;
-    const WINDOW: Duration = Duration::from_secs(15 * 60);
+/// Counts failures per key (a client IP, an account) and blocks the key
+/// once it has too many within a window.
+pub struct Throttle<K> {
+    failures: Mutex<HashMap<K, (u32, Instant)>>,
+    max_failures: u32,
+    window: Duration,
+}
 
-    pub fn is_blocked(&self, ip: IpAddr) -> bool {
-        let mut failures = self.failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        match failures.get(&ip) {
-            Some((_, since)) if since.elapsed() > Self::WINDOW => {
-                failures.remove(&ip);
+/// Per-IP throttle on failed logins. Behind a reverse proxy every client
+/// shares the proxy's IP, so this is a coarse brake, not account lockout.
+pub type LoginLimiter = Throttle<IpAddr>;
+
+impl Default for LoginLimiter {
+    fn default() -> Self {
+        Self::new(10, Duration::from_secs(15 * 60))
+    }
+}
+
+/// Per-account throttle on wrong second-factor codes, whatever address
+/// they come from: a six-digit code is a small space to guess in.
+pub type AccountLimiter = Throttle<i64>;
+
+impl Default for AccountLimiter {
+    fn default() -> Self {
+        Self::new(10, Duration::from_secs(15 * 60))
+    }
+}
+
+impl<K: Hash + Eq> Throttle<K> {
+    pub fn new(max_failures: u32, window: Duration) -> Self {
+        Self { failures: Mutex::new(HashMap::new()), max_failures, window }
+    }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<K, (u32, Instant)>> {
+        self.failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn is_blocked(&self, key: K) -> bool {
+        let mut failures = self.map();
+        match failures.get(&key) {
+            Some((_, since)) if since.elapsed() > self.window => {
+                failures.remove(&key);
                 false
             }
-            Some((count, _)) => *count >= Self::MAX_FAILURES,
+            Some((count, _)) => *count >= self.max_failures,
             None => false,
         }
     }
 
-    pub fn record_failure(&self, ip: IpAddr) {
-        let mut failures = self.failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = failures.entry(ip).or_insert((0, Instant::now()));
-        if entry.1.elapsed() > Self::WINDOW {
+    pub fn record_failure(&self, key: K) {
+        let mut failures = self.map();
+        let entry = failures.entry(key).or_insert((0, Instant::now()));
+        if entry.1.elapsed() > self.window {
             *entry = (0, Instant::now());
         }
         entry.0 += 1;
     }
 
-    pub fn record_success(&self, ip: IpAddr) {
-        self.failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&ip);
+    pub fn record_success(&self, key: K) {
+        self.map().remove(&key);
     }
 
     /// Drops windows that have expired, so the map can't grow without bound.
     pub fn prune(&self) {
-        self.failures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|_, (_, since)| since.elapsed() <= Self::WINDOW);
+        let window = self.window;
+        self.map().retain(|_, (_, since)| since.elapsed() <= window);
     }
 }

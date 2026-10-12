@@ -26,7 +26,7 @@ use crate::protocol::{
     MAX_SEALED_INPUT_LEN, MAX_SEALED_SHELL_LEN, answer_fits, clipboard_access,
     machine_auth_message,
 };
-use crate::registry::{Answer, DashboardHandle, DeviceOutbound, Outbound, Registry};
+use crate::registry::{Answer, DashboardHandle, DeviceOutbound, Outbound, Registry, StepUp};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -399,6 +399,7 @@ async fn handle_dashboard(
         user_id: current.user.id,
         session_id: current.session_id,
         email: current.user.email,
+        step_up: StepUp { mfa: current.account.mfa, at: current.step_up_at },
     };
     let dashboard_id = registry.add_dashboard(handle, machines);
 
@@ -452,6 +453,7 @@ async fn handle_dashboard(
                 }
             }
             Ok(DashboardCommand::StopView { device_id }) => registry.stop_view(dashboard_id, &device_id),
+            Ok(DashboardCommand::Elevate { device_id }) => registry.elevate(dashboard_id, &device_id),
             Ok(DashboardCommand::Input { device_id, sealed }) => {
                 // Dropped quietly: a view-only or flooding dashboard gets
                 // nothing through, and no reply it could time against. The

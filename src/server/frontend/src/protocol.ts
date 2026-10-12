@@ -81,6 +81,9 @@ export type DashboardEvent =
       shell?: boolean;
     }
   | { type: "view_rejected"; deviceId: string; reason: string }
+  // Whether the relay passes on this view's input, files and shells. False
+  // until the session has proved a second factor lately (see useStepUp).
+  | { type: "elevation"; deviceId: string; elevated: boolean }
   | { type: "stream_key"; deviceId: string; wrappedKey: string }
   // Clipboard text the machine sealed for this viewer (ViewSession.openClipboard).
   | { type: "clipboard"; deviceId: string; sealed: string }
@@ -110,6 +113,9 @@ export const WHEEL_DELTA = 120;
 export type DashboardCommand =
   | { type: "start_view"; deviceId: string; join: { statement: string; signature: string } }
   | { type: "stop_view"; deviceId: string }
+  // Asks for input, files and shells on this view once the session has
+  // stepped up; answered with an elevation event.
+  | { type: "elevate"; deviceId: string }
   // Sealed for the machine (ViewSession.sealInput); the relay can't read it.
   | { type: "input"; deviceId: string; sealed: string }
   // A clipboard request, sealed the same way (ViewSession.sealClipboard).

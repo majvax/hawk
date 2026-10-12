@@ -1,18 +1,25 @@
 import { type JSX, useCallback, useEffect, useState } from "react";
 
-import { type User, getSession } from "./api.js";
+import { type User, getSession, resendVerification } from "./api.js";
 import { type Identity, currentIdentity, logOut } from "./keys.js";
 import { AdminPage } from "./pages/Admin.js";
-import { LoginPage, SignupPage, UnlockPage } from "./pages/Auth.js";
+import { LoginPage, SignupPage, UnlockPage, VerifyEmailPage } from "./pages/Auth.js";
 import { MachinesPage, formatBitrate } from "./pages/Machines.js";
 import { SettingsPage } from "./pages/Settings.js";
-import { Dot, Logo, type Tone } from "./ui.js";
+import { MfaSetupPage } from "./pages/TwoFactor.js";
+import { StepUpProvider } from "./stepUp.js";
+import { Dot, Logo, type Tone, errorMessage } from "./ui.js";
 import { type ConnectionStatus, type Dashboard, useDashboard } from "./useDashboard.js";
 
 type Tab = "machines" | "settings" | "admin";
 
 function inviteTokenFromPath(): string | null {
   const match = /^\/invite\/([A-Za-z0-9_-]+)$/.exec(window.location.pathname);
+  return match?.[1] ?? null;
+}
+
+function verifyTokenFromPath(): string | null {
+  const match = /^\/verify\/([A-Za-z0-9_-]+)$/.exec(window.location.pathname);
   return match?.[1] ?? null;
 }
 
@@ -23,6 +30,7 @@ export function App(): JSX.Element {
   // be unlocked with the password.
   const [identity, setIdentity] = useState<Identity | null | undefined>(undefined);
   const [inviteToken, setInviteToken] = useState(inviteTokenFromPath);
+  const [verifyToken, setVerifyToken] = useState(verifyTokenFromPath);
 
   const recheckSession = useCallback((): void => {
     getSession().then(
@@ -35,6 +43,12 @@ export function App(): JSX.Element {
   }, []);
 
   useEffect(recheckSession, [recheckSession]);
+
+  // The account changed (a second factor, a confirmed email): re-read it,
+  // keeping the unlocked key.
+  const refreshUser = useCallback((): void => {
+    void getSession().then((session) => session !== null && setUser(session), () => {});
+  }, []);
 
   const enter = ({ user: next, identity: unlocked }: { user: User; identity: Identity }): void => {
     // Leave /invite/<token> so a reload doesn't show the signup page again.
@@ -51,6 +65,18 @@ export function App(): JSX.Element {
     setUser(null);
   };
 
+  if (verifyToken !== null) {
+    return (
+      <VerifyEmailPage
+        token={verifyToken}
+        onDone={() => {
+          window.history.replaceState(null, "", "/");
+          setVerifyToken(null);
+          refreshUser();
+        }}
+      />
+    );
+  }
   if (inviteToken !== null && user !== undefined) return <SignupPage token={inviteToken} onSignup={enter} />;
   if (user === undefined || identity === undefined) {
     return (
@@ -61,11 +87,16 @@ export function App(): JSX.Element {
     );
   }
   if (user === null) return <LoginPage onLogin={enter} />;
+  if (user.mfaSetupRequired) return <MfaSetupPage user={user} onDone={refreshUser} onLogOut={leave} />;
   if (identity === null) {
     return <UnlockPage user={user} onUnlock={(unlocked) => enter({ user, identity: unlocked })} onLogOut={leave} />;
   }
   // Keyed so a different account never inherits the last one's dashboard.
-  return <Console key={user.id} user={user} identity={identity} onSessionEnded={leave} />;
+  return (
+    <StepUpProvider>
+      <Console key={user.id} user={user} identity={identity} onSessionEnded={leave} onAccountChanged={refreshUser} />
+    </StepUpProvider>
+  );
 }
 
 const TABS: [Tab, string][] = [
@@ -78,10 +109,12 @@ function Console({
   user,
   identity,
   onSessionEnded,
+  onAccountChanged,
 }: {
   user: User;
   identity: Identity;
   onSessionEnded: () => void;
+  onAccountChanged: () => void;
 }): JSX.Element {
   const [tab, setTab] = useState<Tab>("machines");
   // Owned here rather than by the machines page so the status bar can show
@@ -89,7 +122,7 @@ function Console({
   const dashboard = useDashboard(identity, onSessionEnded);
 
   return (
-    <div className="shell">
+    <div className={user.emailVerified ? "shell" : "shell with-banner"}>
       <header className="topbar">
         <div className="brand">
           <Logo size={18} />
@@ -121,6 +154,8 @@ function Console({
         </div>
       </header>
 
+      {!user.emailVerified && <VerifyBanner email={user.email} />}
+
       {/* The machines page stays mounted so switching tabs doesn't drop a
           live view. */}
       <main className="view fixed" hidden={tab !== "machines"}>
@@ -128,7 +163,7 @@ function Console({
       </main>
       {tab === "settings" && (
         <main className="view">
-          <SettingsPage user={user} identity={identity} />
+          <SettingsPage user={user} identity={identity} onAccountChanged={onAccountChanged} />
         </main>
       )}
       {tab === "admin" && user.isAdmin && (
@@ -138,6 +173,30 @@ function Console({
       )}
 
       <StatusBar dashboard={dashboard} />
+    </div>
+  );
+}
+
+// Until the address is confirmed, machines can't be enrolled under this
+// account or shared with it.
+function VerifyBanner({ email }: { email: string }): JSX.Element {
+  const [note, setNote] = useState<string | null>(null);
+  const resend = (): void => {
+    resendVerification().then(
+      () => setNote("Sent. Check your inbox."),
+      (caught: unknown) => setNote(errorMessage(caught)),
+    );
+  };
+  return (
+    <div className="banner" role="status">
+      <span>
+        Confirm your email address: open the link sent to <span className="mono">{email}</span>. Until then, machines
+        can't be enrolled under this account or shared with it.
+      </span>
+      {note !== null && <span className="muted" style={{ flex: "none" }}>{note}</span>}
+      <button type="button" className="btn btn-sm" onClick={resend}>
+        Send the link again
+      </button>
     </div>
   );
 }

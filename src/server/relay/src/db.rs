@@ -137,6 +137,48 @@ const MIGRATIONS: &[&str] = &["
     ALTER TABLE machine_shares_new RENAME TO machine_shares;
     CREATE INDEX machine_shares_expires_at ON machine_shares (expires_at) WHERE expires_at IS NOT NULL;
     CREATE INDEX machine_shares_starts_at ON machine_shares (starts_at) WHERE starts_at IS NOT NULL;
+", "
+    -- Second factors. A TOTP seed has to be readable to check a code, so
+    -- it's encrypted under the relay's secret key rather than hashed.
+    CREATE TABLE mfa_factors (
+        id           INTEGER PRIMARY KEY,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind         TEXT    NOT NULL CHECK (kind IN ('totp')),
+        label        TEXT    NOT NULL,
+        secret       BLOB    NOT NULL,             -- sealed with auth::SecretKey
+        last_counter INTEGER NOT NULL DEFAULT -1,  -- last time step accepted: no replays
+        created_at   INTEGER NOT NULL,
+        last_used_at INTEGER
+    );
+    CREATE INDEX mfa_factors_user_id ON mfa_factors (user_id);
+    -- Single-use codes for when every factor is lost. Only their SHA-256.
+    CREATE TABLE recovery_codes (
+        id        INTEGER PRIMARY KEY,
+        user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        code_hash BLOB    NOT NULL,
+        used_at   INTEGER
+    );
+    CREATE INDEX recovery_codes_user_id ON recovery_codes (user_id);
+    -- When the session last proved a second factor; step-up actions need
+    -- it to be recent.
+    ALTER TABLE sessions ADD COLUMN step_up_at INTEGER;
+
+    -- Email ownership. Accounts from before this are taken as verified.
+    ALTER TABLE users ADD COLUMN email_verified_at INTEGER;
+    UPDATE users SET email_verified_at = created_at;
+    CREATE TABLE email_verifications (
+        id         INTEGER PRIMARY KEY,
+        token_hash BLOB    NOT NULL UNIQUE,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+
+    -- Instance-wide policy the admin sets, as key/value.
+    CREATE TABLE settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
 "];
 
 #[derive(Clone)]
@@ -223,6 +265,8 @@ pub struct UserRow {
     pub user: User,
     pub disabled: bool,
     pub created_at: i64,
+    pub mfa: bool,
+    pub email_verified: bool,
 }
 
 pub struct InviteRow {
@@ -282,9 +326,28 @@ pub fn user_key(conn: &Connection, user_id: i64) -> rusqlite::Result<Option<User
 
 /// The identity key of the account with `email`: (user id, public key).
 /// The key is None for an account that hasn't set one up yet.
-pub fn public_key_by_email(conn: &Connection, email: &str) -> rusqlite::Result<Option<(i64, Option<Vec<u8>>)>> {
-    conn.query_row("SELECT id, public_key FROM users WHERE email = ?1", [email], |row| Ok((row.get(0)?, row.get(1)?)))
-        .optional()
+/// With `require_verified`, accounts that haven't proved they own their
+/// email are left out, so no one is handed a machine under an address they
+/// typed but don't own.
+pub fn public_key_by_email(
+    conn: &Connection,
+    email: &str,
+    require_verified: bool,
+) -> rusqlite::Result<Option<(i64, Option<Vec<u8>>)>> {
+    conn.query_row(
+        "SELECT id, public_key FROM users WHERE email = ?1 AND (email_verified_at IS NOT NULL OR NOT ?2)",
+        params![email, require_verified],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// The account, unless it's disabled or gone.
+pub fn active_user(conn: &Connection, user_id: i64) -> rusqlite::Result<Option<User>> {
+    conn.query_row("SELECT id, email, is_admin FROM users WHERE id = ?1 AND disabled = 0", [user_id], |row| {
+        Ok(User { id: row.get(0)?, email: row.get(1)?, is_admin: row.get(2)? })
+    })
+    .optional()
 }
 
 /// Moves a legacy account to derived credentials and gives it its identity
@@ -313,14 +376,19 @@ pub fn upgrade_account(
 }
 
 pub fn list_users(conn: &Connection) -> rusqlite::Result<Vec<UserRow>> {
-    let mut statement =
-        conn.prepare("SELECT id, email, is_admin, disabled, created_at FROM users ORDER BY created_at, id")?;
+    let mut statement = conn.prepare(
+        "SELECT u.id, u.email, u.is_admin, u.disabled, u.created_at,
+                EXISTS (SELECT 1 FROM mfa_factors f WHERE f.user_id = u.id), u.email_verified_at IS NOT NULL
+           FROM users u ORDER BY u.created_at, u.id",
+    )?;
     statement
         .query_map([], |row| {
             Ok(UserRow {
                 user: User { id: row.get(0)?, email: row.get(1)?, is_admin: row.get(2)? },
                 disabled: row.get(3)?,
                 created_at: row.get(4)?,
+                mfa: row.get(5)?,
+                email_verified: row.get(6)?,
             })
         })?
         .collect()
@@ -351,25 +419,75 @@ pub fn create_session(
     origin: &SessionOrigin,
     now: i64,
     expires_at: i64,
+    step_up_at: Option<i64>,
 ) -> rusqlite::Result<i64> {
     conn.execute(
-        "INSERT INTO sessions (token_hash, user_id, user_agent, ip, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![token_hash, user_id, origin.user_agent, origin.ip, now, expires_at],
+        "INSERT INTO sessions (token_hash, user_id, user_agent, ip, created_at, expires_at, step_up_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![token_hash, user_id, origin.user_agent, origin.ip, now, expires_at, step_up_at],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
+/// A live session and where its account stands on second factors and
+/// email.
+pub struct SessionInfo {
+    pub id: i64,
+    pub user: User,
+    pub step_up_at: Option<i64>,
+    pub account: AccountFlags,
+}
+
+/// What every request needs to know about the account besides who it is.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountFlags {
+    /// At least one second factor registered.
+    pub mfa: bool,
+    pub email_verified: bool,
+    /// The admin requires a second factor on every account.
+    pub mfa_required: bool,
+}
+
+const ACCOUNT_FLAGS_SQL: &str = "
+    EXISTS (SELECT 1 FROM mfa_factors f WHERE f.user_id = u.id),
+    u.email_verified_at IS NOT NULL,
+    EXISTS (SELECT 1 FROM settings WHERE key = 'require_mfa' AND value = '1')";
+
+fn account_flags_from(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<AccountFlags> {
+    Ok(AccountFlags { mfa: row.get(first)?, email_verified: row.get(first + 1)?, mfa_required: row.get(first + 2)? })
+}
+
 /// The live session for this token: not expired, user not disabled.
-pub fn find_session(conn: &Connection, token_hash: &[u8], now: i64) -> rusqlite::Result<Option<(i64, User)>> {
+pub fn find_session(conn: &Connection, token_hash: &[u8], now: i64) -> rusqlite::Result<Option<SessionInfo>> {
     conn.query_row(
-        "SELECT s.id, u.id, u.email, u.is_admin
-           FROM sessions s JOIN users u ON u.id = s.user_id
-          WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.disabled = 0",
+        &format!(
+            "SELECT s.id, u.id, u.email, u.is_admin, s.step_up_at, {ACCOUNT_FLAGS_SQL}
+               FROM sessions s JOIN users u ON u.id = s.user_id
+              WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.disabled = 0"
+        ),
         params![token_hash, now],
-        |row| Ok((row.get(0)?, User { id: row.get(1)?, email: row.get(2)?, is_admin: row.get(3)? })),
+        |row| {
+            Ok(SessionInfo {
+                id: row.get(0)?,
+                user: User { id: row.get(1)?, email: row.get(2)?, is_admin: row.get(3)? },
+                step_up_at: row.get(4)?,
+                account: account_flags_from(row, 5)?,
+            })
+        },
     )
     .optional()
+}
+
+pub fn account_flags(conn: &Connection, user_id: i64) -> rusqlite::Result<AccountFlags> {
+    conn.query_row(&format!("SELECT {ACCOUNT_FLAGS_SQL} FROM users u WHERE u.id = ?1"), [user_id], |row| {
+        account_flags_from(row, 0)
+    })
+}
+
+/// Records that the session just proved a second factor.
+pub fn set_step_up(conn: &Connection, session_id: i64, now: i64) -> rusqlite::Result<()> {
+    conn.execute("UPDATE sessions SET step_up_at = ?1 WHERE id = ?2", params![now, session_id])?;
+    Ok(())
 }
 
 pub fn delete_session(conn: &Connection, session_id: i64) -> rusqlite::Result<()> {
@@ -502,13 +620,15 @@ pub fn redeem_invite(
     token_hash: &[u8],
     email: &str,
     credentials: &NewCredentials<'_>,
+    email_verified: bool,
     now: i64,
 ) -> Result<User, SignupError> {
     let tx = conn.unchecked_transaction()?;
     let invite = find_invite(&tx, token_hash, now)?.ok_or(SignupError::InvalidInvite)?;
     let inserted = tx.execute(
-        "INSERT INTO users (email, password_hash, is_admin, created_at, kdf, kdf_iterations, public_key, wrapped_key)
-         VALUES (?1, ?2, ?3, ?4, 'pbkdf2-sha256', ?5, ?6, ?7)",
+        "INSERT INTO users (email, password_hash, is_admin, created_at, kdf, kdf_iterations, public_key, wrapped_key,
+                            email_verified_at)
+         VALUES (?1, ?2, ?3, ?4, 'pbkdf2-sha256', ?5, ?6, ?7, ?8)",
         params![
             email,
             credentials.password_hash,
@@ -516,7 +636,8 @@ pub fn redeem_invite(
             now,
             credentials.iterations,
             credentials.public_key,
-            credentials.wrapped_key
+            credentials.wrapped_key,
+            email_verified.then_some(now)
         ],
     );
     match inserted {
@@ -539,6 +660,188 @@ pub fn purge_expired(conn: &Connection, now: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?;
     conn.execute("DELETE FROM invites WHERE used_by IS NULL AND expires_at <= ?1", [now])?;
     conn.execute("DELETE FROM enrollment_codes WHERE expires_at <= ?1", [now])?;
+    conn.execute("DELETE FROM email_verifications WHERE expires_at <= ?1", [now])?;
+    Ok(())
+}
+
+// ---- second factors, email verification, settings -------------------------
+
+pub struct FactorRow {
+    pub id: i64,
+    pub label: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+/// A TOTP factor as needed to check a code against it.
+pub struct TotpFactor {
+    pub id: i64,
+    pub secret: Vec<u8>,
+}
+
+pub fn list_factors(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<FactorRow>> {
+    let mut statement = conn.prepare(
+        "SELECT id, label, created_at, last_used_at FROM mfa_factors WHERE user_id = ?1 ORDER BY created_at, id",
+    )?;
+    statement
+        .query_map([user_id], |row| {
+            Ok(FactorRow { id: row.get(0)?, label: row.get(1)?, created_at: row.get(2)?, last_used_at: row.get(3)? })
+        })?
+        .collect()
+}
+
+pub fn totp_factors(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<TotpFactor>> {
+    let mut statement =
+        conn.prepare("SELECT id, secret FROM mfa_factors WHERE user_id = ?1 AND kind = 'totp'")?;
+    statement
+        .query_map([user_id], |row| Ok(TotpFactor { id: row.get(0)?, secret: row.get(1)? }))?
+        .collect()
+}
+
+/// Moves the factor's counter up to `counter`, only if that's past the last
+/// one accepted: false means the code was already used.
+pub fn use_totp_counter(conn: &Connection, factor_id: i64, counter: i64, now: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE mfa_factors SET last_counter = ?1, last_used_at = ?2 WHERE id = ?3 AND last_counter < ?1",
+        params![counter, now, factor_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// A TOTP factor to add, its seed already sealed.
+pub struct NewTotp<'a> {
+    pub label: &'a str,
+    pub secret: &'a [u8],
+    /// The time step of the code that confirmed it, so that code can't be
+    /// used again.
+    pub counter: i64,
+}
+
+/// Adds a factor and ends every other session the user has, in one step.
+/// With `recovery_hashes`, the account also gets that fresh set of codes.
+pub fn add_totp_factor(
+    conn: &Connection,
+    user_id: i64,
+    factor: &NewTotp<'_>,
+    recovery_hashes: &[Vec<u8>],
+    keep_session: i64,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO mfa_factors (user_id, kind, label, secret, last_counter, created_at, last_used_at)
+         VALUES (?1, 'totp', ?2, ?3, ?4, ?5, ?5)",
+        params![user_id, factor.label, factor.secret, factor.counter, now],
+    )?;
+    if !recovery_hashes.is_empty() {
+        replace_recovery_codes(&tx, user_id, recovery_hashes)?;
+    }
+    delete_other_sessions(&tx, user_id, keep_session)?;
+    tx.commit()
+}
+
+/// Removes one of the user's factors and ends their other sessions. The
+/// last factor takes the recovery codes with it. Returns false if there's
+/// no such factor.
+pub fn delete_factor(conn: &Connection, user_id: i64, factor_id: i64, keep_session: i64) -> rusqlite::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let deleted = tx.execute("DELETE FROM mfa_factors WHERE id = ?1 AND user_id = ?2", params![factor_id, user_id])?;
+    if deleted == 0 {
+        return Ok(false);
+    }
+    let remaining: i64 =
+        tx.query_row("SELECT COUNT(*) FROM mfa_factors WHERE user_id = ?1", [user_id], |row| row.get(0))?;
+    if remaining == 0 {
+        tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", [user_id])?;
+    }
+    delete_other_sessions(&tx, user_id, keep_session)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The admin's rescue for a lost phone: every factor and recovery code
+/// gone, and every session ended.
+pub fn reset_mfa(conn: &Connection, user_id: i64) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM mfa_factors WHERE user_id = ?1", [user_id])?;
+    tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", [user_id])?;
+    tx.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;
+    tx.commit()
+}
+
+pub fn user_email(conn: &Connection, user_id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT email FROM users WHERE id = ?1", [user_id], |row| row.get(0)).optional()
+}
+
+pub fn replace_recovery_codes(conn: &Connection, user_id: i64, hashes: &[Vec<u8>]) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM recovery_codes WHERE user_id = ?1", [user_id])?;
+    let mut insert = conn.prepare("INSERT INTO recovery_codes (user_id, code_hash) VALUES (?1, ?2)")?;
+    for hash in hashes {
+        insert.execute(params![user_id, hash])?;
+    }
+    Ok(())
+}
+
+/// Spends an unused recovery code: false if it isn't one, or was used.
+pub fn use_recovery_code(conn: &Connection, user_id: i64, code_hash: &[u8], now: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE recovery_codes SET used_at = ?1
+          WHERE id = (SELECT id FROM recovery_codes
+                       WHERE user_id = ?2 AND code_hash = ?3 AND used_at IS NULL LIMIT 1)",
+        params![now, user_id, code_hash],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn unused_recovery_codes(conn: &Connection, user_id: i64) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL", [user_id], |row| {
+        row.get(0)
+    })
+}
+
+/// Replaces any verification link the user had with this one.
+pub fn create_email_verification(
+    conn: &Connection,
+    user_id: i64,
+    token_hash: &[u8],
+    now: i64,
+    expires_at: i64,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM email_verifications WHERE user_id = ?1", [user_id])?;
+    tx.execute(
+        "INSERT INTO email_verifications (token_hash, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        params![token_hash, user_id, now, expires_at],
+    )?;
+    tx.commit()
+}
+
+/// Marks the link's account verified and spends the link. Returns the
+/// account, or None for an unknown or expired link.
+pub fn redeem_email_verification(conn: &Connection, token_hash: &[u8], now: i64) -> rusqlite::Result<Option<i64>> {
+    let tx = conn.unchecked_transaction()?;
+    let user_id: Option<i64> = tx
+        .query_row(
+            "SELECT user_id FROM email_verifications WHERE token_hash = ?1 AND expires_at > ?2",
+            params![token_hash, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(user_id) = user_id else { return Ok(None) };
+    tx.execute(
+        "UPDATE users SET email_verified_at = ?1 WHERE id = ?2 AND email_verified_at IS NULL",
+        params![now, user_id],
+    )?;
+    tx.execute("DELETE FROM email_verifications WHERE user_id = ?1", [user_id])?;
+    tx.commit()?;
+    Ok(Some(user_id))
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
     Ok(())
 }
 
@@ -1117,5 +1420,37 @@ mod tests {
                 .is_err()
         );
         assert_eq!(Role::from_sql("dev"), Role::Dev);
+    }
+
+    /// Accounts from before email verification stay verified, and a code
+    /// can't be accepted twice.
+    #[test]
+    fn mfa_migration_and_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        let before = MIGRATIONS.len() - 1;
+        for migration in &MIGRATIONS[..before] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", i64::try_from(before).unwrap()).unwrap();
+        conn.execute("INSERT INTO users (email, password_hash, created_at) VALUES ('a@example.com', 'x', 5)", [])
+            .unwrap();
+
+        migrate(&conn).unwrap();
+        let flags = account_flags(&conn, 1).unwrap();
+        assert!(flags.email_verified && !flags.mfa && !flags.mfa_required);
+
+        let factor = NewTotp { label: "phone", secret: b"sealed", counter: 10 };
+        add_totp_factor(&conn, 1, &factor, &[b"hash".to_vec()], 0, 100).unwrap();
+        assert!(account_flags(&conn, 1).unwrap().mfa);
+        let id = totp_factors(&conn, 1).unwrap()[0].id;
+        assert!(!use_totp_counter(&conn, id, 10, 101).unwrap());
+        assert!(use_totp_counter(&conn, id, 11, 101).unwrap());
+        assert!(use_recovery_code(&conn, 1, b"hash", 102).unwrap());
+        assert!(!use_recovery_code(&conn, 1, b"hash", 103).unwrap());
+
+        set_setting(&conn, "require_mfa", "1").unwrap();
+        assert!(account_flags(&conn, 1).unwrap().mfa_required);
+        assert!(delete_factor(&conn, 1, id, 0).unwrap());
+        assert_eq!(unused_recovery_codes(&conn, 1).unwrap(), 0);
     }
 }

@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::protocol::{DashboardEvent, DeviceCommand, MachineView, SignedView, is_keyframe};
 
@@ -60,6 +61,22 @@ pub struct DashboardHandle {
     pub user_id: i64,
     pub session_id: i64,
     pub email: String,
+    pub step_up: StepUp,
+}
+
+/// Where the session behind a dashboard stands on step-up: whether its
+/// account has a second factor to prove, and when it last did.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StepUp {
+    pub mfa: bool,
+    pub at: Option<i64>,
+}
+
+impl StepUp {
+    /// Whether control, files and shells may be opened right now.
+    fn allows(self, now: i64) -> bool {
+        !self.mfa || self.at.is_some_and(|at| now - at < STEP_UP_WINDOW)
+    }
 }
 
 impl DashboardHandle {
@@ -85,6 +102,10 @@ struct Viewer {
     // Set for a new viewer and whenever its queue overflowed: a dropped
     // frame breaks every delta after it, so skip ahead to the next keyframe.
     awaiting_keyframe: bool,
+    // Whether input, files and shells are passed on for this view: set when
+    // the view starts or is elevated within the step-up window, and kept
+    // until the view ends.
+    elevated: bool,
 }
 
 struct Device {
@@ -374,18 +395,29 @@ impl Registry {
         let Some(row) = dashboard.access.get(machine_id) else { return false };
         let grant = row.grant.as_ref().map(SignedView::from);
         let video = row.role.can_view();
+        let elevated = dashboard.handle.step_up.allows(auth::now());
         let viewer = Viewer {
             frames: dashboard.handle.frames.clone(),
             email: dashboard.handle.email.clone(),
             video,
             awaiting_keyframe: true,
+            elevated,
         };
         let Some(device) = inner.devices.get_mut(machine_id) else { return false };
         // Capture starts with the first viewer that watches the screen.
         let was_idle = video && !device.viewers.values().any(|viewer| viewer.video);
         // Asked again while already watching (a fresh key exchange): start
-        // over from the next keyframe.
-        device.viewers.entry(dashboard_id).and_modify(|viewer| viewer.awaiting_keyframe = true).or_insert(viewer);
+        // over from the next keyframe, and stay elevated if it was.
+        let mut elevated = elevated;
+        device
+            .viewers
+            .entry(dashboard_id)
+            .and_modify(|viewer| {
+                viewer.awaiting_keyframe = true;
+                viewer.elevated |= elevated;
+                elevated = viewer.elevated;
+            })
+            .or_insert(viewer);
         if was_idle {
             device.send(DeviceCommand::StartCapture);
         }
@@ -395,8 +427,46 @@ impl Registry {
             signature: join.signature,
             grant,
         });
+        if let Some(dashboard) = inner.dashboards.get(&dashboard_id) {
+            dashboard.handle.send(DashboardEvent::Elevation { device_id: machine_id.to_owned(), elevated });
+        }
         inner.publish(machine_id);
         true
+    }
+
+    /// Lets this dashboard's view of the machine pass on input, files and
+    /// shells, if its session has proved a second factor within the window
+    /// (or has none to prove). Answers with an elevation event either way;
+    /// a refused one tells the dashboard to ask for a code.
+    pub fn elevate(&self, dashboard_id: DashboardId, machine_id: &str) {
+        let mut inner = self.lock();
+        let Some(dashboard) = inner.dashboards.get(&dashboard_id) else { return };
+        let allowed = dashboard.handle.step_up.allows(auth::now());
+        let Some(viewer) = inner.devices.get_mut(machine_id).and_then(|device| device.viewers.get_mut(&dashboard_id))
+        else {
+            return;
+        };
+        viewer.elevated |= allowed;
+        let elevated = viewer.elevated;
+        if let Some(dashboard) = inner.dashboards.get(&dashboard_id) {
+            dashboard.handle.send(DashboardEvent::Elevation { device_id: machine_id.to_owned(), elevated });
+        }
+    }
+
+    /// The session proved a second factor at `at`.
+    pub fn note_step_up(&self, session_id: i64, at: i64) {
+        let mut inner = self.lock();
+        for dashboard in inner.dashboards.values_mut().filter(|dashboard| dashboard.handle.session_id == session_id) {
+            dashboard.handle.step_up.at = Some(at);
+        }
+    }
+
+    /// The user gained their first second factor, or lost their last.
+    pub fn set_mfa(&self, user_id: i64, mfa: bool) {
+        let mut inner = self.lock();
+        for dashboard in inner.dashboards.values_mut().filter(|dashboard| dashboard.handle.user_id == user_id) {
+            dashboard.handle.step_up.mfa = mfa;
+        }
     }
 
     /// Passes sealed input on to the machine if this dashboard may control
@@ -404,21 +474,7 @@ impl Registry {
     /// machine right now. The machine checks the role again against the
     /// owner's grant before acting on it. Returns whether it was passed on.
     pub fn input(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
-        let inner = self.lock();
-        let may_control = inner
-            .dashboards
-            .get(&dashboard_id)
-            .and_then(|dashboard| dashboard.access.get(machine_id))
-            .is_some_and(|row| row.role.can_control());
-        if !may_control {
-            return false;
-        }
-        let Some(device) = inner.devices.get(machine_id) else { return false };
-        if !device.viewers.contains_key(&dashboard_id) {
-            return false;
-        }
-        device.send(DeviceCommand::Input { viewer: dashboard_id, sealed });
-        true
+        self.pass_on(dashboard_id, machine_id, Role::can_control, DeviceCommand::Input { viewer: dashboard_id, sealed })
     }
 
     /// Passes a sealed clipboard request on to the machine if this dashboard
@@ -444,7 +500,7 @@ impl Registry {
     }
 
     /// Passes a sealed shell-channel message on to the machine if this
-    /// dashboard may open shells there and is watching it.
+    /// dashboard may open shells there and is watching it, elevated.
     pub fn shell(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
         self.pass_on(dashboard_id, machine_id, Role::can_shell, DeviceCommand::Shell { viewer: dashboard_id, sealed })
     }
@@ -463,7 +519,8 @@ impl Registry {
             .and_then(|dashboard| dashboard.access.get(machine_id))
             .is_some_and(|row| allowed(row.role));
         let Some(device) = inner.devices.get(machine_id) else { return false };
-        if !may || !device.viewers.contains_key(&dashboard_id) {
+        // Not elevated: the session owes a fresh second factor first.
+        if !may || !device.viewers.get(&dashboard_id).is_some_and(|viewer| viewer.elevated) {
             return false;
         }
         device.send(command);
@@ -642,6 +699,7 @@ mod tests {
             user_id,
             session_id: user_id,
             email: format!("user{user_id}@example.com"),
+            step_up: StepUp::default(),
         };
         (handle, events_rx)
     }
@@ -694,6 +752,43 @@ mod tests {
         let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
         assert!(registry.input(dashboard, MACHINE, "sealed".to_owned()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Input { viewer, .. }) if viewer == dashboard));
+    }
+
+    fn next_elevation(events: &mut mpsc::UnboundedReceiver<Outbound>) -> Option<bool> {
+        while let Ok(outbound) = events.try_recv() {
+            if let Outbound::Event(event) = outbound
+                && let DashboardEvent::Elevation { elevated, .. } = *event
+            {
+                return Some(elevated);
+            }
+        }
+        None
+    }
+
+    /// A session that owes a second factor watches, but its input, files
+    /// and shells go nowhere until it steps up and asks again.
+    #[test]
+    fn control_waits_for_step_up() {
+        let registry = Registry::default();
+        let (mut handle, mut events) = handle(1);
+        handle.step_up = StepUp { mfa: true, at: None };
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::Owner)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert_eq!(next_elevation(&mut events), Some(false));
+        while next(&mut device_rx).is_some() {}
+
+        assert!(!registry.input(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.shell(dashboard, MACHINE, "sealed".to_owned()));
+        registry.elevate(dashboard, MACHINE);
+        assert_eq!(next_elevation(&mut events), Some(false));
+
+        registry.note_step_up(1, auth::now());
+        registry.elevate(dashboard, MACHINE);
+        assert_eq!(next_elevation(&mut events), Some(true));
+        assert!(registry.input(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(registry.shell(dashboard, MACHINE, "sealed".to_owned()));
     }
 
     #[test]
@@ -803,7 +898,15 @@ mod tests {
         let (frames, _frames_rx) = mpsc::channel(1);
         let (bulk, mut files_rx) = mpsc::channel(2);
         let handle =
-            DashboardHandle { events, frames, bulk, user_id: 2, session_id: 2, email: "user2@example.com".to_owned() };
+            DashboardHandle {
+                events,
+                frames,
+                bulk,
+                user_id: 2,
+                session_id: 2,
+                email: "user2@example.com".to_owned(),
+                step_up: StepUp::default(),
+            };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Control)]);
         let (outbound, _device_rx) = mpsc::unbounded_channel();
         registry.add_device(MACHINE, 1, outbound);

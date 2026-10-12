@@ -6,10 +6,13 @@ mod auth;
 mod db;
 mod error;
 mod machines;
+mod mail;
+mod mfa;
 mod protocol;
 mod registry;
 mod e2e;
 mod routes;
+mod totp;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -27,9 +30,12 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::auth::LoginLimiter;
+use crate::auth::{AccountLimiter, LoginLimiter};
 use crate::db::Db;
+use crate::mail::Mailer;
+use crate::mfa::LoginTickets;
 use crate::registry::Registry;
+use crate::totp::SecretKey;
 
 /// Shared by every handler.
 #[derive(Clone)]
@@ -44,6 +50,17 @@ pub struct AppState {
     pub relay_pin: Option<String>,
     /// Wakes the share clock when a share's start or expiry changes.
     pub shares_changed: Arc<Notify>,
+    /// Throttles wrong second-factor codes per account.
+    pub mfa_limiter: Arc<AccountLimiter>,
+    /// Logins waiting for their second factor.
+    pub mfa_tickets: Arc<LoginTickets>,
+    /// Seals TOTP seeds at rest.
+    pub secret_key: Arc<SecretKey>,
+    /// What authenticator apps list this relay's codes under.
+    pub totp_issuer: Arc<str>,
+    /// None when no SMTP server is configured: then nothing is mailed and
+    /// email addresses are taken as given.
+    pub mailer: Option<Arc<Mailer>>,
 }
 
 struct Config {
@@ -52,7 +69,11 @@ struct Config {
     tls_cert: PathBuf,
     tls_key: PathBuf,
     db_path: PathBuf,
-    /// The URL people reach the dashboard at, for links printed to the log.
+    /// The relay's own secret (seals TOTP seeds). Back it up with the
+    /// database: without it, every authenticator has to be set up again.
+    secret_key_path: PathBuf,
+    /// The URL people reach the dashboard at, for links printed to the log
+    /// and sent in emails.
     public_url: Option<String>,
 }
 
@@ -67,12 +88,15 @@ impl Config {
         let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
         let addr = format!("{host}:{port}").parse().map_err(|error| format!("invalid HOST/PORT: {error}"))?;
         let path_or = |var: &str, default: PathBuf| std::env::var_os(var).map(PathBuf::from).unwrap_or(default);
+        let db_path = path_or("HAWK_DB_PATH", root.join("data/hawk.db"));
+        let beside_db = db_path.parent().map_or_else(|| PathBuf::from("secret.key"), |dir| dir.join("secret.key"));
         Ok(Self {
             addr,
             frontend_dist: path_or("FRONTEND_DIST", root.join("frontend/dist")),
             tls_cert: path_or("TLS_CERT_PATH", root.join("certs/dev-cert.pem")),
             tls_key: path_or("TLS_KEY_PATH", root.join("certs/dev-key.pem")),
-            db_path: path_or("HAWK_DB_PATH", root.join("data/hawk.db")),
+            secret_key_path: path_or("HAWK_SECRET_KEY_PATH", beside_db),
+            db_path,
             public_url: std::env::var("PUBLIC_URL").ok().map(|url| url.trim_end_matches('/').to_owned()),
         })
     }
@@ -114,6 +138,8 @@ fn spawn_cleanup(state: AppState) {
                 error!(%error, "purging expired sessions failed");
             }
             state.limiter.prune();
+            state.mfa_limiter.prune();
+            state.mfa_tickets.prune();
         }
     });
 }
@@ -167,9 +193,16 @@ async fn main() -> Result<(), String> {
     let db = Db::open(&config.db_path)?;
     info!("database at {}", config.db_path.display());
 
+    let secret_key = SecretKey::load_or_create(&config.secret_key_path)?;
+
     let scheme = if tls.is_some() { "https" } else { "http" };
     let base_url = config.public_url.clone().unwrap_or_else(|| format!("{scheme}://{}", config.addr));
     bootstrap_admin(&db, &base_url).await?;
+    let mailer = Mailer::from_env(&base_url)?;
+    if mailer.is_some() && config.public_url.is_none() {
+        warn!("PUBLIC_URL is not set: links in emails point at {base_url}");
+    }
+    let host = base_url.split_once("://").map_or(base_url.as_str(), |(_, host)| host);
 
     let (view_ended, view_ended_rx) = mpsc::unbounded_channel();
     let state = AppState {
@@ -179,6 +212,11 @@ async fn main() -> Result<(), String> {
         secure_cookies: tls.is_some(),
         relay_pin,
         shares_changed: Arc::new(Notify::new()),
+        mfa_limiter: Arc::new(AccountLimiter::default()),
+        mfa_tickets: Arc::new(LoginTickets::default()),
+        secret_key: Arc::new(secret_key),
+        totp_issuer: format!("Hawk ({host})").into(),
+        mailer: mailer.map(Arc::new),
     };
     spawn_cleanup(state.clone());
     machines::spawn_share_clock(state.clone());
@@ -190,18 +228,29 @@ async fn main() -> Result<(), String> {
         .route("/api/session", get(api::session))
         .route("/api/login", post(api::login))
         .route("/api/login/params", post(api::login_params))
+        .route("/api/login/mfa", post(api::login_mfa))
         .route("/api/logout", post(api::logout))
         .route("/api/signup", post(api::signup))
         .route("/api/invites/{token}", get(api::invite_info))
         .route("/api/account/password", post(api::change_password))
         .route("/api/account/key", get(api::account_key))
         .route("/api/account/upgrade", post(api::upgrade_account))
+        .route("/api/account/verify-email", post(api::verify_email))
+        .route("/api/account/verify-email/resend", post(api::resend_verification))
+        .route("/api/account/step-up", post(mfa::step_up))
+        .route("/api/account/mfa", get(mfa::list_factors))
+        .route("/api/account/mfa/totp/setup", post(mfa::totp_setup))
+        .route("/api/account/mfa/totp", post(mfa::add_totp))
+        .route("/api/account/mfa/recovery-codes", post(mfa::regenerate_recovery_codes))
+        .route("/api/account/mfa/{id}", delete(mfa::remove_factor))
         .route("/api/users/lookup", post(api::lookup_user_key))
         .route("/api/sessions", get(api::list_sessions))
         .route("/api/sessions/revoke-others", post(api::revoke_other_sessions))
         .route("/api/sessions/{id}", delete(api::revoke_session))
         .route("/api/admin/users", get(api::list_users))
         .route("/api/admin/users/{id}/disabled", post(api::set_user_disabled))
+        .route("/api/admin/users/{id}/reset-mfa", post(mfa::admin_reset))
+        .route("/api/admin/policy", get(mfa::get_policy).put(mfa::set_policy))
         .route("/api/admin/invites", get(api::list_invites).post(api::create_invite))
         .route("/api/admin/invites/{id}", delete(api::delete_invite))
         .route("/api/machines/enroll", post(machines::create_enrollment_code))

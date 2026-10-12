@@ -8,6 +8,11 @@
 //! account's identity key before it's stored here (see frontend/src/keys.ts).
 //! Accounts from before this are "legacy" until their next login, which
 //! sends the password itself one last time to upgrade them.
+//!
+//! An account with a second factor logs in in two steps: the password earns
+//! a short-lived ticket, and a code trades it for a session (see crate::mfa).
+//! With a mailer configured, a new account also has to confirm its email
+//! address before machines can be shared with it or enrolled under it.
 
 use std::net::SocketAddr;
 
@@ -20,10 +25,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::auth::{self, AdminUser, CurrentUser};
-use crate::db::{self, NewCredentials, SignupError, User};
+use crate::auth::{self, AdminUser, CurrentUser, SessionUser, SteppedUp, SteppedUpAdmin};
+use crate::db::{self, AccountFlags, NewCredentials, SignupError, User};
 use crate::e2e;
 use crate::error::ApiError;
+use crate::mail;
+use crate::mfa::{self, Proof};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,16 +38,41 @@ pub struct UserView {
     id: i64,
     email: String,
     is_admin: bool,
+    /// Has at least one second factor.
+    mfa: bool,
+    email_verified: bool,
+    /// The admin requires a second factor and this account has none: the
+    /// dashboard only offers setting one up.
+    mfa_setup_required: bool,
 }
 
-impl From<User> for UserView {
-    fn from(user: User) -> Self {
-        Self { id: user.id, email: user.email, is_admin: user.is_admin }
+impl UserView {
+    fn new(state: &AppState, user: User, account: AccountFlags) -> Self {
+        Self {
+            id: user.id,
+            email: user.email,
+            is_admin: user.is_admin,
+            mfa: account.mfa,
+            email_verified: email_verified(state, account),
+            mfa_setup_required: account.mfa_required && !account.mfa,
+        }
+    }
+
+    async fn load(state: &AppState, user: User) -> Result<Self, ApiError> {
+        let user_id = user.id;
+        let account = state.db.call(move |conn| db::account_flags(conn, user_id)).await?;
+        Ok(Self::new(state, user, account))
     }
 }
 
-pub async fn session(current: CurrentUser) -> Json<UserView> {
-    Json(current.user.into())
+/// Whether the account counts as owning its address. Without a mailer
+/// there's no way to check, so every address is taken as given.
+pub fn email_verified(state: &AppState, account: AccountFlags) -> bool {
+    account.email_verified || state.mailer.is_none()
+}
+
+pub async fn session(State(state): State<AppState>, SessionUser(current): SessionUser) -> Json<UserView> {
+    Json(UserView::new(&state, current.user, current.account))
 }
 
 /// What new accounts are told to use, and what an unknown email is told,
@@ -117,13 +149,26 @@ pub struct Credentials {
     password: String,
 }
 
+/// What a correct password gets: a session, or for an account with a
+/// second factor, a ticket to trade for one with a code.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum LoginOutcome {
+    SignedIn(UserView),
+    #[serde(rename_all = "camelCase")]
+    MfaRequired {
+        mfa_required: bool,
+        ticket: String,
+    },
+}
+
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<Credentials>,
-) -> Result<(CookieJar, Json<UserView>), ApiError> {
+) -> Result<(CookieJar, Json<LoginOutcome>), ApiError> {
     let ip = peer.ip();
     if state.limiter.is_blocked(ip) {
         return Err(ApiError::TooManyRequests);
@@ -158,16 +203,65 @@ pub async fn login(
     }
     state.limiter.record_success(ip);
 
-    let jar = start_session(&state, jar, found.user.id, session_origin(peer, &headers)).await?;
-    Ok((jar, Json(found.user.into())))
+    let user_id = found.user.id;
+    let account = state.db.call(move |conn| db::account_flags(conn, user_id)).await?;
+    if account.mfa {
+        let ticket = state.mfa_tickets.issue(user_id, session_origin(peer, &headers));
+        return Ok((jar, Json(LoginOutcome::MfaRequired { mfa_required: true, ticket })));
+    }
+    let jar = start_session(&state, jar, user_id, session_origin(peer, &headers), false).await?;
+    Ok((jar, Json(LoginOutcome::SignedIn(UserView::new(&state, found.user, account)))))
+}
+
+#[derive(Deserialize)]
+pub struct SecondStep {
+    ticket: String,
+    code: String,
+}
+
+/// The second step of a login: a code from an authenticator, or a recovery
+/// code, for the ticket the password earned. The new session counts as
+/// stepped up.
+pub async fn login_mfa(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    jar: CookieJar,
+    Json(body): Json<SecondStep>,
+) -> Result<(CookieJar, Json<UserView>), ApiError> {
+    let ip = peer.ip();
+    if state.limiter.is_blocked(ip) {
+        return Err(ApiError::TooManyRequests);
+    }
+    let expired = || ApiError::bad_request("this sign-in has expired: enter your password again");
+    let user_id = state.mfa_tickets.attempt(&body.ticket).ok_or_else(expired)?;
+    let Some(proof) = mfa::check_code(&state, user_id, &body.code).await? else {
+        state.limiter.record_failure(ip);
+        return Err(ApiError::bad_request("that code isn't right"));
+    };
+    let redeemed = state.mfa_tickets.redeem(&body.ticket).ok_or_else(expired)?;
+
+    // Disabled since the password was checked: no session.
+    let (user, account) = state
+        .db
+        .call(move |conn| {
+            let Some(user) = db::active_user(conn, user_id)? else { return Ok(None) };
+            Ok(Some((user, db::account_flags(conn, user_id)?)))
+        })
+        .await?
+        .ok_or(ApiError::Forbidden)?;
+    let jar = start_session(&state, jar, redeemed.user_id, redeemed.origin, true).await?;
+    if proof == Proof::RecoveryCode {
+        mfa::notify(&state, &user.email, "Someone signed in to your account with a recovery code.");
+    }
+    Ok((jar, Json(UserView::new(&state, user, account))))
 }
 
 pub async fn logout(
     State(state): State<AppState>,
     jar: CookieJar,
-    current: Option<CurrentUser>,
+    current: Option<SessionUser>,
 ) -> Result<(CookieJar, StatusCode), ApiError> {
-    if let Some(current) = current {
+    if let Some(SessionUser(current)) = current {
         let session_id = current.session_id;
         state.db.call(move |conn| db::delete_session(conn, session_id)).await?;
         state.registry.close_session(session_id);
@@ -219,6 +313,8 @@ pub async fn signup(
 
     let invite_hash = auth::token_hash(&body.token);
     let now = auth::now();
+    // With no mailer there's nothing to confirm the address with.
+    let verified = state.mailer.is_none();
     let user = state
         .db
         .call(move |conn| {
@@ -228,7 +324,7 @@ pub async fn signup(
                 public_key: &key.public_key,
                 wrapped_key: &key.wrapped_key,
             };
-            Ok(db::redeem_invite(conn, &invite_hash, &email, &credentials, now))
+            Ok(db::redeem_invite(conn, &invite_hash, &email, &credentials, verified, now))
         })
         .await?
         .map_err(|error| match error {
@@ -237,8 +333,64 @@ pub async fn signup(
             SignupError::Db(error) => error.into(),
         })?;
 
-    let jar = start_session(&state, jar, user.id, session_origin(peer, &headers)).await?;
-    Ok((jar, Json(user.into())))
+    if !verified {
+        // Counts against resending, so "send it again" can't replace the
+        // link before it has had a chance to arrive.
+        if let Some(mailer) = &state.mailer {
+            mailer.take_send(user.id);
+        }
+        send_verification(&state, &user).await?;
+    }
+    let jar = start_session(&state, jar, user.id, session_origin(peer, &headers), false).await?;
+    Ok((jar, Json(UserView::load(&state, user).await?)))
+}
+
+/// Mails the user a fresh link to confirm their address with, replacing any
+/// earlier one.
+async fn send_verification(state: &AppState, user: &User) -> Result<(), ApiError> {
+    let Some(mailer) = state.mailer.clone() else { return Ok(()) };
+    let token = auth::random_token();
+    let hash = auth::token_hash(&token);
+    let now = auth::now();
+    let expires_at = now + mail::VERIFICATION_TTL.whole_seconds();
+    let user_id = user.id;
+    state.db.call(move |conn| db::create_email_verification(conn, user_id, &hash, now, expires_at)).await?;
+    mailer.send_verification(&user.email, &token);
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct VerifyEmail {
+    token: String,
+}
+
+/// Opens a verification link. Needs no session: the link may well be
+/// opened on another device than the one that signed up.
+pub async fn verify_email(State(state): State<AppState>, Json(body): Json<VerifyEmail>) -> Result<StatusCode, ApiError> {
+    let hash = auth::token_hash(&body.token);
+    let now = auth::now();
+    state
+        .db
+        .call(move |conn| db::redeem_email_verification(conn, &hash, now))
+        .await?
+        .ok_or_else(|| ApiError::bad_request("this link has expired or was already used"))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sends another verification link, at most once a minute.
+pub async fn resend_verification(
+    State(state): State<AppState>,
+    SessionUser(current): SessionUser,
+) -> Result<StatusCode, ApiError> {
+    let Some(mailer) = state.mailer.as_ref() else { return Err(ApiError::NotFound) };
+    if current.account.email_verified {
+        return Err(ApiError::Conflict("your email address is already confirmed".into()));
+    }
+    if !mailer.take_send(current.user.id) {
+        return Err(ApiError::TooManyRequests);
+    }
+    send_verification(&state, &current.user).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Longer User-Agents are cut; they're only shown to tell sessions apart.
@@ -255,17 +407,24 @@ fn session_origin(peer: SocketAddr, headers: &HeaderMap) -> db::SessionOrigin {
     db::SessionOrigin { user_agent, ip: peer.ip().to_canonical().to_string() }
 }
 
+/// `stepped_up`: a second factor was just proved, so step-up actions don't
+/// ask again straight away.
 async fn start_session(
     state: &AppState,
     jar: CookieJar,
     user_id: i64,
     origin: db::SessionOrigin,
+    stepped_up: bool,
 ) -> Result<CookieJar, ApiError> {
     let token = auth::random_token();
     let hash = auth::token_hash(&token);
     let now = auth::now();
     let expires_at = now + auth::SESSION_TTL.whole_seconds();
-    state.db.call(move |conn| db::create_session(conn, &hash, user_id, &origin, now, expires_at)).await?;
+    let step_up_at = stepped_up.then_some(now);
+    state
+        .db
+        .call(move |conn| db::create_session(conn, &hash, user_id, &origin, now, expires_at, step_up_at))
+        .await?;
     Ok(jar.add(auth::session_cookie(token, state.secure_cookies)))
 }
 
@@ -279,12 +438,34 @@ pub struct ChangePassword {
     wrapped_key: String,
 }
 
+/// Checks `password` (the derived auth key) against the account's, for an
+/// action that has to be confirmed with it. Wrong ones count as failed
+/// logins, so a stolen session can't be used to guess the password.
+pub async fn check_password(state: &AppState, peer: SocketAddr, user_id: i64, password: &str) -> Result<(), ApiError> {
+    let ip = peer.ip();
+    if state.limiter.is_blocked(ip) {
+        return Err(ApiError::TooManyRequests);
+    }
+    let stored = state.db.call(move |conn| db::password_hash(conn, user_id)).await?;
+    let password = password.to_owned();
+    let matches = tokio::task::spawn_blocking(move || auth::verify_password(&password, &stored))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !matches {
+        state.limiter.record_failure(ip);
+        return Err(ApiError::bad_request("password is incorrect"));
+    }
+    state.limiter.record_success(ip);
+    Ok(())
+}
+
 /// Checks the current password, stores the new one's hash, and ends every
-/// other session the user has. The session making the change stays.
+/// other session the user has. The session making the change stays. A
+/// step-up action.
 pub async fn change_password(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    current: CurrentUser,
+    SteppedUp(current): SteppedUp,
     Json(body): Json<ChangePassword>,
 ) -> Result<StatusCode, ApiError> {
     // Wrong current passwords count as failed logins, so a stolen session
@@ -326,6 +507,7 @@ pub async fn change_password(
         return Err(ApiError::Conflict("your password was changed elsewhere; reload and try again".into()));
     }
     state.registry.close_other_sessions(user_id, keep);
+    mfa::notify(&state, &current.user.email, "The password of your account was changed.");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -339,7 +521,12 @@ pub struct AccountKeyView {
 /// The account's identity key, still encrypted under the password: the
 /// browser unlocks it with the password on login. 404 for an account that
 /// hasn't been upgraded yet.
-pub async fn account_key(State(state): State<AppState>, current: CurrentUser) -> Result<Json<AccountKeyView>, ApiError> {
+/// Open to a session the MFA policy confines too: the browser needs the key
+/// to finish signing in before it can set a factor up.
+pub async fn account_key(
+    State(state): State<AppState>,
+    SessionUser(current): SessionUser,
+) -> Result<Json<AccountKeyView>, ApiError> {
     let user_id = current.user.id;
     let key = state.db.call(move |conn| db::user_key(conn, user_id)).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(AccountKeyView { public_key: BASE64.encode(key.public_key), wrapped_key: BASE64.encode(key.wrapped_key) }))
@@ -361,7 +548,7 @@ pub struct UpgradeRequest {
 pub async fn upgrade_account(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    current: CurrentUser,
+    SessionUser(current): SessionUser,
     Json(body): Json<UpgradeRequest>,
 ) -> Result<StatusCode, ApiError> {
     let ip = peer.ip();
@@ -424,11 +611,16 @@ pub async fn lookup_user_key(
 ) -> Result<Json<UserKeyView>, ApiError> {
     let email = auth::normalize_email(&body.email).ok_or_else(|| ApiError::bad_request("invalid email address"))?;
     let lookup = email.clone();
+    let require_verified = state.mailer.is_some();
     let (user_id, public_key) = state
         .db
-        .call(move |conn| db::public_key_by_email(conn, &lookup))
+        .call(move |conn| db::public_key_by_email(conn, &lookup, require_verified))
         .await?
-        .ok_or_else(|| ApiError::bad_request("no account with that email; ask the admin to invite them first"))?;
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "no account with a confirmed email at that address; ask the admin to invite them first",
+            )
+        })?;
     Ok(Json(UserKeyView { user_id, email, public_key: public_key.map(|key| BASE64.encode(key)) }))
 }
 
@@ -500,6 +692,8 @@ pub struct AdminUserView {
     is_admin: bool,
     disabled: bool,
     created_at: i64,
+    mfa: bool,
+    email_verified: bool,
 }
 
 pub async fn list_users(State(state): State<AppState>, _admin: AdminUser) -> Result<Json<Vec<AdminUserView>>, ApiError> {
@@ -513,6 +707,8 @@ pub async fn list_users(State(state): State<AppState>, _admin: AdminUser) -> Res
                 is_admin: row.user.is_admin,
                 disabled: row.disabled,
                 created_at: row.created_at,
+                mfa: row.mfa,
+                email_verified: row.email_verified || state.mailer.is_none(),
             })
             .collect(),
     ))
@@ -525,7 +721,7 @@ pub struct SetDisabled {
 
 pub async fn set_user_disabled(
     State(state): State<AppState>,
-    AdminUser(admin): AdminUser,
+    SteppedUpAdmin(admin): SteppedUpAdmin,
     Path(user_id): Path<i64>,
     Json(body): Json<SetDisabled>,
 ) -> Result<StatusCode, ApiError> {
@@ -574,7 +770,7 @@ pub struct CreatedInvite {
 
 pub async fn create_invite(
     State(state): State<AppState>,
-    AdminUser(admin): AdminUser,
+    SteppedUpAdmin(admin): SteppedUpAdmin,
 ) -> Result<Json<CreatedInvite>, ApiError> {
     let token = auth::random_token();
     let hash = auth::token_hash(&token);
@@ -587,7 +783,7 @@ pub async fn create_invite(
 
 pub async fn delete_invite(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    _admin: SteppedUpAdmin,
     Path(invite_id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     let deleted = state.db.call(move |conn| db::delete_pending_invite(conn, invite_id)).await?;

@@ -201,6 +201,9 @@ pub enum DashboardCommand {
     /// machine; the relay adds the viewer's grant from its records.
     StartView { device_id: String, join: SignedView },
     StopView { device_id: String },
+    /// Asks for input, files and shells on the view of this machine, which
+    /// takes a recently proved second factor; answered with an elevation.
+    Elevate { device_id: String },
     /// Sealed for the machine. Only passed on while viewing the machine
     /// with a control (or owner) role; the machine checks that again.
     Input { device_id: String, sealed: String },
@@ -286,6 +289,9 @@ pub enum DashboardEvent {
     },
     /// The machine refused to stream to this viewer.
     ViewRejected { device_id: String, reason: String },
+    /// Whether this view passes on input, files and shells. When it doesn't,
+    /// the dashboard asks for a code, steps up and sends elevate.
+    Elevation { device_id: String, elevated: bool },
     /// The stream moved to a new key, wrapped for this viewer.
     StreamKey { device_id: String, wrapped_key: String },
     /// Clipboard text the machine sealed for this viewer.

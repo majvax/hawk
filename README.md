@@ -143,7 +143,9 @@ TODO
 - [x] Secure-desktop (UAC / lock screen) capture and control: hawk-capture runs as SYSTEM in-session and follows the input desktop
 - [x] End-to-end encryption of video and input, with viewer access decided by the owner's signatures rather than the relay
 - [ ] Self-signed certificate automation
-- [ ] Multi-factor authentication (TOTP, WebAuthn/passkeys, recovery codes)
+- [x] Multi-factor authentication: TOTP, recovery codes, step-up, admin policy and reset
+- [ ] WebAuthn / passkeys
+- [x] Email ownership verification and security notices (when the relay has a mailer)
 - [ ] Trusted-proxy address resolution, with IP allow/deny lists
 - [ ] Machine analytics (CPU/RAM/GPU/disk/network) and dashboard charts
 - [x] `dev` role: a shell instead of a video stream, for low bandwidth (ConPTY as the logged-on user)
@@ -171,10 +173,13 @@ Each of the unchecked items is described under [Planned Features](#planned-featu
 Design intent for the work that isn't built yet. Nothing in this section is
 implemented; it's here so the shape is settled before the code is.
 
-### Multi-factor authentication
+### Multi-factor authentication (TOTP and recovery codes built)
 
 The relay is the only gate in front of every machine, so a stolen password
-has to not be enough. Planned, in rough order of value:
+has to not be enough. TOTP, recovery codes, step-up, the admin policy and
+reset are built (`src/server/README.md`, "Two-factor authentication"), as
+are email verification and security notices. WebAuthn and email codes are
+still to come. In rough order of value:
 
 * **TOTP** (RFC 6238, any authenticator app) — the baseline, works offline
   and needs nothing from the browser.
@@ -323,9 +328,10 @@ whatever the relay forwards, and capture doesn't even start for it.
 * **Accountable.** Every shell is logged with who opened it, as which user,
   for how long and how many bytes each way. Keystrokes are never logged.
 
-Not yet: running shells as a dedicated low-privilege account instead of the
-logged-on user, recording sessions for the owner to read back, and making
-opening a shell an MFA step-up action (once there is MFA).
+Opening a shell is an MFA step-up action: the view has to be elevated
+with a fresh code first. Not yet: running shells as a dedicated
+low-privilege account instead of the logged-on user, and recording
+sessions for the owner to read back.
 
 ### Installer
 

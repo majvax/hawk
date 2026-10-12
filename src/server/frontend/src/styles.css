@@ -664,6 +664,11 @@ select {
   height: 100dvh;
 }
 
+/* A notice under the top bar, such as an unconfirmed email address. */
+.shell.with-banner {
+  grid-template-rows: var(--bar-h) auto minmax(0, 1fr) var(--status-h);
+}
+
 .topbar {
   display: flex;
   align-items: stretch;
@@ -1969,4 +1974,64 @@ select {
   gap: 6px 14px;
   align-items: baseline;
   max-width: 560px;
+}
+
+/* --- Dialogs and two-factor setup ---------------------------------------- */
+
+.dialog {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  overflow: visible;
+}
+
+.dialog::backdrop {
+  background: color-mix(in srgb, var(--void) 78%, transparent);
+}
+
+.qr {
+  display: block;
+  flex: none;
+  border: 1px solid var(--line);
+}
+
+.totp-setup {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.totp-setup > div {
+  display: grid;
+  flex: 1 1 220px;
+  gap: 12px;
+  min-width: 0;
+}
+
+.recovery-codes {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 6px 16px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  background: var(--void);
+  font-family: var(--mono);
+  list-style: none;
+}
+
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 8px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--warn) 40%, var(--line));
+  background: color-mix(in srgb, var(--warn) 7%, var(--void));
+}
+
+.banner > span {
+  flex: 1 1 260px;
 }
