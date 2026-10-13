@@ -2321,3 +2321,24 @@ a.btn {
     opacity: 1;
   }
 }
+
+/* The values hawk-setup's window asks for, in the Add machine steps. */
+.enroll-values {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0;
+}
+
+.enroll-values dt {
+  color: var(--fg-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.enroll-values dd {
+  margin: 0;
+  min-width: 0;
+}

@@ -49,10 +49,36 @@ struct ShellConfig {
     std::string command = "powershell.exe -NoLogo";
 };
 
+struct RelayConfig {
+    // Where the relay is. The installer writes it; the default is a relay
+    // on this same PC, for development.
+    std::string url = "wss://127.0.0.1:8080/v1/ws";
+};
+
+// What the updater (hawk-setup.exe beside the service) may do on its own.
+enum class UpdatePolicy : std::uint8_t {
+    off,        // never look
+    notify,     // look, and tell the owner in the dashboard; install when they say
+    automatic,  // look, and install
+};
+
+struct UpdateConfig {
+    UpdatePolicy  policy = UpdatePolicy::notify;
+    std::uint32_t check_hours = 24;
+    // Read by hawk-setup, not the service: where releases are announced,
+    // the key they're signed with, and stable or beta. Empty means what
+    // the build was made with.
+    std::string manifest_url;
+    std::string public_key;
+    std::string channel;
+};
+
 struct MachineConfig {
     ClipboardConfig clipboard;
     FilesConfig     files;
     ShellConfig     shell;
+    RelayConfig     relay;
+    UpdateConfig    update;
 };
 
 // The config, with defaults for what it leaves out (or for a missing file).
@@ -73,6 +99,20 @@ struct MachineConfig {
 //   [[shell]]
 //   enabled = false
 //   command = "powershell.exe -NoLogo"
+//
+//   [[relay]]
+//   url = "wss://relay.example.com/v1/ws"
+//
+//   [[update]]
+//   policy = "notify"    # off | notify | auto
+//   check_hours = 24
+//   channel = "stable"   # stable | beta
+//   manifest_url = ""    # empty: the release feed this build came from
+//   public_key = ""      # empty: the key this build trusts
+//
+// A relay url that doesn't parse leaves the service unconnected rather
+// than guessing; an [[update]] table that doesn't parse falls back to
+// notify, which never installs anything by itself.
 [[nodiscard]] MachineConfig load_machine_config();
 
 }  // namespace hawk::service

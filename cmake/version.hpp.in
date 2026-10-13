@@ -6,5 +6,7 @@ namespace internal::version {
     inline constexpr int version_minor = @PROJECT_VERSION_MINOR@;
     inline constexpr int version_patch = @PROJECT_VERSION_PATCH@;
     inline constexpr std::string_view version = "@PROJECT_VERSION@";
+    // With any prerelease suffix, e.g. "1.1.0-rc.1": what releases are named by.
+    inline constexpr std::string_view full_version = "@HAWK_VERSION@";
     inline constexpr std::string_view project_name = "@PROJECT_NAME@";
 }

@@ -19,8 +19,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
+use axum::extract::State;
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use serde::Serialize;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use base64::Engine;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -30,7 +34,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::auth::{AccountLimiter, LoginLimiter};
+use crate::auth::{AccountLimiter, AllowedOrigins, LoginLimiter};
 use crate::db::Db;
 use crate::mail::Mailer;
 use crate::mfa::LoginTickets;
@@ -61,6 +65,8 @@ pub struct AppState {
     /// None when no SMTP server is configured: then nothing is mailed and
     /// email addresses are taken as given.
     pub mailer: Option<Arc<Mailer>>,
+    /// Other origins that may use this relay with bearer tokens.
+    pub allowed_origins: Arc<AllowedOrigins>,
 }
 
 struct Config {
@@ -75,6 +81,7 @@ struct Config {
     /// The URL people reach the dashboard at, for links printed to the log
     /// and sent in emails.
     public_url: Option<String>,
+    allowed_origins: AllowedOrigins,
 }
 
 impl Config {
@@ -98,6 +105,7 @@ impl Config {
             secret_key_path: path_or("HAWK_SECRET_KEY_PATH", beside_db),
             db_path,
             public_url: std::env::var("PUBLIC_URL").ok().map(|url| url.trim_end_matches('/').to_owned()),
+            allowed_origins: AllowedOrigins::parse(&std::env::var("HAWK_ALLOWED_ORIGINS").unwrap_or_default())?,
         })
     }
 }
@@ -175,6 +183,41 @@ fn load_tls(config: &Config) -> Result<Option<(rustls::ServerConfig, String)>, S
     Ok(Some((server, pin)))
 }
 
+/// Liveness for the updater and load balancers: the relay answers and its
+/// database opens. Says nothing else.
+async fn healthz(State(state): State<AppState>) -> StatusCode {
+    match state.db.call(|conn| conn.query_row("SELECT 1", [], |_| Ok(()))).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+#[derive(Serialize)]
+struct VersionInfo {
+    /// What dashboards and machines speak. A dashboard compares it with its
+    /// own and says plainly which side needs updating.
+    protocol: u32,
+}
+
+/// Public, so a dashboard can check it before anyone signs in. The release
+/// itself isn't given out: an exact version on a public page helps nobody
+/// but someone looking for a known bug.
+async fn version() -> Json<VersionInfo> {
+    Json(VersionInfo { protocol: protocol::PROTOCOL_VERSION })
+}
+
+/// CORS for the allowed origins: bearer tokens only, never cookies, so
+/// credentials stay off.
+fn cors_layer(origins: &AllowedOrigins) -> CorsLayer {
+    let origins: Vec<HeaderValue> = origins.list().iter().filter_map(|origin| origin.parse().ok()).collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .expose_headers([HeaderName::from_static(auth::SESSION_TOKEN_HEADER)])
+        .max_age(Duration::from_secs(60 * 60))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     tracing_subscriber::fmt()
@@ -182,7 +225,16 @@ async fn main() -> Result<(), String> {
         .init();
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("hawk-relay {} (protocol {})", env!("CARGO_PKG_VERSION"), protocol::PROTOCOL_VERSION);
+        return Ok(());
+    }
+    info!(version = env!("CARGO_PKG_VERSION"), protocol = protocol::PROTOCOL_VERSION, "hawk relay starting");
+
     let config = Config::from_env()?;
+    if !config.allowed_origins.is_empty() {
+        info!(origins = ?config.allowed_origins.list(), "dashboards on these origins may sign in with bearer tokens");
+    }
     let (tls, relay_pin) = match load_tls(&config)? {
         Some((tls, pin)) => {
             info!(pin = %pin, "relay certificate pin (machines check this; see install-service.ps1 -RelayPin)");
@@ -217,6 +269,7 @@ async fn main() -> Result<(), String> {
         secret_key: Arc::new(secret_key),
         totp_issuer: format!("Hawk ({host})").into(),
         mailer: mailer.map(Arc::new),
+        allowed_origins: Arc::new(config.allowed_origins.clone()),
     };
     spawn_cleanup(state.clone());
     machines::spawn_share_clock(state.clone());
@@ -224,7 +277,10 @@ async fn main() -> Result<(), String> {
 
     let frontend = ServeDir::new(&config.frontend_dist)
         .fallback(ServeFile::new(config.frontend_dist.join("index.html")));
+    let cors = cors_layer(&config.allowed_origins);
     let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/api/version", get(version))
         .route("/api/session", get(api::session))
         .route("/api/login", post(api::login))
         .route("/api/login/params", post(api::login_params))
@@ -261,6 +317,7 @@ async fn main() -> Result<(), String> {
         .route("/v1/ws", get(routes::device_socket))
         .route("/v1/dashboard", get(routes::dashboard_socket))
         .fallback_service(frontend)
+        .layer(cors)
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 

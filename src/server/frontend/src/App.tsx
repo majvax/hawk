@@ -3,10 +3,12 @@ import { type JSX, useCallback, useEffect, useState } from "react";
 import { type User, getSession, resendVerification } from "./api.js";
 import { type Identity, currentIdentity, logOut } from "./keys.js";
 import { AdminPage } from "./pages/Admin.js";
-import { LoginPage, SignupPage, UnlockPage, VerifyEmailPage } from "./pages/Auth.js";
+import { LoginPage, RelayPage, SignupPage, UnlockPage, VerifyEmailPage } from "./pages/Auth.js";
 import { MachinesPage, formatBitrate } from "./pages/Machines.js";
 import { SettingsPage } from "./pages/Settings.js";
 import { MfaSetupPage } from "./pages/TwoFactor.js";
+import { type AppUpdate, installAppUpdate, onAppUpdate } from "./desktop.js";
+import { STANDALONE, activeRelay, checkRelayProtocol, leaveRelay, relayIsTls, relayPageUrl } from "./relay.js";
 import { StepUpProvider } from "./stepUp.js";
 import { Dot, Logo, type Tone, errorMessage } from "./ui.js";
 import { type ConnectionStatus, type Dashboard, useDashboard } from "./useDashboard.js";
@@ -24,6 +26,12 @@ function verifyTokenFromPath(): string | null {
 }
 
 export function App(): JSX.Element {
+  // A standalone dashboard needs a relay before anything else.
+  if (activeRelay() === null) return <RelayPage />;
+  return <SignedOutOrIn />;
+}
+
+function SignedOutOrIn(): JSX.Element {
   // undefined: still checking; null: logged out.
   const [user, setUser] = useState<User | null | undefined>(undefined);
   // The account's identity key in this browser; null while it still has to
@@ -117,12 +125,22 @@ function Console({
   onAccountChanged: () => void;
 }): JSX.Element {
   const [tab, setTab] = useState<Tab>("machines");
+  // Said plainly when the relay and this dashboard don't speak the same
+  // protocol, instead of failing in odd ways later.
+  const [mismatch, setMismatch] = useState<string | null>(null);
+  useEffect(() => {
+    void checkRelayProtocol().then(setMismatch);
+  }, []);
+  // The desktop app found a newer release of itself at start.
+  const [appUpdate, setAppUpdate] = useState<AppUpdate | null>(null);
+  const [installing, setInstalling] = useState(false);
+  useEffect(() => onAppUpdate(setAppUpdate), []);
   // Owned here rather than by the machines page so the status bar can show
   // the relay link from any tab, and a live view survives switching tabs.
   const dashboard = useDashboard(identity, onSessionEnded);
 
   return (
-    <div className={user.emailVerified ? "shell" : "shell with-banner"}>
+    <div className={user.emailVerified && mismatch === null && appUpdate === null ? "shell" : "shell with-banner"}>
       <header className="topbar">
         <div className="brand">
           <Logo size={18} />
@@ -145,9 +163,22 @@ function Console({
             <span className="email truncate">{user.email}</span>
           </span>
           {/* A new tab, so a live view stays open. */}
-          <a className="btn btn-ghost btn-sm" href="/docs" target="_blank" rel="noopener">
+          <a className="btn btn-ghost btn-sm" href={relayPageUrl("/docs")} target="_blank" rel="noopener">
             Docs
           </a>
+          {STANDALONE && (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              title="Switch to another relay (stays signed in here)"
+              onClick={() => {
+                leaveRelay();
+                window.location.reload();
+              }}
+            >
+              Relays
+            </button>
+          )}
           <button
             type="button"
             className="btn btn-ghost btn-sm"
@@ -158,6 +189,30 @@ function Console({
         </div>
       </header>
 
+      {mismatch !== null && (
+        <div className="banner" role="alert">
+          <span>{mismatch}</span>
+        </div>
+      )}
+      {appUpdate !== null && mismatch === null && (
+        <div className="banner" role="status">
+          <span>
+            Hawk {appUpdate.version} is available (you have {appUpdate.current}). Installing it restarts the app, so
+            finish what you're watching first.
+          </span>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={installing}
+            onClick={() => {
+              setInstalling(true);
+              installAppUpdate().catch(() => setInstalling(false));
+            }}
+          >
+            {installing ? "Installing…" : "Install and restart"}
+          </button>
+        </div>
+      )}
       {!user.emailVerified && <VerifyBanner email={user.email} />}
 
       {/* The machines page stays mounted so switching tabs doesn't drop a
@@ -217,7 +272,7 @@ function StatusBar({ dashboard }: { dashboard: Dashboard }): JSX.Element {
   const [tone, label] = LINK[status];
   const online = machines.filter((machine) => machine.online).length;
   const viewing = machines.find((machine) => machine.id === viewingId);
-  const secure = window.location.protocol === "https:";
+  const secure = relayIsTls();
 
   return (
     <footer className="statusbar">

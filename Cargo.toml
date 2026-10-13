@@ -1,0 +1,17 @@
+# The Rust side of Hawk: the relay, the shared update client, the installer
+# and the desktop app. One lockfile, and one version taken from VERSION
+# (scripts/bump-version keeps the two in step).
+[workspace]
+resolver = "3"
+members = ["src/server/relay", "src/update", "src/installer", "src/app"]
+
+[workspace.package]
+version = "1.0.0-rc.1"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

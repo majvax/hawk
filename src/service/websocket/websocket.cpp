@@ -320,6 +320,25 @@ std::expected<void, WebSocketError> WebSocketClient::connect(std::string_view ur
         return std::unexpected(std::move(error));
     }
 
+    if (parsed->secure && !options.pinned_keys.empty()) {
+        // With a pin, the pin is the trust: a relay with a self-signed
+        // certificate is accepted when its key is the pinned one, without
+        // making that certificate a root for the whole machine. The key is
+        // checked below, before the hello; only the upgrade request, which
+        // carries nothing secret, goes out first. Names and dates are still
+        // checked.
+        DWORD security_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+        if (WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS, &security_flags, sizeof(security_flags)) ==
+            FALSE) {
+            WebSocketError error = make_error(WebSocketError::Code::handshake_failed, GetLastError(),
+                                               "WinHttpSetOption(SECURITY_FLAGS)");
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect_handle);
+            WinHttpCloseHandle(session);
+            return std::unexpected(std::move(error));
+        }
+    }
+
     if (WinHttpSetOption(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) == FALSE) {
         WebSocketError error = make_error(WebSocketError::Code::handshake_failed, GetLastError(),
                                            "WinHttpSetOption(UPGRADE_TO_WEB_SOCKET)");

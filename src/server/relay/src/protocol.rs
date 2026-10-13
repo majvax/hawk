@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{Role, Signed};
 
+/// Bumped when a message changes in a way an older dashboard or machine
+/// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
+/// and `kProtocolVersion` in `src/service/main.cpp`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
 ///
@@ -44,6 +49,18 @@ pub enum DeviceMessage {
         /// The owner's browser checks it before vouching for the key.
         #[serde(default)]
         binding: Option<String>,
+        /// The service's release, e.g. "1.0.0", shown to the owner.
+        #[serde(default)]
+        version: Option<String>,
+        /// The protocol the machine speaks; absent from one older than it.
+        #[serde(default)]
+        protocol: Option<u32>,
+    },
+    /// The release the machine's updater found and is waiting to install
+    /// (the machine's config says to ask first), or None once there's none.
+    UpdateStatus {
+        #[serde(default)]
+        available: Option<String>,
     },
     Proof {
         /// Base64 ECDSA P-256 signature, r||s, over
@@ -126,6 +143,10 @@ pub enum DeviceCommand {
     Shell { viewer: u64, sealed: String },
     /// Every revocation the owner has signed for this machine.
     Revocations { revocations: Vec<SignedView> },
+    /// The owner asks the machine to install the update it's holding now.
+    /// The machine still checks the release's signature, and only ever
+    /// moves forward, so a relay sending this on its own gains nothing.
+    InstallUpdate,
 }
 
 /// A signed statement on the wire (see crate::e2e).
@@ -217,6 +238,8 @@ pub enum DashboardCommand {
     /// A sealed shell-channel message. Only passed on while viewing the
     /// machine with a role that may open shells (dev or owner).
     Shell { device_id: String, sealed: String },
+    /// The owner asks the machine to install the update it's holding.
+    InstallUpdate { device_id: String },
 }
 
 /// A machine as one dashboard's user sees it.
@@ -258,6 +281,10 @@ pub struct MachineView {
     /// Shares only: whether the owner has signed a grant for this user yet.
     /// Without one the machine refuses them.
     pub granted: bool,
+    /// Owner only, while online: the service's release, and a newer one
+    /// its updater found and is holding until the owner says so.
+    pub version: Option<String>,
+    pub update_available: Option<String>,
 }
 
 /// Messages pushed to connected dashboards.

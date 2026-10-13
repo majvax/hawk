@@ -9,11 +9,13 @@ import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 
 import { App } from "./App.js";
+import { openLinksInBrowser } from "./desktop.js";
 import "./styles.css";
 import { applyAccent, loadAccent } from "./theme.js";
 
 // Before the first render, so the page never flashes the default accent.
 applyAccent(loadAccent());
+openLinksInBrowser();
 
 // /docs is public and needs no session, so it skips the dashboard entirely.
 // Loaded on its own, so the dashboard doesn't carry the docs' text.

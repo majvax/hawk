@@ -1,6 +1,12 @@
 # Scripts
 
-Administration helpers for the host machine. All require an **elevated**
+`bump-version.py` sets the version everywhere, and `release/` holds the
+release tooling (see "Releasing" in the main README).
+
+The PowerShell scripts below are the developer's way to run a build from
+`bin\` as the service. Installs from a release use `hawk-setup` instead
+(`src/installer`), which also locks down `C:\ProgramData\HawkService`,
+registers updates and can uninstall cleanly. All require an **elevated**
 PowerShell prompt (right-click → Run as administrator). Run them on the
 Windows machine you are capturing, not the relay host.
 

@@ -59,9 +59,13 @@ Configuration is by environment variable: `HOST` (default `127.0.0.1`),
 `HAWK_DB_PATH` (default `data/hawk.db`), `HAWK_SECRET_KEY_PATH` (default
 `secret.key` beside the database), `PUBLIC_URL` (the address people reach
 the dashboard at, used in links the relay logs and emails), `HAWK_SMTP_URL`
-and `HAWK_MAIL_FROM` (see "Email" below), and `HAWK_SERVER_ROOT` (the
+and `HAWK_MAIL_FROM` (see "Email" below), `HAWK_ALLOWED_ORIGINS` (other
+origins that may sign in with bearer tokens: the desktop app and any
+separately hosted dashboard, comma separated), and `HAWK_SERVER_ROOT` (the
 directory the default paths are relative to; defaults to this directory).
-`RUST_LOG` controls log verbosity.
+`RUST_LOG` controls log verbosity. `/healthz` answers 204 while the relay
+and its database are up, and `/api/version` gives the protocol version
+(not the release) to dashboards before they sign in.
 
 **Back up the secret key with the database.** The relay creates
 `secret.key` (32 random bytes, readable by its owner only) on first start
@@ -170,9 +174,10 @@ server shows in the log, not in the dashboard.
 Every machine has exactly one owner and its own key pair.
 
 - **Enrolling:** in the dashboard, **Machines > Add machine** makes a
-  one-time enrollment code (25 characters, valid 1 hour) and shows the exact
-  install command, `install-service.ps1 -EnrollCode <code> -RelayPin <pin>`
-  (see `scripts/README.md`). The code is made in the browser, and the relay
+  one-time enrollment code (25 characters, valid 1 hour) with the relay's
+  address and pin, for hawk-setup's window or as one command,
+  `hawk-setup install machine --relay <address> --pin <pin> --code <code>`
+  (see `src/installer`). The code is made in the browser, and the relay
   only ever gets its hash: it keys the bindings that let the machine and its
   owner trust each other's keys (see "End-to-end encryption" below). The
   service creates an ECDSA P-256 key in the machine's TPM (or the software
@@ -360,15 +365,17 @@ for an actual domain pointed at this server.
 
 On top of the chain check, machines pin the relay's **TLS key**: the relay
 logs `relay certificate pin` at startup (base64 SHA-256 of the
-certificate's SubjectPublicKeyInfo) and the dashboard puts it in every
-install command as `-RelayPin`. A machine with a pin refuses any other key,
-even from a certificate that chains to a root it trusts (a rogue or
-corporate CA), before sending anything.
+certificate's SubjectPublicKeyInfo) and the dashboard shows it with every
+enrollment code. A machine with a pin refuses any other key, even from a
+certificate that chains to a root it trusts (a rogue or corporate CA),
+before sending its hello. With a pin, the pin is also all the trust it
+needs: a self-signed certificate is accepted when it carries the pinned
+key, without becoming a root on the machine.
 
 Because it pins the key, not the certificate, renewing the certificate is
 fine **as long as the key stays the same** (e.g. certbot `--reuse-key`). To
 change the key: put the new key's pin on every machine first, alongside the
-old one (`install-service.ps1 -RelayPin <old>,<new>`), then switch the relay
+old one (`hawk-setup install machine --pin <old> --pin <new>`), then switch the relay
 to it. A machine whose pins don't match logs `refusing ...: server key <pin>
 is not pinned` and retries every 30s.
 

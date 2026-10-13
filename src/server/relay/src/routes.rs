@@ -23,7 +23,7 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_SEALED_INPUT_LEN, MAX_SEALED_SHELL_LEN, answer_fits, clipboard_access,
+    MAX_SEALED_INPUT_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
 use crate::registry::{Answer, DashboardHandle, DeviceOutbound, Outbound, Registry, StepUp};
@@ -148,13 +148,25 @@ async fn authenticate_device(
     state: &AppState,
     sink: &mut DeviceSink,
     stream: &mut DeviceStream,
-) -> Result<(MachineAuth, Option<EnrollmentOwner>), Refusal> {
-    let Some(DeviceMessage::Hello { machine_id: hostname, machine, enroll_code_hash, public_key, key_storage, binding }) =
-        next_device_message(stream, HELLO_TIMEOUT).await
+) -> Result<(MachineAuth, Option<EnrollmentOwner>, Option<String>), Refusal> {
+    let Some(DeviceMessage::Hello {
+        machine_id: hostname,
+        machine,
+        enroll_code_hash,
+        public_key,
+        key_storage,
+        binding,
+        version,
+        protocol,
+    }) = next_device_message(stream, HELLO_TIMEOUT).await
     else {
         return Err(Refusal::Malformed);
     };
+    if protocol.is_some_and(|protocol| protocol > PROTOCOL_VERSION) {
+        warn!(protocol, "relay: a machine speaks a newer protocol than this relay: update the relay");
+    }
     let hostname: String = hostname.chars().take(255).collect();
+    let version = version.map(|version| version.chars().take(32).collect::<String>());
     let claim =
         resolve_claim(state, HelloClaim { machine, enroll_code_hash, public_key, key_storage, binding }).await?;
 
@@ -176,7 +188,7 @@ async fn authenticate_device(
         Claim::Existing { public_id, owner_id, .. } => {
             let id = public_id.clone();
             state.db.call(move |conn| db::record_connect(conn, &id, &hostname, now)).await?;
-            Ok((MachineAuth { public_id, owner_id }, None))
+            Ok((MachineAuth { public_id, owner_id }, None, version))
         }
         Claim::Enroll { code_hash, public_key, key_storage, binding } => {
             let public_id = uuid::Uuid::new_v4().to_string();
@@ -197,7 +209,7 @@ async fn authenticate_device(
                 // The code was used by another connection while this one signed.
                 .ok_or(Refusal::Unknown)?;
             let (machine, owner) = enrolled;
-            Ok((machine, Some(owner)))
+            Ok((machine, Some(owner), version))
         }
     }
 }
@@ -205,7 +217,7 @@ async fn authenticate_device(
 async fn handle_device(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
-    let (machine, enrolled) = match authenticate_device(&state, &mut sink, &mut stream).await {
+    let (machine, enrolled, version) = match authenticate_device(&state, &mut sink, &mut stream).await {
         Ok(result) => result,
         Err(Refusal::Malformed) => {
             warn!("relay: device sent a malformed or incomplete handshake, closing");
@@ -246,7 +258,7 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     }
 
     let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
-    let connection = state.registry.add_device(&machine_id, machine.owner_id, outbound);
+    let connection = state.registry.add_device(&machine_id, machine.owner_id, version, outbound);
     info!(%machine_id, "relay: machine connected");
 
     // Before any viewer can join, so a revoked one is refused.
@@ -277,7 +289,14 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     while let Some(Ok(message)) = stream.next().await {
         match message {
             Message::Binary(frame) => state.registry.forward_frame(&machine_id, frame),
-            Message::Text(text) => route_device_answer(&state.registry, &machine_id, &text, &mut clipboard_budgets),
+            Message::Text(text) => {
+                if let Ok(DeviceMessage::UpdateStatus { available }) = serde_json::from_str::<DeviceMessage>(&text) {
+                    let available = available.map(|version| version.chars().take(32).collect());
+                    state.registry.set_update_available(&machine_id, connection, available);
+                    continue;
+                }
+                route_device_answer(&state.registry, &machine_id, &text, &mut clipboard_budgets);
+            }
             Message::Close(_) => break,
             _ => {}
         }
@@ -352,14 +371,15 @@ fn route_device_answer(
 ///
 /// Requires a session. A browser always sends Origin on a WebSocket
 /// handshake; refusing a foreign one keeps another site from opening this
-/// socket with the user's cookie.
+/// socket with the user's cookie. A dashboard on an allowed origin sends
+/// its bearer token as a subprotocol instead (see auth::session_token).
 pub async fn dashboard_socket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     current: CurrentUser,
     headers: HeaderMap,
 ) -> Response {
-    if !same_origin(&headers) {
+    if !same_origin(&headers) && state.allowed_origins.of_request(&headers).is_none() {
         warn!(user = %current.user.email, "dashboard: rejected cross-origin socket");
         return ApiError::Forbidden.into_response();
     }
@@ -369,7 +389,7 @@ pub async fn dashboard_socket(
         Err(error) => return ApiError::from(error).into_response(),
     };
     let registry = state.registry;
-    ws.on_upgrade(move |socket| handle_dashboard(socket, registry, current, machines))
+    ws.protocols([auth::SOCKET_PROTOCOL]).on_upgrade(move |socket| handle_dashboard(socket, registry, current, machines))
 }
 
 /// True when there's no Origin (not a browser) or it names the host the
@@ -454,6 +474,7 @@ async fn handle_dashboard(
             }
             Ok(DashboardCommand::StopView { device_id }) => registry.stop_view(dashboard_id, &device_id),
             Ok(DashboardCommand::Elevate { device_id }) => registry.elevate(dashboard_id, &device_id),
+            Ok(DashboardCommand::InstallUpdate { device_id }) => registry.install_update(dashboard_id, &device_id),
             Ok(DashboardCommand::Input { device_id, sealed }) => {
                 // Dropped quietly: a view-only or flooding dashboard gets
                 // nothing through, and no reply it could time against. The

@@ -23,12 +23,12 @@ flowchart TD
 
     subgraph HostPC [Target Machine / Your PC]
         subgraph Session0 [Session 0: Background Services]
-            Service["OverlayAdminService.exe<br/>(Runs as SYSTEM at Boot)"]
+            Service["hawk-service.exe<br/>(Runs as SYSTEM at Boot)"]
         end
 
         subgraph UserSession [Interactive User Session]
-            Overlay["overlay.exe<br/>(uiAccess=true, Self-Signed Topmost UI)"]
-            Capture["capture_helper.exe<br/>(DXGI Desktop Duplication + SendInput)"]
+            Overlay["overlay.exe (planned)<br/>(uiAccess=true, Self-Signed Topmost UI)"]
+            Capture["hawk-capture.exe<br/>(SYSTEM in-session: DXGI Desktop Duplication + SendInput)"]
         end
     end
 
@@ -92,9 +92,9 @@ Instead of opening firewall ports or port-forwarding a home router, both the bro
 
 ---
 
-## Frontend Hosting (planned)
+## Frontend Hosting
 
-The dashboard is a static bundle, so it doesn't have to be served by the relay. Two modes are planned, side by side, and a relay owner picks which ones their relay accepts:
+The dashboard is a static bundle, so it doesn't have to be served by the relay. Two modes exist side by side, and a relay owner picks which ones their relay accepts (the desktop app uses the second):
 
 * **Same origin (default, what exists today):** the relay serves the dashboard itself. Sessions are an `HttpOnly`, `SameSite=Strict` cookie and the dashboard socket is refused from any other `Origin`. Nothing cross-site is possible, and nothing changes for existing setups.
 * **Separate origin (opt-in):** the dashboard is hosted anywhere static (GitHub Pages, a CDN, another server) and the user enters their relay's address, which is kept in their browser only, along with their session. Cross-site cookies are unreliable (third-party cookie blocking and partitioning), so this mode uses bearer tokens instead:
@@ -107,28 +107,49 @@ The dashboard is a static bundle, so it doesn't have to be served by the relay. 
 
 ---
 
-## Installation (planned)
+## Installation and updates
 
-One installer per side, interactive by default and scriptable with flags, so the options above don't turn into a page of manual steps:
+`hawk-setup` installs, updates and removes every part, from the project's releases. On Windows it opens a window in the dashboard's style when double-clicked; with a command it's a plain CLI that never opens one, for scripts and servers. Details: `/docs/machine`, `/docs/relay` and `/docs/updates` in the dashboard.
 
-* **Relay (Linux VPS):**
-  * Installs the relay binary and the built dashboard, and sets it up as a `systemd` service with its own user, data directory and log rotation.
-  * TLS: obtains and renews a Let's Encrypt certificate for a domain (or an IP certificate), or generates a self-signed one for LAN use. It reuses the existing key on renewal, so the pin that enrolled machines check stays valid, and it prints the pin.
-  * Asks which frontend modes to allow, and for separate origin, which origins (`HAWK_ALLOWED_ORIGINS`).
-  * Opens the firewall port, creates the first admin and prints their invite link.
-  * Update and uninstall commands that keep the database and key.
-* **Machine (Windows):**
-  * Installs `hawk-service` and `hawk-capture`, registers the service to start at boot, and points it at the relay with its address and pinned key.
-  * Generates the TPM-backed machine key, falling back to a software key with a warning, and walks through enrollment on the dashboard.
-  * Self-signed certificate automation: creates the local signing certificate, keeps it in the machine's own `Root`/`TrustedPublisher` stores only, and signs the binaries.
-  * Update and uninstall commands that remove the service, the certificate and the key.
-* **Separately hosted dashboard:** a build that ships without a relay address (the user enters it), plus a ready-made GitHub Pages workflow for anyone who wants to host their own copy.
+### Quick start
+
+1. **Relay**, on a Linux server with systemd and a domain pointed at it. As root, with `hawk-setup-<version>-linux-x64` (or `-arm64`) from the [releases](../../releases):
+   ```sh
+   chmod +x hawk-setup-*-linux-x64
+   ./hawk-setup-*-linux-x64 install relay --public-url https://relay.example.com --tls certbot --email you@example.com
+   ```
+   It ends by printing the relay's key pin and a one-time link to create the admin account.
+2. **Admin account:** open that link, sign up, and set up two-factor login.
+3. **Machine**, on the Windows PC to control. In the dashboard, *Machines → Add machine* shows the relay's address, its pin and a one-time code (valid one hour; keep the tab open until the machine appears). Run `hawk-setup-<version>-windows-x64.exe` as administrator and choose *Set up this PC*, or from an elevated terminal:
+   ```powershell
+   hawk-setup install machine --relay relay.example.com --pin <pin> --code <code>
+   ```
+4. **Desktop app** (optional): `hawk-setup install app`, or `hawk-app-<version>-windows-x64-setup.exe` from the release, then enter the relay's address. A relay installed by hawk-setup accepts the app out of the box.
+
+Releases aren't signed with a Windows code-signing certificate, so SmartScreen warns on the first run. What protects the install is hawk-setup's own check: everything it installs must match a manifest signed with the project's key (`minisign.pub`).
+
+### What it sets up
+
+* **Machine (Windows):** `hawk-setup install machine --relay … --pin … --code …`, the same three values the dashboard shows under *Add machine*. Preflight in plain words before anything is written (administrator, Windows version, TPM, relay reachable with the pinned key), then Program Files, the `HawkService` service (LocalSystem, auto-start, restart on failure), ProgramData locked to SYSTEM and administrators, an *Apps & features* entry, and enrollment followed live. Uninstall deletes the TPM key too.
+* **Relay (Linux):** `hawk-setup install relay --public-url https://… --tls certbot|self-signed|existing`. A hardened systemd unit under its own `hawk` user, TLS whose key survives renewals (certbot `--reuse-key` and a deploy hook), firewall, and the pin and first admin invite printed at the end.
+* **Desktop app (Windows):** `hawk-setup install app`, or its own installer from the release.
+* **Updates:** every part checks a signed release feed (see `src/update`). The machine service runs `hawk-setup update machine` daily and the relay a systemd timer; each rolls back if the new version doesn't come up, the relay with its database. The app uses Tauri's updater against the same key. The policy (`notify`, `auto`, `off`), channel (`stable`, `beta`), feed URL and key are set per install, and builds default to the feed of the repository they were built from, so a fork works with nothing to edit.
+
+### Releasing
+
+`python scripts/bump-version.py 1.1.0`, commit, tag `v1.1.0`, push. CI (`.github/workflows/release.yml`) builds everything and leaves a draft release with the unsigned manifests. Then, on the machine holding the signing key, `python scripts/release/release-sign.py v1.1.0` signs the manifests and the app's installer, publishes the release, and moves the `feed` release to it. The signing key never touches CI: it ships code to every install. One-time setup: `minisign -G`, and put the public key (the second line of `minisign.pub`) in the repository variable `HAWK_UPDATE_PUBKEY`.
 
 ---
 
 ## Compilation & Toolchain
 
-TODO
+| Part | Toolchain | Build |
+|---|---|---|
+| `hawk-service`, `hawk-capture` | MSYS2 UCRT64 (GCC 15, CMake, Ninja) | `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build` (into `bin/`; MinGW's runtime is linked in) |
+| Relay, `hawk-update`, `hawk-setup`, app | Rust (stable, edition 2024), one Cargo workspace at the root | `cargo build --release -p hawk-relay` / `-p hawk-setup [--features gui]` / `-p hawk-app` |
+| Dashboard, setup window | bun | in `src/server`: `bun install`, then `bun run --cwd frontend build` (relay-served), `build:app` (standalone, for the app), `build:setup` (hawk-setup's window) |
+
+`VERSION` is the one version for everything; `scripts/bump-version.py` copies it where it can't be read directly.
 
 ---
 
@@ -149,7 +170,8 @@ TODO
 - [ ] Trusted-proxy address resolution, with IP allow/deny lists
 - [ ] Machine analytics (CPU/RAM/GPU/disk/network) and dashboard charts
 - [x] `dev` role: a shell instead of a video stream, for low bandwidth (ConPTY as the logged-on user)
-- [ ] Signed GUI installer, pre-stamped with relay URL, pin and enroll code
+- [x] GUI and CLI installer (`hawk-setup`): machine, relay, app; preflight, repair, uninstall
+- [ ] Installer pre-stamped by the dashboard with relay URL, pin and enroll code; Authenticode signing
 - [ ] Machine config file, schema-described and synced to the dashboard
 - [ ] Multiple display support (per-display capture, display-aware input)
 - [ ] Audio (WASAPI loopback, Opus) alongside the video stream
@@ -158,10 +180,12 @@ TODO
 - [ ] Remote power actions, reboot-and-reconnect, Wake-on-LAN via a LAN peer
 - [ ] Relay operations: container image, health endpoints, metrics, backups
 - [ ] Trusted devices (remember a browser after MFA)
-- [ ] Separately hosted dashboard: bearer-token sessions, `HAWK_ALLOWED_ORIGINS` (CORS + socket `Origin` allow-list), relay address entered in the browser, protocol version in the handshake
-- [ ] Relay installer (Linux): `systemd` service, Let's Encrypt or self-signed TLS with a stable pinned key, frontend modes, first admin
+- [x] Separately hosted dashboard: bearer-token sessions, `HAWK_ALLOWED_ORIGINS` (CORS + socket `Origin` allow-list), relay address entered in the browser, protocol version in the handshake
+- [x] Relay installer (Linux): `systemd` service, Let's Encrypt or self-signed TLS with a stable pinned key, frontend modes, first admin
+- [x] Signed updates for every part from one release feed, with rollback; release CI on tags, signing offline
 - [ ] GitHub Pages workflow for hosting the dashboard on its own
-- [ ] Native dashboard app (Tauri): signed updates, full keyboard capture, identity key in the OS keychain
+- [x] Native dashboard app (Tauri): standalone dashboard, signed updates
+- [ ] Native dashboard app: full keyboard capture, identity key in the OS keychain
 - [x] `/docs` in the dashboard: setup and usage guide, public, Markdown rendered at build time
 - [ ] `/docs` follow-ups: prerendered HTML, search, generated reference tables, help links in context
 - [ ] `/about` page (late: once features and the name settle)
@@ -335,7 +359,12 @@ with a fresh code first. Not yet: running shells as a dedicated
 low-privilege account instead of the logged-on user, and recording
 sessions for the owner to read back.
 
-### Installer
+### Installer (built, except the stamped download and code signing)
+
+`hawk-setup` (see "Installation and updates") is built: GUI and silent CLI,
+preflight, live enrollment, update, uninstall with the TPM key. Still to
+come: the dashboard handing out a copy already stamped with the relay URL,
+pin and code, and Authenticode signing. The original plan:
 
 `install-service.ps1` with a pasted enrollment code is a developer's
 install. The replacement: a signed, single-file GUI installer the dashboard
@@ -940,3 +969,9 @@ than the implementation effort, is what makes this a decision rather than a
 task. A sensible first step is factoring the capture/encode/input
 interfaces behind a platform-neutral boundary while the Windows
 implementation is the only one, so the choice stays open.
+
+---
+
+## License
+
+Hawk is free software under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`). You can use, study, change and share it; if you distribute a modified version, or let others use a modified relay or dashboard over a network, you must offer them its source under the same license.

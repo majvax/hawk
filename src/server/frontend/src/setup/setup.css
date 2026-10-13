@@ -1,0 +1,131 @@
+/* hawk-setup's window: the sign-in layout, with a wider panel for the
+   install log. Everything else comes from styles.css. */
+
+.setup .auth-hero .logo {
+  width: min(220px, 22vw);
+}
+
+.setup-panel {
+  width: min(400px, 100%);
+}
+
+.setup-panel.wide {
+  width: min(520px, 100%);
+}
+
+.setup-facts {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.setup-facts dt {
+  color: var(--fg-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  align-self: center;
+}
+
+.setup-facts dd {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.setup-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.setup-remove {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.setup-checks {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 10px;
+  list-style: none;
+  border: 1px solid var(--line);
+  background: var(--rail);
+}
+
+.setup-checks li {
+  display: grid;
+  grid-template-columns: 10px 84px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+}
+
+.setup-check-name {
+  font-weight: 500;
+}
+
+.setup-check-detail {
+  color: var(--fg-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.setup-log {
+  height: 260px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: #050606;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.setup-line {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  color: var(--fg-2);
+  overflow-wrap: anywhere;
+}
+
+.setup-line.step {
+  color: var(--fg);
+  margin-top: 6px;
+}
+
+.setup-line.step:first-child {
+  margin-top: 0;
+}
+
+.setup-line.ok .setup-mark {
+  color: var(--ok);
+}
+
+.setup-line.warn {
+  color: var(--warn);
+}
+
+.setup-busy {
+  font-size: 12px;
+}
+
+.auth-foot .link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.auth-foot .link:hover {
+  text-decoration: underline;
+}

@@ -115,6 +115,9 @@ struct Device {
     connected_at: OffsetDateTime,
     outbound: mpsc::UnboundedSender<DeviceOutbound>,
     viewers: HashMap<DashboardId, Viewer>,
+    /// As the machine reports them: its release, and an update it holds.
+    version: Option<String>,
+    update_available: Option<String>,
 }
 
 impl Device {
@@ -176,6 +179,10 @@ impl Inner {
             enroll_code_hash: row.enroll_code_hash.as_ref().map(|hash| BASE64.encode(hash)),
             enroll_binding: row.enroll_binding.as_ref().map(|binding| BASE64.encode(binding)),
             granted: row.role == Role::Owner || row.grant.is_some(),
+            version: device.filter(|_| row.role == Role::Owner).and_then(|device| device.version.clone()),
+            update_available: device
+                .filter(|_| row.role == Role::Owner)
+                .and_then(|device| device.update_available.clone()),
         }
     }
 
@@ -285,6 +292,7 @@ impl Registry {
         &self,
         machine_id: &str,
         owner_id: i64,
+        version: Option<String>,
         outbound: mpsc::UnboundedSender<DeviceOutbound>,
     ) -> u64 {
         let connection = self.next_id();
@@ -298,6 +306,8 @@ impl Registry {
             connected_at: OffsetDateTime::now_utc(),
             outbound,
             viewers: HashMap::new(),
+            version,
+            update_available: None,
         };
         inner.devices.insert(machine_id.to_owned(), device);
         inner.publish(machine_id);
@@ -570,6 +580,31 @@ impl Registry {
         }
     }
 
+    /// The machine's updater found a release it's holding for the owner, or
+    /// no longer has one.
+    pub fn set_update_available(&self, machine_id: &str, connection: u64, available: Option<String>) {
+        let mut inner = self.lock();
+        let Some(device) = inner.devices.get_mut(machine_id).filter(|device| device.connection == connection) else {
+            return;
+        };
+        if device.update_available != available {
+            device.update_available = available;
+            inner.publish(machine_id);
+        }
+    }
+
+    /// Passes the owner's go-ahead for an update on. Anyone else is ignored.
+    pub fn install_update(&self, dashboard_id: DashboardId, machine_id: &str) {
+        let inner = self.lock();
+        let Some(dashboard) = inner.dashboards.get(&dashboard_id) else { return };
+        if !dashboard.access.get(machine_id).is_some_and(|row| row.role == Role::Owner) {
+            return;
+        }
+        if let Some(device) = inner.devices.get(machine_id) {
+            device.send(DeviceCommand::InstallUpdate);
+        }
+    }
+
     pub fn stop_view(&self, dashboard_id: DashboardId, machine_id: &str) {
         let mut inner = self.lock();
         let Some(dashboard) = inner.dashboards.get(&dashboard_id) else { return };
@@ -726,7 +761,7 @@ mod tests {
         let (handle, events_rx) = handle(user_id);
         let dashboard = registry.add_dashboard(handle, vec![row(role)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, outbound);
+        registry.add_device(MACHINE, 1, None, outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture)));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
@@ -739,7 +774,7 @@ mod tests {
         let (handle, _events) = handle(2);
         let dashboard = registry.add_dashboard(handle, vec![row(Role::View)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, outbound);
+        registry.add_device(MACHINE, 1, None, outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture)));
         let Some(DeviceCommand::ViewerJoin { viewer, grant, .. }) = next(&mut device_rx) else { panic!("no join") };
@@ -774,7 +809,7 @@ mod tests {
         handle.step_up = StepUp { mfa: true, at: None };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Owner)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, outbound);
+        registry.add_device(MACHINE, 1, None, outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert_eq!(next_elevation(&mut events), Some(false));
         while next(&mut device_rx).is_some() {}
@@ -909,7 +944,7 @@ mod tests {
             };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Control)]);
         let (outbound, _device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, outbound);
+        registry.add_device(MACHINE, 1, None, outbound);
         let file = |sealed: &str| DashboardEvent::File { device_id: MACHINE.to_owned(), sealed: sealed.to_owned() };
         assert!(!registry.forward_bulk(MACHINE, dashboard, file("early")));
         assert!(registry.start_view(dashboard, MACHINE, join()));
@@ -928,7 +963,7 @@ mod tests {
         let (handle, _events) = handle(2);
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Dev)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, outbound);
+        registry.add_device(MACHINE, 1, None, outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
         assert!(next(&mut device_rx).is_none(), "no capture for a dev share");

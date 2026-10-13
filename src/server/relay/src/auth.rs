@@ -11,6 +11,7 @@ use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, header};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -87,6 +88,54 @@ pub fn removal_cookie() -> Cookie<'static> {
     Cookie::build(SESSION_COOKIE).path("/").build()
 }
 
+/// Origins other than the relay's own that may use it with bearer tokens:
+/// a separately hosted dashboard, or the desktop app. From
+/// `HAWK_ALLOWED_ORIGINS`, comma separated, e.g.
+/// `https://you.github.io,http://tauri.localhost`. Empty means same origin
+/// only.
+#[derive(Debug, Default, Clone)]
+pub struct AllowedOrigins(Vec<String>);
+
+impl AllowedOrigins {
+    pub fn parse(list: &str) -> Result<Self, String> {
+        let mut origins = Vec::new();
+        for origin in list.split(',').map(str::trim).filter(|origin| !origin.is_empty()) {
+            let origin = origin.trim_end_matches('/').to_ascii_lowercase();
+            let valid = origin.split_once("://").is_some_and(|(scheme, host)| {
+                !scheme.is_empty() && !host.is_empty() && !host.contains('/') && origin != "null"
+            });
+            if !valid || origin.contains('*') {
+                return Err(format!("HAWK_ALLOWED_ORIGINS: \"{origin}\" isn't an origin like https://example.com"));
+            }
+            origins.push(origin);
+        }
+        Ok(Self(origins))
+    }
+
+    pub fn contains(&self, origin: &str) -> bool {
+        self.0.iter().any(|allowed| allowed.eq_ignore_ascii_case(origin))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn list(&self) -> &[String] {
+        &self.0
+    }
+
+    /// The request's Origin, when it's one of these: a login from there gets
+    /// its session token back to keep, since its cookie wouldn't come back.
+    pub fn of_request(&self, headers: &HeaderMap) -> Option<String> {
+        let origin = headers.get(header::ORIGIN)?.to_str().ok()?;
+        self.contains(origin).then(|| origin.to_owned())
+    }
+}
+
+/// The header a login answer carries the session token in, for an allowed
+/// origin. Exposed through CORS.
+pub const SESSION_TOKEN_HEADER: &str = "x-hawk-session";
+
 pub fn normalize_email(email: &str) -> Option<String> {
     let email = email.trim().to_lowercase();
     let valid = email.len() <= 254
@@ -134,9 +183,38 @@ impl CurrentUser {
     }
 }
 
+/// The WebSocket subprotocol a dashboard on another origin carries its
+/// session in, as `hawk.bearer.<token>`: a browser can't set headers on a
+/// socket, but it can offer subprotocols. The relay answers with
+/// [`SOCKET_PROTOCOL`], never echoing the token back.
+pub const BEARER_PROTOCOL_PREFIX: &str = "hawk.bearer.";
+pub const SOCKET_PROTOCOL: &str = "hawk";
+
+/// The session token a request carries: the cookie (same origin), or for a
+/// dashboard served elsewhere, `Authorization: Bearer` or the socket
+/// subprotocol. A bearer token is never sent by the browser on its own, so
+/// another site can't ride on it the way it could on a lax cookie.
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(cookie) = CookieJar::from_headers(headers).get(SESSION_COOKIE) {
+        return Some(cookie.value().to_owned());
+    }
+    if let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        return Some(token.trim().to_owned());
+    }
+    headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .find_map(|protocol| protocol.trim().strip_prefix(BEARER_PROTOCOL_PREFIX).map(str::to_owned))
+}
+
 async fn load_session(parts: &Parts, state: &AppState) -> Result<CurrentUser, ApiError> {
-    let jar = CookieJar::from_headers(&parts.headers);
-    let token = jar.get(SESSION_COOKIE).ok_or(ApiError::Unauthorized)?.value().to_owned();
+    let token = session_token(&parts.headers).filter(|token| !token.is_empty()).ok_or(ApiError::Unauthorized)?;
     let hash = token_hash(&token);
     let now = now();
     let session = state.db.call(move |conn| db::find_session(conn, &hash, now)).await?.ok_or(ApiError::Unauthorized)?;
@@ -308,5 +386,35 @@ impl<K: Hash + Eq> Throttle<K> {
     pub fn prune(&self) {
         let window = self.window;
         self.map().retain(|_, (_, since)| since.elapsed() <= window);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn allowed_origins_parse_and_match() {
+        let origins = AllowedOrigins::parse(" https://You.github.io/ , http://tauri.localhost").unwrap();
+        assert!(origins.contains("https://you.github.io"));
+        assert!(origins.contains("http://tauri.localhost"));
+        assert!(!origins.contains("https://evil.example"));
+        assert!(AllowedOrigins::parse("").unwrap().is_empty());
+        assert!(AllowedOrigins::parse("*").is_err());
+        assert!(AllowedOrigins::parse("example.com").is_err());
+        assert!(AllowedOrigins::parse("https://example.com/path").is_err());
+    }
+
+    #[test]
+    fn session_token_sources() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(session_token(&headers), None);
+        headers.insert(header::SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("hawk, hawk.bearer.abc"));
+        assert_eq!(session_token(&headers).as_deref(), Some("abc"));
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer def"));
+        assert_eq!(session_token(&headers).as_deref(), Some("def"));
+        headers.insert(header::COOKIE, HeaderValue::from_static("hawk_session=ghi"));
+        assert_eq!(session_token(&headers).as_deref(), Some("ghi"));
     }
 }

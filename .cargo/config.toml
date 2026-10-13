@@ -1,0 +1,4 @@
+# hawk-setup and the app run on PCs that may not have the Visual C++
+# runtime installed: link it in.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -168,7 +168,7 @@ pub async fn login(
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<Credentials>,
-) -> Result<(CookieJar, Json<LoginOutcome>), ApiError> {
+) -> Result<(CookieJar, Option<SessionToken>, Json<LoginOutcome>), ApiError> {
     let ip = peer.ip();
     if state.limiter.is_blocked(ip) {
         return Err(ApiError::TooManyRequests);
@@ -207,10 +207,10 @@ pub async fn login(
     let account = state.db.call(move |conn| db::account_flags(conn, user_id)).await?;
     if account.mfa {
         let ticket = state.mfa_tickets.issue(user_id, session_origin(peer, &headers));
-        return Ok((jar, Json(LoginOutcome::MfaRequired { mfa_required: true, ticket })));
+        return Ok((jar, None, Json(LoginOutcome::MfaRequired { mfa_required: true, ticket })));
     }
-    let jar = start_session(&state, jar, user_id, session_origin(peer, &headers), false).await?;
-    Ok((jar, Json(LoginOutcome::SignedIn(UserView::new(&state, found.user, account)))))
+    let (jar, token) = start_session(&state, jar, &headers, user_id, session_origin(peer, &headers), false).await?;
+    Ok((jar, token, Json(LoginOutcome::SignedIn(UserView::new(&state, found.user, account)))))
 }
 
 #[derive(Deserialize)]
@@ -225,9 +225,10 @@ pub struct SecondStep {
 pub async fn login_mfa(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<SecondStep>,
-) -> Result<(CookieJar, Json<UserView>), ApiError> {
+) -> Result<(CookieJar, Option<SessionToken>, Json<UserView>), ApiError> {
     let ip = peer.ip();
     if state.limiter.is_blocked(ip) {
         return Err(ApiError::TooManyRequests);
@@ -249,11 +250,11 @@ pub async fn login_mfa(
         })
         .await?
         .ok_or(ApiError::Forbidden)?;
-    let jar = start_session(&state, jar, redeemed.user_id, redeemed.origin, true).await?;
+    let (jar, token) = start_session(&state, jar, &headers, redeemed.user_id, redeemed.origin, true).await?;
     if proof == Proof::RecoveryCode {
         mfa::notify(&state, &user.email, "Someone signed in to your account with a recovery code.");
     }
-    Ok((jar, Json(UserView::new(&state, user, account))))
+    Ok((jar, token, Json(UserView::new(&state, user, account))))
 }
 
 pub async fn logout(
@@ -301,7 +302,7 @@ pub async fn signup(
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<SignupRequest>,
-) -> Result<(CookieJar, Json<UserView>), ApiError> {
+) -> Result<(CookieJar, Option<SessionToken>, Json<UserView>), ApiError> {
     let email = auth::normalize_email(&body.email).ok_or_else(|| ApiError::bad_request("invalid email address"))?;
     auth::check_password_policy(&body.password)?;
     let key = body.key.decode()?;
@@ -341,8 +342,8 @@ pub async fn signup(
         }
         send_verification(&state, &user).await?;
     }
-    let jar = start_session(&state, jar, user.id, session_origin(peer, &headers), false).await?;
-    Ok((jar, Json(UserView::load(&state, user).await?)))
+    let (jar, token) = start_session(&state, jar, &headers, user.id, session_origin(peer, &headers), false).await?;
+    Ok((jar, token, Json(UserView::load(&state, user).await?)))
 }
 
 /// Mails the user a fresh link to confirm their address with, replacing any
@@ -407,15 +408,20 @@ fn session_origin(peer: SocketAddr, headers: &HeaderMap) -> db::SessionOrigin {
     db::SessionOrigin { user_agent, ip: peer.ip().to_canonical().to_string() }
 }
 
+/// A new session's token, sent back in a header to a dashboard on an
+/// allowed origin, which keeps it and sends it as a bearer token.
+pub type SessionToken = [(&'static str, String); 1];
+
 /// `stepped_up`: a second factor was just proved, so step-up actions don't
 /// ask again straight away.
 async fn start_session(
     state: &AppState,
     jar: CookieJar,
+    headers: &HeaderMap,
     user_id: i64,
     origin: db::SessionOrigin,
     stepped_up: bool,
-) -> Result<CookieJar, ApiError> {
+) -> Result<(CookieJar, Option<SessionToken>), ApiError> {
     let token = auth::random_token();
     let hash = auth::token_hash(&token);
     let now = auth::now();
@@ -425,7 +431,10 @@ async fn start_session(
         .db
         .call(move |conn| db::create_session(conn, &hash, user_id, &origin, now, expires_at, step_up_at))
         .await?;
-    Ok(jar.add(auth::session_cookie(token, state.secure_cookies)))
+    if state.allowed_origins.of_request(headers).is_some() {
+        return Ok((jar, Some([(auth::SESSION_TOKEN_HEADER, token)])));
+    }
+    Ok((jar.add(auth::session_cookie(token, state.secure_cookies)), None))
 }
 
 #[derive(Deserialize)]

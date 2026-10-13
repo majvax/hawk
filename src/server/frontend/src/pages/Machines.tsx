@@ -8,6 +8,7 @@ import {
   formatTime,
 } from "../api.js";
 import { createEnrollment } from "../e2e.js";
+import { relayHost, relayPageUrl } from "../relay.js";
 import type { Identity } from "../keys.js";
 import {
   MAX_CLIPBOARD_BYTES,
@@ -41,9 +42,11 @@ export function formatBitrate(kbps: number): string {
   return kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mb/s` : `${kbps} kb/s`;
 }
 
+// The same three things hawk-setup's window asks for, as one command for
+// a script or a terminal.
 function installCommand(enrollment: EnrollmentCode): string {
-  const pin = enrollment.relayPin === null ? "" : ` -RelayPin ${enrollment.relayPin}`;
-  return `powershell -ExecutionPolicy Bypass -File scripts\\install-service.ps1 -EnrollCode ${enrollment.code}${pin}`;
+  const pin = enrollment.relayPin === null ? "" : ` --pin ${enrollment.relayPin}`;
+  return `hawk-setup install machine --relay ${relayHost()}${pin} --code ${enrollment.code}`;
 }
 
 // "up 02:14:07" while online, "seen 4m ago" otherwise.
@@ -198,7 +201,7 @@ export function MachinesPage({
                 )}
               </div>
             </div>
-            <MachineStrip machine={selected} now={now} />
+            <MachineStrip machine={selected} now={now} onInstallUpdate={dashboard.installUpdate} />
             {tabs.length > 1 && (
               <div className="pane-tabs" role="tablist">
                 {tabs.map(([id, label]) => (
@@ -302,8 +305,17 @@ function RailItem({
   );
 }
 
-function MachineStrip({ machine, now }: { machine: Machine; now: number }): JSX.Element {
+function MachineStrip({
+  machine,
+  now,
+  onInstallUpdate,
+}: {
+  machine: Machine;
+  now: number;
+  onInstallUpdate: (deviceId: string) => void;
+}): JSX.Element {
   const terms = accessTerms(machine);
+  const [installing, setInstalling] = useState<string | null>(null);
   return (
     <div className="strip">
       <Metric label="Status">
@@ -324,6 +336,26 @@ function MachineStrip({ machine, now }: { machine: Machine; now: number }): JSX.
       {machine.role === "owner" && (
         <Metric label="Machine key">
           <KeyStorage storage={machine.keyStorage} />
+        </Metric>
+      )}
+      {machine.version != null && (
+        <Metric label="Version">
+          <span className="mono">{machine.version}</span>
+          {machine.updateAvailable != null && (
+            <button
+              type="button"
+              className="btn btn-sm btn-accent"
+              style={{ marginLeft: 8 }}
+              disabled={installing === machine.updateAvailable}
+              title="The machine checks the release's signature before installing it, then restarts its service"
+              onClick={() => {
+                setInstalling(machine.updateAvailable ?? null);
+                onInstallUpdate(machine.id);
+              }}
+            >
+              {installing === machine.updateAvailable ? "Installing…" : `Update to ${machine.updateAvailable}`}
+            </button>
+          )}
         </Metric>
       )}
       {machine.viewers !== null && (
@@ -460,7 +492,7 @@ function Enrollment({ enrollment, onDone }: { enrollment: EnrollmentCode; onDone
     <div className="enroll" role="region" aria-label="Add a machine">
       <div className="block-head">
         <h2 style={{ flex: 1 }}>Add a machine</h2>
-        <a className="btn btn-ghost btn-sm" href="/docs/machine" target="_blank" rel="noopener">
+        <a className="btn btn-ghost btn-sm" href={relayPageUrl("/docs/machine")} target="_blank" rel="noopener">
           Setup guide
         </a>
         <button type="button" className="btn btn-sm" onClick={onDone}>
@@ -477,14 +509,32 @@ function Enrollment({ enrollment, onDone }: { enrollment: EnrollmentCode; onDone
         </li>
         <li>
           <span>
-            On the PC, run this from an elevated PowerShell in the Hawk folder. The code never reaches the relay: it
-            lets your machine and this browser check each other's keys.
+            On the PC, run <span className="mono">hawk-setup.exe</span> from the release and enter the relay's address
+            and key pin. The code never reaches the relay: it lets your machine and this browser check each other's
+            keys.
+          </span>
+          <dl className="enroll-values">
+            <dt>Relay</dt>
+            <dd>
+              <CodeBlock value={relayHost()} />
+            </dd>
+            {enrollment.relayPin !== null && (
+              <>
+                <dt>Key pin</dt>
+                <dd>
+                  <CodeBlock value={enrollment.relayPin} />
+                </dd>
+              </>
+            )}
+          </dl>
+          <span className="field-hint">
+            Or from an elevated terminal, for a script or a PC without a screen:
           </span>
           <CodeBlock value={installCommand(enrollment)} />
           {enrollment.relayPin !== null && (
             <span className="field-hint">
-              -RelayPin makes the machine accept only this relay's TLS key, even from a certificate it would
-              otherwise trust.
+              The pin makes the machine accept only this relay's TLS key, even from a certificate it would otherwise
+              trust.
             </span>
           )}
         </li>

@@ -1,0 +1,77 @@
+# Every push and pull request: everything builds, the tests pass, and the
+# versions are in step. Releases are release.yml's job.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  versions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/bump-version.py --check
+
+  frontend:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: src/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run --cwd frontend build
+      - run: bun run --cwd frontend build:app
+      - run: bun run --cwd frontend build:setup
+
+  linux:
+    # The relay, the update client, and hawk-setup's Linux side.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p hawk-relay -p hawk-update -p hawk-setup
+      - run: cargo clippy --locked -p hawk-relay -p hawk-update -p hawk-setup
+
+  windows:
+    # The service, hawk-setup with its window, and the desktop app.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+      - name: Service
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$PWD/out"
+          cmake --build build
+          ./out/hawk-service.exe --version
+      - uses: oven-sh/setup-bun@v2
+      - name: Pages for hawk-setup and the app
+        working-directory: src/server
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd frontend build:setup
+          bun run --cwd frontend build:app
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p hawk-update -p hawk-setup
+      - run: cargo build --locked -p hawk-setup --features gui
+      - run: cargo build --locked -p hawk-app

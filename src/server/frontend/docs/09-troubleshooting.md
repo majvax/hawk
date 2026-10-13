@@ -12,18 +12,17 @@ Look at the end of the machine's log.
 - **Is the service running?** `Get-Service HawkService` in PowerShell.
   Start it with `Start-Service HawkService`.
 - **Is it pointed at your relay?** The log says `relay: connected to ...`
-  or which address failed. The address is compiled in (see
-  [Adding a machine](/docs/machine#1-build-it)). The default,
-  `127.0.0.1`, only works with the relay on the same PC.
+  or which address failed; `hawk-setup status` shows the address too.
+  Change it with `hawk-setup install machine --relay <address>`.
 - **`refusing ...: server key <pin> is not pinned`:** the relay's TLS key
   isn't the one the machine was given. Either the relay's key changed (a
   new certificate made without reusing the key), or a proxy in between
-  presents its own. Reinstall with the right pin:
-  `install-service.ps1 -RelayPin <pin from the relay's log>`. The machine
-  retries every 30 seconds.
-- **Certificate errors:** with a self-signed certificate, the PC has to
-  trust `certs/dev-cert.pem` (Local Machine → *Trusted Root Certification
-  Authorities*).
+  presents its own. Set the right pin:
+  `hawk-setup install machine --pin <pin from the relay's log>`. The
+  machine retries every 30 seconds.
+- **Certificate errors:** a machine without a pin checks the relay's
+  certificate against Windows' trusted roots, which a self-signed one
+  isn't in. Give the machine the relay's pin.
 - **The relay is listening on 127.0.0.1:** other computers can't reach
   it. Set `HOST=0.0.0.0` (or `bun run dev:relay:lan` in development), and
   allow the port in the firewall.

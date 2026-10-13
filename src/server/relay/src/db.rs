@@ -194,6 +194,7 @@ impl Db {
         let conn = Connection::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
             .map_err(|error| error.to_string())?;
+        check_not_newer(&conn).map_err(|error| format!("{}: {error}", path.display()))?;
         migrate(&conn).map_err(|error| format!("migrating {}: {error}", path.display()))?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
@@ -213,6 +214,22 @@ impl Db {
         .await
         .expect("database task panicked")
     }
+}
+
+/// Refuses a database a newer relay has migrated: this one doesn't know the
+/// schema, and writing into it could corrupt what the newer one expects.
+/// That's the case after an update is rolled back without its backup.
+fn check_not_newer(conn: &Connection) -> Result<(), String> {
+    let applied: i64 =
+        conn.pragma_query_value(None, "user_version", |row| row.get(0)).map_err(|error| error.to_string())?;
+    let known = i64::try_from(MIGRATIONS.len()).unwrap_or(i64::MAX);
+    if applied > known {
+        return Err(format!(
+            "the database is at schema {applied}, newer than this relay knows ({known}). \
+             Run the newer relay, or restore the backup taken before the update"
+        ));
+    }
+    Ok(())
 }
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -1385,6 +1402,16 @@ pub fn share_for(conn: &Connection, public_id: &str, owner_id: i64, user_id: i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database a newer relay migrated is refused, not written into.
+    #[test]
+    fn newer_database_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(check_not_newer(&conn).is_ok());
+        conn.pragma_update(None, "user_version", i64::try_from(MIGRATIONS.len() + 1).unwrap()).unwrap();
+        assert!(check_not_newer(&conn).is_err());
+    }
 
     /// The rebuild that lets shares be dev keeps every share already there.
     #[test]

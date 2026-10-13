@@ -1,6 +1,9 @@
-// Typed wrappers over the relay's /api routes (relay/src/api.rs). The
-// session lives in an HttpOnly cookie, so nothing here touches tokens.
+// Typed wrappers over the relay's /api routes (relay/src/api.rs). Served by
+// the relay, the session lives in an HttpOnly cookie and nothing here
+// touches it; a standalone dashboard keeps a bearer token instead (relay.ts).
 // Nothing here sees a password either: keys.ts derives what's sent from it.
+
+import { apiUrl, relayPageUrl, sessionToken, setSessionToken } from "./relay.js";
 
 export interface User {
   id: number;
@@ -58,11 +61,19 @@ export function setStepUpHandler(handler: (() => Promise<boolean>) | null): void
 }
 
 async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const response = await fetch(path, {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["content-type"] = "application/json";
+  const token = sessionToken();
+  if (token !== null) headers.authorization = `Bearer ${token}`;
+  const response = await fetch(apiUrl(path), {
     method,
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  // A sign-in from a standalone dashboard: the session to keep.
+  const issued = response.headers.get("x-hawk-session");
+  if (issued !== null) setSessionToken(issued);
+  if (response.status === 401 && token !== null) setSessionToken(null);
   if (!response.ok) {
     let message = `request failed (${response.status})`;
     let stepUp = false;
@@ -124,7 +135,7 @@ export const login = (email: string, password: string) =>
   request<LoginResult>("POST", "/api/login", { email, password });
 // `code`: from an authenticator app, or a recovery code.
 export const loginMfa = (ticket: string, code: string) => request<User>("POST", "/api/login/mfa", { ticket, code });
-export const logout = () => request<void>("POST", "/api/logout");
+export const logout = () => request<void>("POST", "/api/logout").finally(() => setSessionToken(null));
 export const getInvite = (token: string) => request<InviteInfo>("GET", `/api/invites/${encodeURIComponent(token)}`);
 export const signup = (token: string, email: string, password: string, key: KeyUpload) =>
   request<User>("POST", "/api/signup", { token, email, password, ...key });
@@ -258,7 +269,7 @@ export const unshareMachine = (id: string, userId: number, revocation: SignedSta
   request<void>("DELETE", `${machinePath(id)}/shares/${userId}`, { revocation });
 
 export function inviteUrl(token: string): string {
-  return `${window.location.origin}/invite/${token}`;
+  return relayPageUrl(`/invite/${token}`);
 }
 
 const pad = (value: number): string => String(value).padStart(2, "0");

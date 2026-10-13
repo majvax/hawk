@@ -17,9 +17,11 @@ add_executable(hawk-service
     service/e2e.cpp
     service/files.cpp
     service/shell.cpp
+    service/updater.cpp
     service/machine_identity.cpp
     service/machine_key.cpp
     service/websocket/websocket.cpp
+    ${HAWK_VERSION_RC}
 )
 
 target_include_directories(hawk-service PRIVATE
@@ -66,6 +68,7 @@ add_executable(hawk-capture
     capture/desktop.cpp
     capture/clipboard.cpp
     capture/capture.rc  # embeds capture.manifest (DPI awareness, asInvoker)
+    ${HAWK_VERSION_RC}
 )
 
 # windres doesn't report the files an .rc pulls in, so without this an edit
@@ -93,3 +96,11 @@ target_link_libraries(hawk-capture PRIVATE
 )
 
 target_set_warning(hawk-capture OFF)
+
+# Released binaries run on PCs without MinGW: link its C++ runtime, libgcc
+# and winpthread in, rather than needing their DLLs beside the exe. (The
+# UCRT they still use is part of Windows 10 and later.)
+if(MINGW)
+    target_link_options(hawk-service PRIVATE -static)
+    target_link_options(hawk-capture PRIVATE -static)
+endif()

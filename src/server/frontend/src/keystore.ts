@@ -11,7 +11,14 @@
 // recover the account: the identity key is also stored on the relay,
 // encrypted under the password.
 
-const DB_NAME = "hawk-keys";
+import { activeRelay } from "./relay.js";
+
+// One store per relay for a standalone dashboard, which can be signed in to
+// several from the same origin; account ids are only unique per relay.
+const dbName = (): string => {
+  const relay = activeRelay();
+  return relay === null || relay === "" ? "hawk-keys" : `hawk-keys@${relay}`;
+};
 const DB_VERSION = 1;
 
 export interface StoredIdentity {
@@ -36,7 +43,7 @@ interface Contact {
 
 function open(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    const request = indexedDB.open(dbName(), DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
       db.createObjectStore("identity");

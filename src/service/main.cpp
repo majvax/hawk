@@ -6,7 +6,10 @@
 #include "shell.hpp"
 #include "machine_identity.hpp"
 #include "machine_key.hpp"
+#include "updater.hpp"
 #include "websocket/websocket.hpp"
+
+#include <hawk/version.hpp>
 
 #include <windows.h>
 
@@ -20,8 +23,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <span>
@@ -39,15 +45,13 @@ namespace svc = hawk::service;
 
 namespace {
 
-// Points at the relay server under src/server (see src/server/README.md),
-// which now serves TLS by default (`bun run certs` + a cert/key on disk).
-// WinHTTP validates the server cert against the Windows trust store like any
-// other wss:// client, so the self-signed dev cert must be imported into
-// this machine's Trusted Root Certification Authorities before a local dev
-// relay will accept a connection — see the TLS section of that README. For
-// anything beyond localhost, use a cert from a real CA instead.
-constexpr std::string_view kRelayServerUrl = "wss://127.0.0.1:8080/v1/ws";
+// The relay's address comes from config.toml ([[relay]] url), which the
+// installer writes. WinHTTP validates the relay's certificate against the
+// Windows trust store like any other wss:// client, and the pins in
+// relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
+// Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
+constexpr std::uint32_t kProtocolVersion = 1;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -73,6 +77,14 @@ struct HelloMessage {
     std::optional<std::string> public_key;  // base64 uncompressed P-256 point
     std::optional<std::string> key_storage;  // "tpm" or "software"
     std::optional<std::string> binding;      // base64 HMAC of public_key under the code
+    std::string                version{internal::version::full_version};
+    std::uint32_t              protocol = kProtocolVersion;
+};
+
+// The update this machine's updater is holding for the owner, if any.
+struct UpdateStatusMessage {
+    std::string                type = "update_status";
+    std::optional<std::string> available;
 };
 
 // Answers the relay's challenge.
@@ -108,7 +120,7 @@ struct glz::meta<HelloMessage> {
     static constexpr auto value =
         object("type", &T::type, "machine_id", &T::machine_id, "machine", &T::machine, "enroll_code_hash",
                &T::enroll_code_hash, "public_key", &T::public_key, "key_storage", &T::key_storage, "binding",
-               &T::binding);
+               &T::binding, "version", &T::version, "protocol", &T::protocol);
 };
 
 template <>
@@ -130,6 +142,12 @@ struct glz::meta<RelayCommand> {
         object("type", &T::type, "nonce", &T::nonce, "machine_id", &T::machine_id, "owner_key", &T::owner_key,
                "owner_binding", &T::owner_binding, "viewer", &T::viewer, "statement", &T::statement, "signature",
                &T::signature, "grant", &T::grant, "sealed", &T::sealed, "revocations", &T::revocations);
+};
+
+template <>
+struct glz::meta<UpdateStatusMessage> {
+    using T                     = UpdateStatusMessage;
+    static constexpr auto value = object("type", &T::type, "available", &T::available);
 };
 
 namespace {
@@ -166,6 +184,41 @@ void InitLogging() {
         // the failure to a debugger/DebugView instead of swallowing it.
         OutputDebugStringA(ex.what());
     }
+}
+
+// What the service is doing, for hawk-setup: it shows enrollment live while
+// installing, and after an update waits for "connected" before calling the
+// update good. Replaced whole each time.
+struct ServiceStatus {
+    std::string  state;
+    std::string  detail;
+    std::string  version;
+    std::int64_t at = 0;
+};
+
+const std::filesystem::path kStatusPath = R"(C:\ProgramData\HawkService\status.json)";
+
+void WriteStatus(std::string_view state, std::string_view detail = {}) {
+    const ServiceStatus status{.state = std::string(state),
+                               .detail = std::string(detail),
+                               .version = std::string(internal::version::full_version),
+                               .at = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count()};
+    auto json = glz::write_json(status);
+    if (!json.has_value()) {
+        return;
+    }
+    auto temporary = kStatusPath;
+    temporary += L".tmp";
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            return;
+        }
+        file << *json;
+    }
+    MoveFileExW(temporary.c_str(), kStatusPath.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 // What one connection authenticates with. A pending enrollment code wins
@@ -376,6 +429,7 @@ struct Connection {
     std::unique_ptr<svc::FileTransfers>& files;
     std::unique_ptr<svc::ShellSessions>& shells;
     const svc::MachineConfig&            config;
+    svc::Updater&                        updater;
 };
 
 // The connection's viewers, once the machine knows its id.
@@ -412,7 +466,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
-    auto& [client, capture, session, hub, files, shells, config] = connection;
+    auto& [client, capture, session, hub, files, shells, config, updater] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -420,8 +474,15 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         }
     } else if (command.type == "enrolled") {
         if (CompleteEnrollment(session, command)) {
+            WriteStatus("enrolled", session.machine_id.value_or(""));
             OpenViewerHub(connection);
+        } else {
+            WriteStatus("rejected", "the owner key didn't match the enrollment code");
         }
+    } else if (command.type == "install_update") {
+        // Only the owner's dashboard can send this, and hawk-setup checks
+        // the release's signature whoever asked.
+        updater.install_now();
     } else if (hub == nullptr) {
         // Not enrolled, or the owner key didn't check out: nothing to serve.
         spdlog::debug("relay: ignoring \"{}\" before enrollment", command.type);
@@ -499,12 +560,25 @@ void SleepUnlessStopped(const std::stop_token& stop_token, std::chrono::seconds 
     }
 }
 
+void SendUpdateStatus(net::WebSocketClient& client, const std::optional<std::string>& available) {
+    if (auto json = glz::write_json(UpdateStatusMessage{.available = available}); json.has_value()) {
+        static_cast<void>(client.send_text(*json));
+    }
+}
+
 void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClient*>& active_client,
-               const svc::MachineConfig& config) {
+               const svc::MachineConfig& config, svc::Updater& updater) {
     net::WebSocketClient client;
     // Declared after `client` so it's destroyed (stopped) first: its reader
     // thread sends through `client`.
     svc::CaptureHost capture;
+
+    const std::string& relay_url = config.relay.url;
+    if (relay_url.empty()) {
+        WriteStatus("misconfigured", "no relay address");
+        spdlog::error("relay: no relay to connect to; set [[relay]] url in the config, or run hawk-setup again");
+        return;
+    }
 
     bool warned_not_enrolled = false;
     bool warned_unpinned = false;
@@ -512,8 +586,9 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         auto session = PrepareSession();
         if (!session.has_value()) {
             if (session.error() == SessionProblem::not_enrolled && !warned_not_enrolled) {
+                WriteStatus("not_enrolled");
                 spdlog::warn("relay: this machine isn't enrolled. Create an enrollment code in the dashboard "
-                             "(Machines > Add machine) and reinstall with install-service.ps1 -EnrollCode <code>");
+                             "(Machines > Add machine) and run hawk-setup again with it");
                 warned_not_enrolled = true;
             }
             SleepUnlessStopped(stop_token, kRejectedRetryDelay);
@@ -524,28 +599,31 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         net::WebSocketClient::ConnectOptions options;
         options.pinned_keys = svc::load_relay_pins();
         if (options.pinned_keys.empty() && !warned_unpinned) {
-            spdlog::warn("relay: no relay key pinned; only the certificate chain is checked. Reinstall with "
-                         "install-service.ps1 -RelayPin <pin> (shown with the enrollment code) to pin it");
+            spdlog::warn("relay: no relay key pinned; only the certificate chain is checked. Run hawk-setup "
+                         "again with the relay's pin (shown with the enrollment code) to pin it");
             warned_unpinned = true;
         }
 
-        if (auto connected = client.connect(kRelayServerUrl, options); !connected.has_value()) {
+        WriteStatus("connecting", relay_url);
+        if (auto connected = client.connect(relay_url, options); !connected.has_value()) {
             DiscardFailedEnrollment(session);  // a fresh key is made next attempt
             if (connected.error().code == net::WebSocketError::Code::pin_mismatch) {
                 // Either the relay's key changed or someone is in the middle:
                 // either way, nothing is sent until a pinned key shows up.
-                spdlog::error("relay: refusing {}: {}. If the relay's TLS key really changed, reinstall with the "
-                              "new -RelayPin",
-                              kRelayServerUrl, connected.error().message);
+                WriteStatus("pin_mismatch", connected.error().message);
+                spdlog::error("relay: refusing {}: {}. If the relay's TLS key really changed, run hawk-setup "
+                              "again with the new pin",
+                              relay_url, connected.error().message);
                 SleepUnlessStopped(stop_token, kRejectedRetryDelay);
             } else {
+                WriteStatus("unreachable", net::to_string(connected.error()));
                 spdlog::error("relay: connect failed: {}", net::to_string(connected.error()));
                 SleepUnlessStopped(stop_token, kReconnectDelay);
             }
             continue;
         }
 
-        spdlog::info("relay: connected to {}", kRelayServerUrl);
+        spdlog::info("relay: connected to {}", relay_url);
         active_client.store(&client);
         // For the owner to compare with the dashboard when verifying the
         // machine from a browser that didn't make its enrollment code.
@@ -566,8 +644,15 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
                                                        .hub = hub,
                                                        .files = files,
                                                        .shells = shells,
-                                                       .config = config};
+                                                       .config = config,
+                                                       .updater = updater};
         OpenViewerHub(connection);
+        if (session->machine_id.has_value()) {
+            WriteStatus("connected", *session->machine_id);
+        }
+        if (auto available = updater.available(); available.has_value()) {
+            SendUpdateStatus(client, available);
+        }
 
         std::optional<std::uint16_t> close_code;
         while (!stop_token.stop_requested()) {
@@ -598,10 +683,12 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         if (close_code == kPolicyViolationCode && enrollment_failed) {
             // A wrong or expired code never becomes right; stop retrying it.
             svc::delete_enroll_code();
+            WriteStatus("rejected", "the enrollment code was wrong, expired or already used");
             spdlog::error("relay: the enrollment code was rejected (wrong, expired or already used). Create a new "
-                          "one in the dashboard and reinstall with install-service.ps1 -EnrollCode <code>");
+                          "one in the dashboard and run hawk-setup again with it");
             SleepUnlessStopped(stop_token, kRejectedRetryDelay);
         } else if (close_code == kPolicyViolationCode) {
+            WriteStatus("refused", "removed, owner disabled, or the key proof failed");
             spdlog::warn("relay: the relay refused this machine (removed, owner disabled, or the key proof "
                          "failed); retrying in {}s",
                          kRejectedRetryDelay.count());
@@ -645,6 +732,7 @@ DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, [[maybe_unused]] DWORD event_type,
 
 void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* argv) {
     InitLogging();
+    spdlog::info("service: hawk-service {} starting", internal::version::full_version);
     const svc::MachineConfig config = svc::load_machine_config();
     spdlog::info("config: clipboard {}{}", to_string(config.clipboard.mode),
                  config.clipboard.view_pull ? ", view shares may read it" : "");
@@ -668,8 +756,17 @@ void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* ar
     service.status.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(service.status_handle, &service.status);
 
-    std::jthread relay_thread(
-        [&service, &config] { RelayLoop(service.stop_source.get_token(), service.active_client, config); });
+    // Tells the owner's dashboards about an update waiting for them, through
+    // whichever connection is up.
+    svc::Updater updater(config.update, [&service](const std::optional<std::string>& available) {
+        if (net::WebSocketClient* client = service.active_client.load(); client != nullptr) {
+            SendUpdateStatus(*client, available);
+        }
+    });
+
+    std::jthread relay_thread([&service, &config, &updater] {
+        RelayLoop(service.stop_source.get_token(), service.active_client, config, updater);
+    });
 
     WaitForSingleObject(service.stop_event, INFINITE);
     relay_thread.join();
@@ -681,9 +778,49 @@ void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* ar
     SetServiceStatus(service.status_handle, &service.status);
 }
 
+// Forgets this machine: deletes its key (from the TPM or the software key
+// store) and everything it pinned, so a reinstall starts over. For
+// hawk-setup's uninstall, run as an administrator with the service stopped.
+// Returns the process exit code.
+int RemoveIdentity() {
+    int result = 0;
+    if (auto identity = svc::load_machine_identity(); identity.has_value()) {
+        if (auto destroyed = svc::MachineKey::destroy(identity->key_name); !destroyed.has_value()) {
+            std::fprintf(stderr, "couldn't delete the machine key: %s\n", destroyed.error().c_str());
+            result = 1;
+        }
+    }
+    static constexpr std::array kFiles{L"machine.txt",    L"owner-key.txt",  L"access-state.txt", L"enroll-code.txt",
+                                       L"relay-pins.txt", L"credential.bin", L"status.json"};
+    const std::filesystem::path data = R"(C:\ProgramData\HawkService)";
+    for (const auto* file : kFiles) {
+        std::error_code ignored;
+        std::filesystem::remove(data / file, ignored);
+    }
+    return result;
+}
+
 }  // namespace
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
+    const std::span<wchar_t*> args(argv, static_cast<std::size_t>(argc));
+    if (args.size() > 1) {
+        const std::wstring_view command = args[1];
+        if (command == L"--version") {
+            std::printf("hawk-service %s (protocol %u)\n", std::string(internal::version::full_version).c_str(),
+                        kProtocolVersion);
+            return 0;
+        }
+        if (command == L"--remove-identity") {
+            return RemoveIdentity();
+        }
+        std::fprintf(stderr,
+                     "hawk-service runs as a Windows service; install it with hawk-setup.\n"
+                     "  --version            print the version\n"
+                     "  --remove-identity    delete this machine's key and enrollment\n");
+        return 2;
+    }
+
     // SERVICE_TABLE_ENTRYW::lpServiceName is LPWSTR (non-const) even though
     // the SCM only ever reads it; a mutable local avoids a const_cast.
     std::array<wchar_t, kServiceName.size() + 1> service_name{};

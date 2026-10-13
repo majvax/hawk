@@ -4,10 +4,50 @@ The relay is one Rust program. It serves this dashboard, the API, and the
 WebSocket endpoints that browsers and machines connect to. Its state is
 one SQLite database and one secret key file.
 
+## Install on a server
+
+On a Linux server with systemd (any current Debian, Ubuntu, Fedora…), as
+root, with `hawk-setup-<version>-linux-x64` (or `-arm64`) from the
+releases:
+
+```sh
+chmod +x hawk-setup-*-linux-x64
+./hawk-setup-*-linux-x64 install relay --public-url https://relay.example.com --tls certbot --email you@example.com
+```
+
+It checks the release's signature, then:
+
+- installs the relay and dashboard in `/opt/hawk`, running as its own
+  `hawk` user under systemd (`hawk-relay.service`), locked down to its
+  data folder, `/var/lib/hawk`;
+- sets up TLS: `--tls certbot` gets a Let's Encrypt certificate (port 80
+  must be reachable) that renews with **the same key**, `--tls
+  self-signed` makes one, and `--tls existing --cert … --key …` uses
+  yours;
+- opens the port in ufw or firewalld if one is running;
+- prints the relay's **key pin** and the link to create the admin account.
+
+| Option | Meaning |
+|---|---|
+| `--public-url` | Where people and machines reach it. Its port is the one it listens on, unless `--port` says otherwise. |
+| `--port` | Listen here instead, behind a proxy or a port forward. |
+| `--origin` | Another origin allowed to use this relay: a separately hosted dashboard. The desktop app is always allowed. Repeat for several. |
+| `--smtp-url`, `--mail-from` | Mail, see [Email](#email). |
+| `--updates` | `notify` (default), `auto` or `off`. See [Updates](/docs/updates). |
+
+Settings end up in `/etc/hawk/relay.env`; change them there and
+`systemctl restart hawk-relay`. Run `hawk-setup status` to see what's
+installed, and `hawk-setup uninstall relay` to remove it (the database,
+settings and TLS key stay unless you add `--delete-data`).
+
+A self-signed certificate is fine for machines, which pin its key, but
+browsers warn about it and the desktop app refuses it: give the relay a
+domain and a real certificate if people will use either.
+
+## Build from source
+
 You need a Rust toolchain (`cargo`) and [bun](https://bun.sh). All commands
 run from `src/server` in the repository.
-
-## Build and start
 
 ```sh
 bun install
@@ -59,6 +99,7 @@ roots.
 | `HAWK_SMTP_URL` | none | Mail server, to send verification links and security notices. See [Email](#email). |
 | `HAWK_MAIL_FROM` | none | Sender address, e.g. `Hawk <hawk@example.com>`. |
 | `FRONTEND_DIST` | `frontend/dist` | The built dashboard to serve. |
+| `HAWK_ALLOWED_ORIGINS` | none | Other origins that may sign in to this relay, comma separated: the desktop app (`http://tauri.localhost,tauri://localhost`) and any separately hosted dashboard. They get bearer tokens instead of the cookie. |
 | `HAWK_SERVER_ROOT` | `src/server` | The directory the default paths above are relative to. |
 | `RUST_LOG` | `info` | Log detail, e.g. `debug`. |
 
@@ -71,12 +112,13 @@ can't connect to a relay without TLS**.
 
 - **On the internet:** use a certificate from a real CA for a domain
   pointed at the server, e.g. Let's Encrypt.
-- **On a LAN:** `bun run certs` makes a self-signed one. Every machine and
-  every browser that connects has to trust it: import
-  `certs/dev-cert.pem` into *Trusted Root Certification Authorities*.
+- **On a LAN:** `bun run certs` (or `hawk-setup install relay --tls
+  self-signed`) makes a self-signed one. Machines given its pin accept
+  it as it is. Browsers have to trust it: import its certificate into
+  *Trusted Root Certification Authorities*.
 
 At startup the relay logs `relay certificate pin`, the SHA-256 of its TLS
-**key**. The dashboard puts it in every install command as `-RelayPin`.
+**key**. The dashboard shows it with every enrollment code.
 A machine with a pin refuses any other key, even one with a certificate
 its system trusts, so a rogue CA or an intercepting proxy can't pose as
 your relay.
@@ -86,7 +128,7 @@ long as the key stays the same** (with certbot: `--reuse-key`).
 `bun run certs` also reuses the existing key. To move to a new key:
 
 1. Add the new pin on every machine first, alongside the old one:
-   `install-service.ps1 -RelayPin <old>,<new>`.
+   `hawk-setup install machine --pin <old> --pin <new>`.
 2. Then switch the relay to the new key.
 
 ## Email

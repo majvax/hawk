@@ -1,6 +1,7 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
 import { getSession } from "./api.js";
+import { socketProtocols, socketUrl } from "./relay.js";
 import { type EnrollmentCheck, type MachineTrust, ViewSession, checkEnrollment, trustMachine } from "./e2e.js";
 import {
   FileManager,
@@ -201,6 +202,8 @@ export interface Dashboard {
   // minutes; then `elevate` asks again.
   elevated: boolean;
   elevate: () => void;
+  // Owner only: tells the machine to install the update it's holding.
+  installUpdate: (deviceId: string) => void;
   startView: (deviceId: string) => void;
   stopView: () => void;
   // Sends one input event to the machine being watched. The relay drops it
@@ -754,8 +757,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     let timer: number | undefined;
 
     const connect = (): void => {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const socket = new WebSocket(`${protocol}//${window.location.host}/v1/dashboard`);
+      const socket = new WebSocket(socketUrl("/v1/dashboard"), socketProtocols());
       socket.binaryType = "arraybuffer";
       socketRef.current = socket;
       setStatus("connecting");
@@ -975,6 +977,13 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     if (streamingRef.current !== null) send({ type: "elevate", deviceId: streamingRef.current });
   }, [send]);
 
+  const installUpdate = useCallback(
+    (deviceId: string): void => {
+      send({ type: "install_update", deviceId });
+    },
+    [send],
+  );
+
   return {
     machines,
     status,
@@ -993,6 +1002,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     enrollmentChecks,
     elevated,
     elevate,
+    installUpdate,
     startView,
     stopView,
     sendInput,

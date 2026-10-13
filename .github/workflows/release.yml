@@ -1,0 +1,192 @@
+# A tag `v<version>` builds every part of Hawk and leaves a *draft* release
+# with all of it and the unsigned update manifests. Nothing is signed here:
+# scripts/release/release-sign.py signs it offline and publishes it. A fork
+# gets the same pipeline with nothing to edit; its builds follow its own
+# feed and trust the key in its own HAWK_UPDATE_PUBKEY variable.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  # Baked into every build: where it looks for updates, and whom it trusts.
+  HAWK_UPDATE_URL: https://github.com/${{ github.repository }}/releases/download/feed/hawk-{channel}.json
+  HAWK_UPDATE_PUBKEY: ${{ vars.HAWK_UPDATE_PUBKEY }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: The tag matches VERSION
+        run: |
+          version="$(python3 scripts/bump-version.py --check)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME but VERSION says $version"
+            exit 1
+          fi
+          if [ -z "$HAWK_UPDATE_PUBKEY" ]; then
+            echo "::warning::HAWK_UPDATE_PUBKEY isn't set: these builds won't be able to update themselves"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  frontend:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: src/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run --cwd frontend build
+      - run: bun run --cwd frontend build:app
+      - name: Standalone dashboard, for static hosting
+        run: tar -C frontend/dist-app -czf "hawk-dashboard-${{ needs.prepare.outputs.version }}.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: src/server/frontend/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dashboard
+          path: src/server/hawk-dashboard-*.tar.gz
+
+  linux:
+    needs: [prepare, frontend]
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Relay and hawk-setup, static
+        run: cargo build --locked --release --target ${{ matrix.target }} -p hawk-relay -p hawk-setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: package/dashboard
+      - name: Package
+        run: |
+          cp target/${{ matrix.target }}/release/hawk-relay target/${{ matrix.target }}/release/hawk-setup package/
+          mkdir out
+          tar -C package -czf "out/hawk-relay-$VERSION-linux-${{ matrix.arch }}.tar.gz" hawk-relay hawk-setup dashboard
+          cp package/hawk-setup "out/hawk-setup-$VERSION-linux-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: out/*
+
+  windows:
+    needs: prepare
+    runs-on: windows-2022
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+      - name: Service and capture helper
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$PWD/package"
+          cmake --build build
+          ./package/hawk-service.exe --version
+      - uses: oven-sh/setup-bun@v2
+      - name: Pages for hawk-setup and the app
+        working-directory: src/server
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd frontend build:setup
+          bun run --cwd frontend build:app
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: hawk-setup, with its window
+        run: cargo build --locked --release -p hawk-setup --features gui
+      - name: Desktop app and its installer
+        working-directory: src/app
+        run: bun x --bun @tauri-apps/cli@2 build --ci
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Copy-Item target/release/hawk-setup.exe package/hawk-setup.exe
+          Compress-Archive -Path package/hawk-service.exe, package/hawk-capture.exe, package/hawk-setup.exe `
+            -DestinationPath "out/hawk-machine-$env:VERSION-windows-x64.zip"
+          Copy-Item target/release/hawk-setup.exe "out/hawk-setup-$env:VERSION-windows-x64.exe"
+          $nsis = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          Copy-Item $nsis.FullName "out/hawk-app-$env:VERSION-windows-x64-setup.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: out/*
+
+  draft:
+    needs: [prepare, linux, windows, frontend]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: out
+          merge-multiple: true
+      - name: Update manifests and checksums
+        run: python3 scripts/release/make-manifest.py --version "$VERSION" --repo "$GITHUB_REPOSITORY" out
+      - name: Release notes
+        run: |
+          python3 - <<'EOF' > notes.md
+          import os, re
+          version = os.environ["VERSION"]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          match = re.search(rf"^## \[?{re.escape(version)}\]?.*?\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+          print(match.group(1).strip() if match else f"Hawk {version}.")
+          print()
+          print("Verify a download against SHA256SUMS; installs check the signed manifests themselves.")
+          EOF
+      - name: Draft release
+        run: |
+          flags=()
+          case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "v$VERSION" out/* --draft --title "Hawk $VERSION" --notes-file notes.md "${flags[@]}"
+          {
+            echo "### Hawk $VERSION is drafted"
+            echo "Sign and publish it from the machine with the release key:"
+            echo '```'
+            echo "python scripts/release/release-sign.py v$VERSION"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,10 @@
 // Mirrors relay/src/protocol.rs. Kept as a plain duplicate rather than a
 // shared package since the frontend only ever reads these shapes.
 
+// Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
+// in a way the other side can't follow.
+export const PROTOCOL_VERSION = 1;
+
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
 export type Role = "view" | "control" | "dev" | "owner";
@@ -59,6 +63,10 @@ export interface Machine {
   enrollBinding: string | null;
   // Whether the owner has signed a grant for this user (always for the owner).
   granted: boolean;
+  // Owner only, while online: the service's release, and a newer one its
+  // updater is holding until the owner says to install it.
+  version?: string | null;
+  updateAvailable?: string | null;
 }
 
 export type DashboardEvent =
@@ -124,7 +132,10 @@ export type DashboardCommand =
   // A file-channel message (ViewSession.sealFile); control, dev and owner.
   | { type: "file"; deviceId: string; sealed: string }
   // A shell-channel message (ViewSession.sealShell); dev and owner.
-  | { type: "shell"; deviceId: string; sealed: string };
+  | { type: "shell"; deviceId: string; sealed: string }
+  // Owner only: install the update the machine is holding. The machine
+  // checks the release's signature itself.
+  | { type: "install_update"; deviceId: string };
 
 // One H.264 access unit, once the frame carrying it has been decrypted
 // (ViewSession.openFrame has the frame layout).

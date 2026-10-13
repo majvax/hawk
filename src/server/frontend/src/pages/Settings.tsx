@@ -10,9 +10,19 @@ import {
   revokeSession,
 } from "../api.js";
 import { fingerprint } from "../crypto.js";
+import {
+  type AppSettings,
+  type AppUpdate,
+  IN_APP,
+  appSettings,
+  appVersion,
+  checkAppUpdate,
+  installAppUpdate,
+  saveAppSettings,
+} from "../desktop.js";
 import { type Identity, changePassword } from "../keys.js";
 import { ACCENT_PRESETS, DEFAULT_ACCENT, applyAccent, isAccent, loadAccent, saveAccent } from "../theme.js";
-import { Alert, ConfirmButton, Dot, Tag, errorMessage } from "../ui.js";
+import { Alert, ConfirmButton, Dot, Segmented, Tag, errorMessage } from "../ui.js";
 import { TwoFactorSection } from "./TwoFactor.js";
 
 const MIN_PASSWORD_LENGTH = 10; // mirrors auth::MIN_PASSWORD_LEN
@@ -40,6 +50,7 @@ export function SettingsPage({
         <h1>Settings</h1>
       </div>
       <AccentSection />
+      {IN_APP && <AppSection />}
       <KeySection identity={identity} />
       <TwoFactorSection
         user={user}
@@ -139,6 +150,142 @@ function AccentSection(): JSX.Element {
 // The account's identity key, which signs everything this user does with
 // their machines: its fingerprint is what others compare to be sure it's
 // theirs.
+const APP_POLICIES: [AppSettings["policy"], string][] = [
+  ["notify", "Ask me"],
+  ["auto", "At start"],
+  ["off", "Never"],
+];
+
+const APP_CHANNELS: [AppSettings["channel"], string][] = [
+  ["stable", "Stable"],
+  ["beta", "Beta"],
+];
+
+// The desktop app's own updates: checked against the release signature it
+// was built to trust (or the key set here, for a fork's releases).
+function AppSection(): JSX.Element {
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [version, setVersion] = useState("");
+  const [update, setUpdate] = useState<AppUpdate | null | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void appSettings().then(setSettings, (caught: unknown) => setError(errorMessage(caught)));
+    void appVersion().then(setVersion, () => {});
+  }, []);
+
+  const save = (next: AppSettings): void => {
+    setSettings(next);
+    setNote(null);
+    setError(null);
+    saveAppSettings(next).then(
+      () => setNote("Saved."),
+      (caught: unknown) => setError(errorMessage(caught)),
+    );
+  };
+
+  const check = (): void => {
+    setBusy(true);
+    setError(null);
+    checkAppUpdate().then(
+      (found) => {
+        setUpdate(found);
+        setBusy(false);
+      },
+      (caught: unknown) => {
+        setError(errorMessage(caught));
+        setBusy(false);
+      },
+    );
+  };
+
+  const install = (): void => {
+    setBusy(true);
+    setError(null);
+    installAppUpdate().catch((caught: unknown) => {
+      setError(errorMessage(caught));
+      setBusy(false);
+    });
+  };
+
+  return (
+    <section className="section">
+      <div className="section-aside">
+        <h2>App updates</h2>
+        <p>
+          New releases are checked against the project's signing key before they install. This app is version{" "}
+          <span className="mono">{version || "…"}</span>.
+        </p>
+      </div>
+      <div className="section-main form-grid">
+        {settings !== null && (
+          <>
+            <div className="field">
+              <span className="label">Install updates</span>
+              <Segmented
+                label="Install updates"
+                options={APP_POLICIES}
+                value={settings.policy}
+                onChange={(policy) => save({ ...settings, policy })}
+              />
+            </div>
+            <div className="field">
+              <span className="label">Channel</span>
+              <Segmented
+                label="Channel"
+                options={APP_CHANNELS}
+                value={settings.channel}
+                onChange={(channel) => save({ ...settings, channel })}
+              />
+            </div>
+            <label className="field">
+              <span className="label">Release feed</span>
+              <input
+                className="input"
+                placeholder="the one this app was built with"
+                spellCheck={false}
+                value={settings.feedUrl}
+                onChange={(e) => setSettings({ ...settings, feedUrl: e.target.value })}
+                onBlur={() => save(settings)}
+              />
+              <span className="field-hint">
+                For a fork's releases: its feed URL, and below, the key they're signed with.
+              </span>
+            </label>
+            <label className="field">
+              <span className="label">Release key</span>
+              <input
+                className="input"
+                placeholder="the one this app was built with"
+                spellCheck={false}
+                value={settings.publicKey}
+                onChange={(e) => setSettings({ ...settings, publicKey: e.target.value })}
+                onBlur={() => save(settings)}
+              />
+            </label>
+          </>
+        )}
+        <div className="form-row" style={{ alignItems: "center" }}>
+          {update ? (
+            <button type="button" className="btn btn-accent" disabled={busy} onClick={install}>
+              {busy ? "Installing…" : `Install ${update.version} and restart`}
+            </button>
+          ) : (
+            <button type="button" className="btn" disabled={busy} onClick={check}>
+              {busy ? "Checking…" : "Check for updates"}
+            </button>
+          )}
+          {update === null && <span className="muted">Up to date.</span>}
+          {note !== null && <span className="muted">{note}</span>}
+        </div>
+        {error !== null && <Alert>{error}</Alert>}
+      </div>
+    </section>
+  );
+}
+
 function KeySection({ identity }: { identity: Identity }): JSX.Element {
   const [print, setPrint] = useState<string | null>(null);
   useEffect(() => {

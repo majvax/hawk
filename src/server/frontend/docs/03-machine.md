@@ -5,37 +5,21 @@ that starts at boot. When someone watches, it launches `hawk-capture`
 into the signed-in user's session, which captures the screen and replays
 the viewer's mouse and keyboard.
 
-## 1. Build it
+## 1. Get hawk-setup
 
-The machine side is C++ built with CMake. With MSYS2's UCRT64 toolchain
-and Ninja, from the repository root:
+Download `hawk-setup-<version>-windows-x64.exe` from the project's
+releases. It's the whole install: it fetches the service from the same
+release, checks it against the release's signature, and sets it up.
 
-```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-That puts `hawk-service.exe` and `hawk-capture.exe` in `bin\`. Keep them
-side by side: the service looks for `hawk-capture.exe` in its own
-directory.
-
-**Point it at your relay before building.** The relay address is set in
-the source, as `kRelayServerUrl` in `src/service/main.cpp`. It's
-`wss://127.0.0.1:8080/v1/ws` by default, which only works when the relay
-runs on the same PC. Change it to your relay, e.g.
-`wss://relay.example.com/v1/ws`, then build.
-
-**Trust the relay's certificate.** The machine checks the relay's
-certificate against the Windows trust store. With a certificate from a
-real CA there's nothing to do. With a self-signed one, import
-`certs/dev-cert.pem` into the PC's *Trusted Root Certification
-Authorities* (Local Machine) first.
+Windows may warn that the file is from an unknown publisher: the releases
+aren't signed with a Windows code-signing certificate. The signature that
+matters to Hawk is checked by hawk-setup itself, on everything it
+installs.
 
 ## 2. Get an enrollment code
 
 In the dashboard: **Machines → Add machine**. It shows a one-time code,
-valid for an hour, and the exact command to run, including your relay's
-pin.
+valid for an hour, with your relay's address and key pin.
 
 The code is made in your browser, and the relay only ever sees its hash.
 **Leave this browser tab open** until the machine shows up: this browser
@@ -43,16 +27,17 @@ uses the code to check the machine's key, and vouches for it on its own.
 
 ## 3. Install the service
 
-On the PC, in an **elevated** PowerShell (right-click → *Run as
-administrator*), from the repository root, paste the command the dashboard
-gave you:
+Run `hawk-setup.exe` and choose **Set up this PC**. It asks for the
+relay's address, its key pin and the code, then checks everything before
+it changes anything:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1 -EnrollCode 7K3QD-WX2MP-4HZ8R-QN1CV-B6T2J -RelayPin wqsPIpg8...xW0=
-```
+- that it's running as an administrator, on Windows 10 1809 or later;
+- whether there's a TPM for the machine's key;
+- that the relay answers, **with the key you pinned**.
 
-This registers `HawkService` (runs as LocalSystem, starts at boot) and
-starts it. The service then:
+Then it installs to `C:\Program Files\Hawk`, registers `HawkService`
+(LocalSystem, starts at boot, restarts if it ever fails), and shows the
+machine enrolling. The service:
 
 - creates the machine's key **inside the TPM**, where it can't be copied
   off the PC. Without a usable TPM, it uses the Windows software key store
@@ -64,14 +49,25 @@ starts it. The service then:
 
 The machine appears in your list within a few seconds.
 
+### From a terminal
+
+The dashboard shows the same install as one command, for scripts and PCs
+you reach without a screen. In an elevated terminal:
+
+```powershell
+hawk-setup install machine --relay relay.example.com --pin wqsPIpg8...xW0= --code 7K3QD-WX2MP-4HZ8R-QN1CV-B6T2J
+```
+
 | Option | Meaning |
 |---|---|
-| `-EnrollCode` | The one-time code. Needed the first time, or to enroll again after removing the machine. |
-| `-RelayPin` | The relay's TLS key pin. Several, comma-separated, to also accept the next key ahead of a change. Without it the machine still checks the certificate, but logs a warning. |
-| `-BinPath` | Where `hawk-service.exe` is, if not `bin\hawk-service.exe`. |
+| `--relay` | The relay's address, as the dashboard shows it. |
+| `--pin` | The relay's TLS key pin. Repeat it to also accept the next key ahead of a change. Without one the machine checks only the certificate, which has to be from a CA it trusts. |
+| `--code` | The one-time code. Needed the first time, or to enroll again after removing the machine. |
+| `--updates` | `notify` (default), `auto` or `off`. See [Updates](/docs/updates). |
+| `--quiet` | Print only warnings and errors. |
 
-To reinstall an enrolled machine (after rebuilding, say), run the script
-with no options: the enrollment and pins are kept.
+Run it again with a different `--relay` or `--pin` to change them; the
+enrollment is kept. Without `--code`, an enrolled machine stays enrolled.
 
 ## 4. Verify it, if needed
 
@@ -91,22 +87,27 @@ trust it: remove the machine and enroll it again with a new code.
 
 | Path | What |
 |---|---|
+| `C:\Program Files\Hawk` | The service, the capture helper and hawk-setup. |
 | `C:\ProgramData\HawkService\hawk-service.log` | The service's log. It has no console window; look here. |
 | `C:\ProgramData\HawkService\config.toml` | What the machine allows. See [Machine config file](/docs/machine-config). |
 | `C:\ProgramData\HawkService\machine.txt` | Which machine it enrolled as, and its key's name. Not secret. |
 | `C:\ProgramData\HawkService\owner-key.txt` | The owner's key it trusts. |
 | `C:\ProgramData\HawkService\relay-pins.txt` | The relay pins it accepts. |
 
+Only SYSTEM and administrators can read or change anything in
+`C:\ProgramData\HawkService`: hawk-setup restricts it, so nobody else using
+the PC can change what the machine allows.
+
 ## Removing or moving a machine
 
 - **Remove** it from the dashboard (*Machine* tab, owner only): the relay
   forgets its key, disconnects it, and everyone it was shared with loses
   it.
-- **Uninstall** the service on the PC, from an elevated PowerShell:
-
-  ```powershell
-  powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
-  ```
+- **Uninstall** it on the PC: *Settings → Apps → Hawk (machine service)*,
+  or run hawk-setup again and choose **Uninstall**, or from an elevated
+  terminal `hawk-setup uninstall machine`. It deletes the machine's key
+  from the TPM too; `--keep-data` keeps the key and settings for a
+  reinstall.
 
 - **Move it to another account:** remove it in the dashboard, then enroll
   it again with a code made by the new owner. The old key is deleted from

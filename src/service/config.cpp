@@ -37,10 +37,24 @@ struct ShellTable {
     std::optional<std::string> command;
 };
 
+struct RelayTable {
+    std::optional<std::string> url;
+};
+
+struct UpdateTable {
+    std::optional<std::string>   policy;
+    std::optional<std::uint32_t> check_hours;
+    std::optional<std::string>   channel;
+    std::optional<std::string>   manifest_url;
+    std::optional<std::string>   public_key;
+};
+
 struct ConfigFile {
     std::vector<ClipboardTable> clipboard;
     std::vector<FilesTable>     files;
     std::vector<ShellTable>     shell;
+    std::vector<RelayTable>     relay;
+    std::vector<UpdateTable>    update;
 };
 
 }  // namespace
@@ -66,9 +80,23 @@ struct glz::meta<hawk::service::ShellTable> {
 };
 
 template <>
+struct glz::meta<hawk::service::RelayTable> {
+    using T                     = hawk::service::RelayTable;
+    static constexpr auto value = object("url", &T::url);
+};
+
+template <>
+struct glz::meta<hawk::service::UpdateTable> {
+    using T                     = hawk::service::UpdateTable;
+    static constexpr auto value = object("policy", &T::policy, "check_hours", &T::check_hours, "channel", &T::channel,
+                                         "manifest_url", &T::manifest_url, "public_key", &T::public_key);
+};
+
+template <>
 struct glz::meta<hawk::service::ConfigFile> {
     using T                     = hawk::service::ConfigFile;
-    static constexpr auto value = object("clipboard", &T::clipboard, "files", &T::files, "shell", &T::shell);
+    static constexpr auto value = object("clipboard", &T::clipboard, "files", &T::files, "shell", &T::shell, "relay",
+                                         &T::relay, "update", &T::update);
 };
 
 namespace hawk::service {
@@ -161,6 +189,64 @@ namespace {
     return config;
 }
 
+[[nodiscard]] std::optional<RelayConfig> relay_config(const std::vector<RelayTable>& tables) {
+    RelayConfig config;
+    if (tables.empty()) {
+        return config;
+    }
+    if (tables.size() > 1) {
+        spdlog::error("config: {} has more than one [[relay]] table", kConfigPath.string());
+        return std::nullopt;
+    }
+    if (const auto& url = tables.front().url; url.has_value()) {
+        if (!url->starts_with("wss://") && !url->starts_with("ws://")) {
+            spdlog::error("config: relay url \"{}\" doesn't start with wss://", *url);
+            return std::nullopt;
+        }
+        config.url = *url;
+    }
+    return config;
+}
+
+[[nodiscard]] std::optional<UpdateConfig> update_config(const std::vector<UpdateTable>& tables) {
+    UpdateConfig config;
+    if (tables.empty()) {
+        return config;
+    }
+    if (tables.size() > 1) {
+        spdlog::error("config: {} has more than one [[update]] table", kConfigPath.string());
+        return std::nullopt;
+    }
+    const auto& table = tables.front();
+    if (table.policy.has_value()) {
+        if (*table.policy == "off") {
+            config.policy = UpdatePolicy::off;
+        } else if (*table.policy == "notify") {
+            config.policy = UpdatePolicy::notify;
+        } else if (*table.policy == "auto") {
+            config.policy = UpdatePolicy::automatic;
+        } else {
+            spdlog::error("config: update policy \"{}\" isn't one of off, notify or auto", *table.policy);
+            return std::nullopt;
+        }
+    }
+    if (table.check_hours.has_value()) {
+        if (*table.check_hours == 0 || *table.check_hours > 24 * 30) {
+            spdlog::error("config: update check_hours must be between 1 and 720");
+            return std::nullopt;
+        }
+        config.check_hours = *table.check_hours;
+    }
+    if (table.channel.has_value() && *table.channel != "stable" && *table.channel != "beta") {
+        spdlog::error("config: update channel \"{}\" isn't stable or beta", *table.channel);
+        return std::nullopt;
+    }
+    config.channel = table.channel.value_or("");
+    config.manifest_url = table.manifest_url.value_or("");
+    config.public_key = table.public_key.value_or("");
+    return config;
+}
+
 }  // namespace
 
 MachineConfig load_machine_config() {
@@ -178,11 +264,12 @@ MachineConfig load_machine_config() {
 
     ConfigFile parsed;
     if (const auto error = glz::read_toml(parsed, text); error) {
-        spdlog::error("config: {} doesn't parse ({}); the clipboard, file transfer and shell are off", kConfigPath.string(),
+        spdlog::error("config: {} doesn't parse ({}); the clipboard, file transfer, shell and relay connection are off", kConfigPath.string(),
                       glz::format_error(error, text));
         config.clipboard.mode = ClipboardMode::off;
         config.files.enabled = false;
         config.shell.enabled = false;
+        config.relay.url.clear();
         return config;
     }
     if (auto clipboard = clipboard_config(parsed.clipboard); clipboard.has_value()) {
@@ -202,6 +289,17 @@ MachineConfig load_machine_config() {
     } else {
         spdlog::error("config: the shell is off until {} is fixed", kConfigPath.string());
         config.shell.enabled = false;
+    }
+    if (auto relay = relay_config(parsed.relay); relay.has_value()) {
+        config.relay = *relay;
+    } else {
+        spdlog::error("config: not connecting to any relay until {} is fixed", kConfigPath.string());
+        config.relay.url.clear();
+    }
+    if (auto update = update_config(parsed.update); update.has_value()) {
+        config.update = *update;
+    } else {
+        spdlog::error("config: updates only notify until {} is fixed", kConfigPath.string());
     }
     return config;
 }
