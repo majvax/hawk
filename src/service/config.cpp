@@ -49,12 +49,18 @@ struct UpdateTable {
     std::optional<std::string>   public_key;
 };
 
+struct MetricsTable {
+    std::optional<bool>          enabled;
+    std::optional<std::uint32_t> history_days;
+};
+
 struct ConfigFile {
     std::vector<ClipboardTable> clipboard;
     std::vector<FilesTable>     files;
     std::vector<ShellTable>     shell;
     std::vector<RelayTable>     relay;
     std::vector<UpdateTable>    update;
+    std::vector<MetricsTable>   metrics;
 };
 
 }  // namespace
@@ -93,10 +99,16 @@ struct glz::meta<hawk::service::UpdateTable> {
 };
 
 template <>
+struct glz::meta<hawk::service::MetricsTable> {
+    using T                     = hawk::service::MetricsTable;
+    static constexpr auto value = object("enabled", &T::enabled, "history_days", &T::history_days);
+};
+
+template <>
 struct glz::meta<hawk::service::ConfigFile> {
     using T                     = hawk::service::ConfigFile;
     static constexpr auto value = object("clipboard", &T::clipboard, "files", &T::files, "shell", &T::shell, "relay",
-                                         &T::relay, "update", &T::update);
+                                         &T::relay, "update", &T::update, "metrics", &T::metrics);
 };
 
 namespace hawk::service {
@@ -247,6 +259,27 @@ namespace {
     return config;
 }
 
+[[nodiscard]] std::optional<MetricsConfig> metrics_config(const std::vector<MetricsTable>& tables) {
+    MetricsConfig config;
+    if (tables.empty()) {
+        return config;
+    }
+    if (tables.size() > 1) {
+        spdlog::error("config: {} has more than one [[metrics]] table", kConfigPath.string());
+        return std::nullopt;
+    }
+    const auto& table = tables.front();
+    if (table.history_days.has_value()) {
+        if (*table.history_days == 0 || *table.history_days > max_metrics_history_days) {
+            spdlog::error("config: metrics history_days must be between 1 and {}", max_metrics_history_days);
+            return std::nullopt;
+        }
+        config.history_days = *table.history_days;
+    }
+    config.enabled = table.enabled.value_or(config.enabled);
+    return config;
+}
+
 }  // namespace
 
 MachineConfig load_machine_config() {
@@ -311,6 +344,11 @@ MachineConfig load_machine_config() {
         config.update = *update;
     } else {
         spdlog::error("config: updates only notify until {} is fixed", kConfigPath.string());
+    }
+    if (auto metrics = metrics_config(parsed.metrics); metrics.has_value()) {
+        config.metrics = *metrics;
+    } else {
+        spdlog::error("config: analytics use the defaults until {} is fixed", kConfigPath.string());
     }
     return config;
 }

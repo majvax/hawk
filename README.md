@@ -171,7 +171,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [ ] WebAuthn / passkeys
 - [x] Email ownership verification and security notices (when the relay has a mailer)
 - [ ] Trusted-proxy address resolution, with IP allow/deny lists
-- [ ] Machine analytics (CPU/RAM/GPU/disk/network) and dashboard charts
+- [x] Machine analytics (CPU/RAM/GPU/disk/network, processes) with charts, history kept on the machine, end-to-end encrypted
+- [ ] Analytics alerts (disk full, machine silent), sparklines in the machine list, temperatures, ending processes
 - [x] `dev` role: a shell instead of a video stream, for low bandwidth (ConPTY as the logged-on user)
 - [x] GUI and CLI installer (`hawk-setup`): machine, relay, app; preflight, repair, uninstall
 - [ ] Installer pre-stamped by the dashboard with relay URL, pin and enroll code; Authenticode signing
@@ -278,7 +279,16 @@ active. Lists apply to dashboard logins, to `/v1/dashboard` sockets and to
 machine (`/v1/ws`) connections, with the rejection logged and visible in the
 dashboard — a lockout that gives no feedback is a lockout you can't fix.
 
-### Machine analytics
+### Machine analytics (built: history on the machine, not the relay)
+
+Built as the **Analytics** and **Processes** tabs, with one change from the
+plan below: the history stays **on the machine** (one point a second for an
+hour, one a minute for `history_days`, in `ProgramData\HawkService\metrics`)
+and reaches the dashboard over the end-to-end encrypted session, so the relay
+sees none of it. Who may read it is a signed `analytics=1` in the owner's
+grant, which the machine checks. Not built yet: temperatures, the relay-side
+alerts below (they'd need the relay to see the numbers), sparklines in the
+machine list, and ending a process. The original plan:
 
 The dashboard knows whether a machine is online and nothing else about it.
 The service already holds an authenticated control channel; sampling the

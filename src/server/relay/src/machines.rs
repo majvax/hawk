@@ -180,6 +180,7 @@ pub struct ShareView {
     starts_at: Option<i64>,
     expires_at: Option<i64>,
     single_view: bool,
+    analytics: bool,
     /// The recipient's identity key; None until they've set one up.
     public_key: Option<String>,
     /// What the owner signed for this share; None for a share from before
@@ -208,6 +209,7 @@ pub async fn list_shares(
                 starts_at: share.terms.starts_at,
                 expires_at: share.terms.expires_at,
                 single_view: share.terms.single_view,
+                analytics: share.terms.analytics,
                 public_key: share.public_key.map(|key| BASE64.encode(key)),
                 grant: share.grant.as_ref().map(SignedView::from),
             })
@@ -231,6 +233,9 @@ pub struct ShareRequest {
     expires_at: Option<i64>,
     #[serde(default)]
     single_view: bool,
+    /// May read the machine's analytics.
+    #[serde(default)]
+    analytics: bool,
     /// The owner's signature over exactly these terms, for the recipient's
     /// current identity key (see e2e::check_grant).
     grant: SignedView,
@@ -254,7 +259,13 @@ impl ShareRequest {
                 return Err(ApiError::bad_request("a temporary share can last at most a year"));
             }
         }
-        Ok(ShareTerms { role: self.role, starts_at, expires_at: self.expires_at, single_view: self.single_view })
+        Ok(ShareTerms {
+            role: self.role,
+            starts_at,
+            expires_at: self.expires_at,
+            single_view: self.single_view,
+            analytics: self.analytics,
+        })
     }
 }
 

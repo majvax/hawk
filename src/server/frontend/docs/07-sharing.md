@@ -18,6 +18,12 @@ Files and shells also have to be allowed by the machine's
 [config file](/docs/machine-config). **Shell only** gets no video at all,
 which makes it usable over a slow connection.
 
+**Analytics** is a checkbox on its own, with any access level: it lets
+them see the machine's [health and processes](/docs/analytics). You can
+turn it on or off for an existing share from the list. Like the access
+level, it's part of what your browser signs, and the machine checks it
+itself.
+
 ## Temporary shares
 
 These combine freely:

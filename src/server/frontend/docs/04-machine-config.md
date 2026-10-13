@@ -39,6 +39,10 @@ max_size = 1073741824    # bytes per file, either way; at most 64 GiB
 [[shell]]
 enabled = true
 command = "powershell.exe -NoLogo"   # or pwsh.exe, cmd.exe, ...
+
+[[metrics]]
+enabled = true           # the Analytics and Processes tabs
+history_days = 7         # how long the machine keeps its history, 1 to 90
 ```
 
 ## Clipboard
@@ -88,3 +92,15 @@ Gives a terminal on the machine to the owner and to **Shell only** shares.
 - Each viewer can have 2 shells open, and the machine 4.
 - Every shell is logged with who opened it and for how long. What's typed
   isn't.
+
+## Metrics
+
+The machine's health for the **Analytics** and **Processes** tabs. On by
+default: nothing leaves the machine unless someone allowed asks for it.
+
+- The machine samples itself once a second and keeps the history itself,
+  in `C:\ProgramData\HawkService\metrics`: every second for the last
+  hour, every minute for `history_days` (about 100 KB a day). Nothing is
+  stored on the relay.
+- `enabled = false` stops the sampling and closes both tabs for everyone.
+- See [Analytics](/docs/analytics) for what's measured and who can see it.

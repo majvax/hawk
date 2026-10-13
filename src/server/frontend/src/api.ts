@@ -245,6 +245,7 @@ export interface ShareTerms {
   startsAt: number | null; // unix seconds; null: right away
   expiresAt: number | null; // unix seconds; null: until revoked
   singleView: boolean; // used up once the viewer stops watching
+  analytics: boolean; // may read the machine's health and processes
 }
 
 export interface Share extends ShareTerms {

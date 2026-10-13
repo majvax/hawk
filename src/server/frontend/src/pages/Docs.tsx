@@ -13,6 +13,7 @@ import sharing from "../../docs/07-sharing.md";
 import security from "../../docs/08-security.md";
 import troubleshooting from "../../docs/09-troubleshooting.md";
 import updates from "../../docs/10-updates.md";
+import analytics from "../../docs/11-analytics.md";
 import { Logo } from "../ui.js";
 
 type Doc = typeof start;
@@ -26,6 +27,7 @@ const PAGES: { slug: string; doc: Doc }[] = [
   { slug: "accounts", doc: accounts },
   { slug: "using", doc: usage },
   { slug: "sharing", doc: sharing },
+  { slug: "analytics", doc: analytics },
   { slug: "security", doc: security },
   { slug: "updates", doc: updates },
   { slug: "troubleshooting", doc: troubleshooting },

@@ -23,7 +23,7 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_SEALED_INPUT_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
+    MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
 use crate::registry::{Answer, DashboardHandle, DeviceOutbound, Outbound, Registry, StepUp};
@@ -357,6 +357,13 @@ fn route_device_answer(
             }
             return;
         }
+        Ok(DeviceMessage::Metrics { viewer, sealed }) if sealed.len() <= MAX_SEALED_METRICS_LEN => {
+            let event = DashboardEvent::Metrics { device_id: machine_id.to_owned(), sealed };
+            if !registry.forward_bulk(machine_id, viewer, event) {
+                debug!(%machine_id, viewer, "relay: dropping metrics for a viewer that isn't keeping up");
+            }
+            return;
+        }
         _ => {
             debug!(%machine_id, "relay: ignoring an unexpected message from a machine");
             return;
@@ -457,6 +464,7 @@ async fn handle_dashboard(
     let mut clipboard_budget = Budget::clipboard();
     let mut file_budget = Budget::file_bytes();
     let mut shell_budget = Budget::shell_bytes();
+    let mut metrics_budget = Budget::metrics();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -504,6 +512,13 @@ async fn handle_dashboard(
                     registry.shell(dashboard_id, &device_id, sealed);
                 }
             }
+            Ok(DashboardCommand::Metrics { device_id, sealed }) => {
+                // Subscribing, a range of history, the process list: a few
+                // a second at most, each asking the machine for work.
+                if sealed.len() <= MAX_SEALED_METRICS_REQUEST_LEN && metrics_budget.take() {
+                    registry.metrics(dashboard_id, &device_id, sealed);
+                }
+            }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
                 warn!(%error, "dashboard: received invalid command (further ones are logged at debug)")
             }
@@ -535,6 +550,12 @@ impl Budget {
     /// text a machine sends one viewer.
     fn clipboard() -> Self {
         Self::new(2.0, 5.0)
+    }
+
+    /// Metrics requests from one dashboard: switching ranges and refreshing
+    /// the process list, never anywhere near this.
+    fn metrics() -> Self {
+        Self::new(5.0, 20.0)
     }
 
     /// Bytes of sealed file messages from one dashboard: far more than a

@@ -27,3 +27,9 @@ The first release.
   that allows it (`HAWK_ALLOWED_ORIGINS`), several relays remembered.
 - Machines show their version, and offer an update in the owner's
   dashboard.
+- **Analytics and Processes** tabs: CPU (per core), memory, GPU, network
+  and disks, live and over 1 hour, 24 hours or 7 days, and every process
+  with its CPU and memory. The machine samples itself and keeps the
+  history; it's read over the end-to-end encrypted session and never
+  stored on the relay. Owners see it; a share sees it only if the owner
+  ticked Analytics. Protocol version 2.

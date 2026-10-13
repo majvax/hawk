@@ -44,7 +44,7 @@ ARTIFACTS = {
 # The app's updater platforms (Tauri's names) -> their artifact. Keep in
 # step with APP_FILES in release-sign.py, which signs them.
 APP_PLATFORMS = {"windows-x86_64": "app-windows-x64", "linux-x86_64": "app-linux-x64"}
-PROTOCOL = 1  # PROTOCOL_VERSION in src/server/relay/src/protocol.rs
+PROTOCOL = 2  # PROTOCOL_VERSION in src/server/relay/src/protocol.rs
 
 
 def sha256(path: Path) -> str:

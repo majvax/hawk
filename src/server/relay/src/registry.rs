@@ -165,6 +165,7 @@ impl Inner {
             key_storage: row.key_storage.clone(),
             access_expires_at: row.share_expires_at,
             single_view: row.single_view,
+            analytics: row.analytics,
             viewers: (row.role == Role::Owner).then(|| {
                 let mut emails: Vec<String> = device
                     .map(|device| device.viewers.values().map(|viewer| viewer.email.clone()).collect())
@@ -515,6 +516,23 @@ impl Registry {
         self.pass_on(dashboard_id, machine_id, Role::can_shell, DeviceCommand::Shell { viewer: dashboard_id, sealed })
     }
 
+    /// Passes a sealed metrics request on to the machine if this dashboard
+    /// owns it or has a share with analytics, and is watching it.
+    pub fn metrics(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
+        let may = inner
+            .dashboards
+            .get(&dashboard_id)
+            .and_then(|dashboard| dashboard.access.get(machine_id))
+            .is_some_and(|row| row.analytics);
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !may || !device.viewers.contains_key(&dashboard_id) {
+            return false;
+        }
+        device.send(DeviceCommand::Metrics { viewer: dashboard_id, sealed });
+        true
+    }
+
     fn pass_on(
         &self,
         dashboard_id: DashboardId,
@@ -713,6 +731,7 @@ mod tests {
             role,
             share_expires_at: None,
             single_view: false,
+            analytics: role == Role::Owner,
             public_key: None,
             owner_public_key: None,
             endorsement: None,

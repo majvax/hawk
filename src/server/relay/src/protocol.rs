@@ -11,7 +11,7 @@ use crate::db::{Role, Signed};
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -100,6 +100,9 @@ pub enum DeviceMessage {
     /// A shell-channel message sealed for one viewer: a shell's output, or
     /// that it opened or exited. Queued with file data.
     Shell { viewer: u64, sealed: String },
+    /// A metrics-channel message sealed for one viewer: a sample, a range of
+    /// history, the process list. Queued with file data.
+    Metrics { viewer: u64, sealed: String },
 }
 
 /// Messages the relay sends down to a device.
@@ -141,6 +144,9 @@ pub enum DeviceCommand {
     /// A shell-channel message sealed by the viewer (open, keystrokes,
     /// resize, ack, close). Only passed on for roles that may open shells.
     Shell { viewer: u64, sealed: String },
+    /// A metrics-channel request sealed by the viewer. Only passed on for
+    /// the owner and shares with analytics.
+    Metrics { viewer: u64, sealed: String },
     /// Every revocation the owner has signed for this machine.
     Revocations { revocations: Vec<SignedView> },
     /// The owner asks the machine to install the update it's holding now.
@@ -189,6 +195,12 @@ pub const MAX_SEALED_FILE_LEN: usize = (8 + 3 + 65_535 + 65_536 + 16_usize).div_
 /// A sealed shell-channel message, either way: counter, op, header length,
 /// a small header, up to 16 KB of terminal bytes, and the tag, in base64.
 pub const MAX_SEALED_SHELL_LEN: usize = (8 + 3 + 1024 + 16 * 1024 + 16_usize).div_ceil(3) * 4;
+/// A sealed metrics-channel message from the machine: counter, op, header
+/// length, a small header, a JSON body of up to 512 KB (a history range,
+/// the process list), and the tag, in base64.
+pub const MAX_SEALED_METRICS_LEN: usize = (8 + 3 + 1024 + 512 * 1024 + 16_usize).div_ceil(3) * 4;
+/// A viewer's metrics request: only a small header.
+pub const MAX_SEALED_METRICS_REQUEST_LEN: usize = (8 + 3 + 1024 + 16_usize).div_ceil(3) * 4;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
 const MAX_ANSWER_LEN: usize = 2048;
 
@@ -238,6 +250,9 @@ pub enum DashboardCommand {
     /// A sealed shell-channel message. Only passed on while viewing the
     /// machine with a role that may open shells (dev or owner).
     Shell { device_id: String, sealed: String },
+    /// A sealed metrics request. Only passed on while viewing the machine
+    /// as its owner, or with a share that allows analytics.
+    Metrics { device_id: String, sealed: String },
     /// The owner asks the machine to install the update it's holding.
     InstallUpdate { device_id: String },
 }
@@ -264,6 +279,8 @@ pub struct MachineView {
     pub access_expires_at: Option<i64>,
     /// This user's share is used up by one viewing.
     pub single_view: bool,
+    /// May read the machine's analytics: always for the owner.
+    pub analytics: bool,
     /// Who is watching right now. Only sent to the owner.
     pub viewers: Option<Vec<String>>,
     /// Base64 keys: the machine's, and its owner's identity key. None for a
@@ -327,6 +344,8 @@ pub enum DashboardEvent {
     File { device_id: String, sealed: String },
     /// A shell-channel message the machine sealed for this viewer.
     Shell { device_id: String, sealed: String },
+    /// A metrics-channel message the machine sealed for this viewer.
+    Metrics { device_id: String, sealed: String },
 }
 
 /// Binary video frame produced by hawk-service (BuildVideoFrame):

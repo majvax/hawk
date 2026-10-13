@@ -159,6 +159,7 @@ export function signGrant(
       ["not_before", optionalTime(terms.startsAt)],
       ["not_after", optionalTime(terms.expiresAt)],
       ["single_view", terms.singleView ? "1" : "0"],
+      ["analytics", terms.analytics ? "1" : "0"],
       ["issued", String(nextIssued(previous))],
     ]),
   );
@@ -224,6 +225,7 @@ const CLIPBOARD_TEXT = 3;
 const CLIPBOARD_PUSH = 4;
 const FILE_AAD = utf8("hawk-file-v1");
 const SHELL_AAD = utf8("hawk-shell-v1");
+const METRICS_AAD = utf8("hawk-metrics-v1");
 
 // One file- or shell-channel message from the machine, opened.
 export interface ChannelMessage {
@@ -282,6 +284,9 @@ export class ViewSession {
   // And shell output, likewise.
   private shellKey: CryptoKey | null = null;
   private shellCounter = 0n;
+  // And the machine's analytics, likewise.
+  private metricsKey: CryptoKey | null = null;
+  private metricsCounter = 0n;
   private readonly streamKeys = new Map<number, CryptoKey>();
   // Numbers input events and clipboard requests alike: the machine keeps
   // one counter for both.
@@ -333,12 +338,13 @@ export class ViewSession {
       throw new Error("the machine's answer doesn't match this request");
     }
     const shared = await exchange(this.exchangeKey.privateKey, fromBase64(ephemeral));
-    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 160);
+    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 192);
     this.inputKey = await aesKey(keys.slice(0, 32), ["encrypt"]);
     this.wrapKey = await aesKey(keys.slice(32, 64), ["decrypt"]);
     this.replyKey = await aesKey(keys.slice(64, 96), ["decrypt"]);
     this.fileKey = await aesKey(keys.slice(96, 128), ["decrypt"]);
     this.shellKey = await aesKey(keys.slice(128, 160), ["decrypt"]);
+    this.metricsKey = await aesKey(keys.slice(160, 192), ["decrypt"]);
     this.role = role;
     // A dev viewer doesn't watch the screen, and is never given its key.
     if (answer.wrappedKey !== "") await this.addStreamKey(answer.wrappedKey);
@@ -438,6 +444,11 @@ export class ViewSession {
     return this.sealChannel(op, header, data, SHELL_AAD);
   }
 
+  // The same for the metrics channel (owner, and shares with analytics).
+  sealMetrics(op: number, header: object): Promise<string> | null {
+    return this.sealChannel(op, header, undefined, METRICS_AAD);
+  }
+
   // A file-channel message from the machine; null for anything that
   // doesn't open or was seen before. Must be called in the order the
   // messages arrived.
@@ -457,6 +468,16 @@ export class ViewSession {
     const opened = await openChannel(key, sealed, SHELL_AAD, this.shellCounter);
     if (opened === null || opened.counter <= this.shellCounter) return null;
     this.shellCounter = opened.counter;
+    return opened.message;
+  }
+
+  // The same for the metrics channel.
+  async openMetrics(sealed: string): Promise<ChannelMessage | null> {
+    const key = this.metricsKey;
+    if (key === null) return null;
+    const opened = await openChannel(key, sealed, METRICS_AAD, this.metricsCounter);
+    if (opened === null || opened.counter <= this.metricsCounter) return null;
+    this.metricsCounter = opened.counter;
     return opened.message;
   }
 

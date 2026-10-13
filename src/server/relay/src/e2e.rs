@@ -119,7 +119,13 @@ pub fn check_grant(
     expect(&fields, "not_after", &optional_time(terms.expires_at))?;
     expect(&fields, "single_view", if terms.single_view { "1" } else { "0" })?;
     issued(&fields)?;
-    if fields.len() != 7 {
+    // analytics came later: a grant without it allows none.
+    match fields.get("analytics").copied() {
+        None if !terms.analytics => {}
+        Some(value) if value == if terms.analytics { "1" } else { "0" } => {}
+        _ => return Err(Mismatch::Field("analytics")),
+    }
+    if fields.len() != 7 + usize::from(fields.contains_key("analytics")) {
         return Err(Mismatch::Malformed);
     }
     Ok(())
@@ -171,7 +177,8 @@ mod tests {
         Signed { statement: statement.to_owned(), signature: signature.as_ref().to_vec() }
     }
 
-    const TERMS: ShareTerms = ShareTerms { role: Role::Control, starts_at: None, expires_at: Some(2000), single_view: true };
+    const TERMS: ShareTerms =
+        ShareTerms { role: Role::Control, starts_at: None, expires_at: Some(2000), single_view: true, analytics: false };
 
     fn grant_text(viewer: &[u8], issued: i64) -> String {
         format!(
@@ -196,6 +203,27 @@ mod tests {
         assert_eq!(check_grant(&forged, owner_key, "m1", viewer_key, &TERMS), Err(Mismatch::Signature));
         let extra = sign(&owner, &format!("{}\nextra=1", grant_text(viewer_key, 1)));
         assert_eq!(check_grant(&extra, owner_key, "m1", viewer_key, &TERMS), Err(Mismatch::Malformed));
+    }
+
+    #[test]
+    fn analytics_must_be_what_the_owner_signed() {
+        let owner = key_pair();
+        let viewer = key_pair();
+        let viewer_key = viewer.public_key().as_ref();
+        let owner_key = owner.public_key().as_ref();
+        let with = |value: &str| sign(&owner, &format!("{}\nanalytics={value}", grant_text(viewer_key, 1)));
+        let analytics = ShareTerms { analytics: true, ..TERMS };
+
+        assert_eq!(check_grant(&with("1"), owner_key, "m1", viewer_key, &analytics), Ok(()));
+        assert_eq!(check_grant(&with("0"), owner_key, "m1", viewer_key, &TERMS), Ok(()));
+        // A grant from before analytics allows none.
+        let old = sign(&owner, &grant_text(viewer_key, 1));
+        assert_eq!(check_grant(&old, owner_key, "m1", viewer_key, &TERMS), Ok(()));
+        assert_eq!(check_grant(&old, owner_key, "m1", viewer_key, &analytics), Err(Mismatch::Field("analytics")));
+        // Terms that don't match what's signed, either way.
+        assert_eq!(check_grant(&with("1"), owner_key, "m1", viewer_key, &TERMS), Err(Mismatch::Field("analytics")));
+        assert_eq!(check_grant(&with("0"), owner_key, "m1", viewer_key, &analytics), Err(Mismatch::Field("analytics")));
+        assert_eq!(check_grant(&with("yes"), owner_key, "m1", viewer_key, &analytics), Err(Mismatch::Field("analytics")));
     }
 
     #[test]

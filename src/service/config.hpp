@@ -73,12 +73,25 @@ struct UpdateConfig {
     std::string channel;
 };
 
+// [[metrics]]: the machine samples its own health (CPU, memory, disks,
+// network, GPU) and keeps the history here, never on the relay; viewers
+// the owner allowed analytics read it over the end-to-end encrypted
+// channel. On by default: nothing leaves the machine unless asked for.
+inline constexpr std::uint32_t default_metrics_history_days = 7;
+inline constexpr std::uint32_t max_metrics_history_days = 90;
+
+struct MetricsConfig {
+    bool          enabled = true;
+    std::uint32_t history_days = default_metrics_history_days;
+};
+
 struct MachineConfig {
     ClipboardConfig clipboard;
     FilesConfig     files;
     ShellConfig     shell;
     RelayConfig     relay;
     UpdateConfig    update;
+    MetricsConfig   metrics;
 };
 
 // The config, with defaults for what it leaves out (or for a missing file).

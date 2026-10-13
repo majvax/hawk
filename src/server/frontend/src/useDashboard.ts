@@ -13,6 +13,7 @@ import {
   type Transfer,
 } from "./fileTransfers.js";
 import { type OutputSink, type ShellInfo, ShellManager, type ShellSender } from "./shellSessions.js";
+import { EMPTY_METRICS, MetricsManager, type MetricsRange, type MetricsSender, type MetricsState } from "./metrics.js";
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
 import type {
@@ -158,6 +159,13 @@ export interface ShellsState {
 
 const NO_SHELLS: ShellsState = { enabled: false, shells: [] };
 
+export interface MetricsActions {
+  // A tab showing live numbers opened (true) or closed (false).
+  watch: (on: boolean) => void;
+  history: (range: MetricsRange) => void;
+  processes: () => void;
+}
+
 export interface ShellActions {
   // Returns the new shell's id, or null when there's no view to open it on.
   open: (cols: number, rows: number) => string | null;
@@ -201,6 +209,9 @@ export interface Dashboard {
   fileActions: FileActions;
   shells: ShellsState;
   shellActions: ShellActions;
+  // The open view's machine analytics, when this viewer may read them.
+  metrics: MetricsState;
+  metricsActions: MetricsActions;
   // Owned machines whose enrollment this browser checked: "mismatch" means
   // the key the machine answered with isn't bound to the code made here.
   enrollmentChecks: Record<string, EnrollmentCheck>;
@@ -257,6 +268,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const shellsEnabledRef = useRef(false);
   const shellManagerRef = useRef<ShellManager | null>(null);
   const shellChainRef = useRef<Promise<void>>(Promise.resolve());
+  const [metrics, setMetrics] = useState<MetricsState>(EMPTY_METRICS);
+  const metricsManagerRef = useRef<MetricsManager | null>(null);
+  const metricsChainRef = useRef<Promise<void>>(Promise.resolve());
   const publishShells = useRef((): void => {
     const manager = shellManagerRef.current;
     setShells(manager === null ? NO_SHELLS : { enabled: shellsEnabledRef.current, shells: manager.snapshot() });
@@ -551,6 +565,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       shellManagerRef.current = deviceId === null ? null : new ShellManager(publishShells);
       shellsEnabledRef.current = false;
       publishShells();
+      metricsManagerRef.current?.close();
+      metricsManagerRef.current = deviceId === null ? null : new MetricsManager(setMetrics);
+      setMetrics(EMPTY_METRICS);
     },
     [publishFiles, publishShells],
   );
@@ -568,6 +585,24 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
             if (sessionRef.current === session) send({ type: "shell", deviceId, sealed: payload });
           })
           .catch((error: unknown) => console.error("sealing shell message:", error));
+        return true;
+      },
+    [send],
+  );
+
+  // The same for metrics requests.
+  const metricsSender = useCallback(
+    (session: ViewSession, deviceId: string): MetricsSender =>
+      (op, header) => {
+        if (sessionRef.current !== session) return false;
+        const sealed = session.sealMetrics(op, header);
+        if (sealed === null) return false;
+        inputChainRef.current = inputChainRef.current
+          .then(() => sealed)
+          .then((payload) => {
+            if (sessionRef.current === session) send({ type: "metrics", deviceId, sealed: payload });
+          })
+          .catch((error: unknown) => console.error("sealing metrics request:", error));
         return true;
       },
     [send],
@@ -660,6 +695,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
                 shellManagerRef.current?.attach(
                   payload.shell === true ? shellSender(session, payload.deviceId) : null,
                 );
+                metricsManagerRef.current?.attach(
+                  payload.analytics === true ? metricsSender(session, payload.deviceId) : null,
+                );
               }
             },
             (error: unknown) => {
@@ -720,6 +758,18 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
             .catch((error: unknown) => console.error("shell message:", error));
           break;
         }
+        case "metrics": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          metricsChainRef.current = metricsChainRef.current
+            .then(() => session.openMetrics(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              metricsManagerRef.current?.handle(opened.op, opened.header, opened.data);
+            })
+            .catch((error: unknown) => console.error("metrics message:", error));
+          break;
+        }
         case "elevation":
           if (viewing !== payload.deviceId) break;
           setElevated(payload.elevated);
@@ -738,7 +788,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
           break;
       }
     },
-    [clearView, fileSender, requestStream, send, shellSender, teardownDecoder],
+    [clearView, fileSender, metricsSender, requestStream, send, shellSender, teardownDecoder],
   );
 
   // Owned machines not vouched for yet: if this browser made the code a
@@ -972,6 +1022,12 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     setSink: (id, sink) => shellManagerRef.current?.setSink(id, sink),
   }).current;
 
+  const metricsActions = useRef<MetricsActions>({
+    watch: (on) => metricsManagerRef.current?.watch(on),
+    history: (range) => metricsManagerRef.current?.requestHistory(range),
+    processes: () => metricsManagerRef.current?.requestProcesses(),
+  }).current;
+
   const stopView = useCallback((): void => {
     if (viewingRef.current === null) return;
     if (streamingRef.current !== null) send({ type: "stop_view", deviceId: streamingRef.current });
@@ -1006,6 +1062,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     fileActions,
     shells,
     shellActions,
+    metrics,
+    metricsActions,
     enrollmentChecks,
     elevated,
     elevate,

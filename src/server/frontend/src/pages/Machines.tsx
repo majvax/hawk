@@ -23,6 +23,7 @@ import { Alert, CodeBlock, CopyButton, Corners, Dot, Metric, Tag, errorMessage, 
 import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
 import { useStepUp } from "../stepUp.js";
+import { AnalyticsPanel, ProcessesPanel } from "./AnalyticsPanel.js";
 import { FilesPanel } from "./FilesPanel.js";
 import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
 
@@ -82,13 +83,13 @@ export function MachinesPage({
 
   const selected = machines.find((machine) => machine.id === selectedId) ?? null;
   const viewing = machines.find((machine) => machine.id === viewingId) ?? null;
-  const tabs = selected === null ? [] : tabsFor(selected.role);
+  const tabs = selected === null ? [] : tabsFor(selected);
   const detailTab = tabs.some(([id]) => id === tab) ? tab : (tabs[0]?.[0] ?? "screen");
 
   const select = (id: string | null): void => {
     if (id !== selectedId) {
       const machine = machines.find((candidate) => candidate.id === id);
-      setTab(machine === undefined ? "screen" : (tabsFor(machine.role)[0]?.[0] ?? "screen"));
+      setTab(machine === undefined ? "screen" : (tabsFor(machine)[0]?.[0] ?? "screen"));
     }
     setSelectedId(id);
   };
@@ -223,6 +224,15 @@ export function MachinesPage({
                   <FilesPanel files={dashboard.files} actions={dashboard.fileActions} connected={connected} />
                 )}
               </ToolTab>
+            )}
+            {(detailTab === "analytics" || detailTab === "processes") && (
+              <AnalyticsTab dashboard={dashboard} machine={selected} viewing={viewing} onConnect={connect}>
+                {detailTab === "analytics" ? (
+                  <AnalyticsPanel metrics={dashboard.metrics} actions={dashboard.metricsActions} />
+                ) : (
+                  <ProcessesPanel metrics={dashboard.metrics} actions={dashboard.metricsActions} />
+                )}
+              </AnalyticsTab>
             )}
             {detailTab === "sharing" && <SharingPanel key={selected.id} machine={selected} identity={identity} />}
             {detailTab === "machine" && (
@@ -981,15 +991,18 @@ function Viewer({
   );
 }
 
-type DetailTab = "screen" | "terminal" | "files" | "sharing" | "machine";
+type DetailTab = "screen" | "terminal" | "files" | "analytics" | "processes" | "sharing" | "machine";
 
-// The tabs a role gets: only what it can use. A dev share has no screen, so
-// it starts on the terminal.
-function tabsFor(role: Role): [DetailTab, string][] {
+// The tabs a machine's user gets: only what they can use. A dev share has
+// no screen, so it starts on the terminal; analytics is the owner's, or a
+// share's the owner allowed it for.
+function tabsFor(machine: Machine): [DetailTab, string][] {
+  const { role } = machine;
   const tabs: [DetailTab, string][] = [];
   if (canView(role)) tabs.push(["screen", "Screen"]);
   if (canShell(role)) tabs.push(["terminal", "Terminal"]);
   if (canFiles(role)) tabs.push(["files", "Files"]);
+  if (role === "owner" || machine.analytics === true) tabs.push(["analytics", "Analytics"], ["processes", "Processes"]);
   if (role === "owner") tabs.push(["sharing", "Sharing"], ["machine", "Machine"]);
   return tabs;
 }
@@ -1102,6 +1115,36 @@ function ToolTab({
         <StepUpNeeded dashboard={dashboard} what="Transferring files" />
       )}
       {(connected || hasTransfers) && children(connected)}
+    </div>
+  );
+}
+
+// The Analytics and Processes tabs: over the view, like files, but
+// read-only, so no second factor is asked for.
+function AnalyticsTab({
+  dashboard,
+  machine,
+  viewing,
+  onConnect,
+  children,
+}: {
+  dashboard: Dashboard;
+  machine: Machine;
+  viewing: Machine | null;
+  onConnect: (machine: Machine) => void;
+  children: ReactNode;
+}): JSX.Element {
+  const secured = isSecured(dashboard, machine, viewing);
+  return (
+    <div className="tool-wrap">
+      {!secured && <NotConnected dashboard={dashboard} machine={machine} viewing={viewing} onConnect={onConnect} />}
+      {secured && !dashboard.metrics.enabled && (
+        <div className="empty">
+          This machine doesn't share its analytics with you: its config has them off, or your share doesn't include
+          them.
+        </div>
+      )}
+      {secured && dashboard.metrics.enabled && children}
     </div>
   );
 }

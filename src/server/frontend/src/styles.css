@@ -19,6 +19,7 @@
   --accent: #00d5df;
   --on-accent: #08090a; /* text on an accent fill */
   --accent-hover: color-mix(in srgb, var(--accent) 72%, #fff);
+  --accent-2: #a78bfa; /* a second series beside the accent in charts */
   --ok: #10b981;
   --warn: #f59e0b;
   --err: #ef4444;
@@ -2341,4 +2342,245 @@ a.btn {
 .enroll-values dd {
   margin: 0;
   min-width: 0;
+}
+
+/* --- Analytics ------------------------------------------------------------ */
+
+/* minmax(0, 1fr): the column may be narrower than what's in it (a long OS
+   name), which then truncates instead of widening the page. */
+.analytics {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+  min-width: 0;
+}
+
+.analytics-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.analytics-strip {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.analytics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
+  gap: 14px;
+}
+
+.metric-card {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  min-width: 0;
+  padding: 12px 14px 14px;
+  background: var(--rail);
+  border: 1px solid var(--line);
+}
+
+.metric-card header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: 2px 12px;
+  min-width: 0;
+}
+
+.metric-card-value {
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+}
+
+.metric-card-sub {
+  grid-column: 1 / -1;
+  font-size: 12px;
+}
+
+/* The SVG is drawn at the width measured here, so it's kept out of the
+   layout: otherwise it would hold the card at its first width. */
+.chart {
+  position: relative;
+  min-width: 0;
+  height: 132px;
+  touch-action: pan-y;
+}
+
+.chart svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  overflow: visible;
+}
+
+.chart-grid {
+  stroke: var(--line);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.chart-axis {
+  fill: var(--fg-3);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.chart-cursor {
+  stroke: var(--line-strong);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.chart-tip {
+  position: absolute;
+  top: 4px;
+  display: grid;
+  gap: 3px;
+  padding: 6px 8px;
+  background: var(--raise);
+  border: 1px solid var(--line-strong);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.chart-tip i,
+.legend i {
+  display: inline-block;
+  width: 8px;
+  height: 2px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.chart-tip b {
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 11px;
+  color: var(--fg-2);
+}
+
+/* Load per logical processor: one thin column each. */
+.cores {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(6px, 1fr));
+  gap: 2px;
+  height: 26px;
+}
+
+.cores > span {
+  position: relative;
+  background: var(--void);
+}
+
+.cores i {
+  position: absolute;
+  inset: auto 0 0;
+  background: var(--accent);
+  opacity: 0.85;
+  transition: height 0.4s ease;
+}
+
+.usage {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.usage-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.usage-track {
+  height: 4px;
+  background: var(--void);
+}
+
+.usage-track > span {
+  display: block;
+  height: 100%;
+  background: var(--tone, var(--accent));
+  transition: width 0.4s ease;
+}
+
+/* --- Processes ------------------------------------------------------------ */
+
+.processes {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+.processes-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.processes-head .input {
+  flex: 1;
+  min-width: 200px;
+  max-width: 360px;
+}
+
+.processes-table td {
+  height: 30px;
+}
+
+.processes-table td:first-child {
+  max-width: 280px;
+}
+
+.th-sort {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.th-sort:hover {
+  color: var(--fg);
+}
+
+/* A number with its share underlined, growing from the right edge. */
+.cell-bar {
+  display: inline-block;
+  min-width: 72px;
+  padding-bottom: 3px;
+  text-align: right;
+  background: linear-gradient(to left, var(--accent) var(--fill), var(--line) var(--fill)) bottom / 100% 2px
+    no-repeat;
+}
+
+@media (max-width: 640px) {
+  .hide-narrow {
+    display: none;
+  }
+
+  .metric-card-value {
+    font-size: 18px;
+  }
 }

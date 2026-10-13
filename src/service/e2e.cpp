@@ -40,6 +40,7 @@ constexpr std::string_view kInputAad = "hawk-input-v1";
 constexpr std::string_view kClipboardAad = "hawk-clipboard-v1";
 constexpr std::string_view kFileAad = "hawk-file-v1";
 constexpr std::string_view kShellAad = "hawk-shell-v1";
+constexpr std::string_view kMetricsAad = "hawk-metrics-v1";
 // A file- or shell-channel plaintext: op, header length (u16, big-endian),
 // the JSON header, then bytes.
 constexpr std::size_t kChannelPreamble = 3;
@@ -259,6 +260,8 @@ struct AcceptMessage {
     std::string clipboard;
     // Whether this viewer may send and fetch files. Likewise only a hint.
     bool files = false;
+    // Whether it may read the machine's analytics. Likewise.
+    bool analytics = false;
     // Whether it may open shells. Likewise.
     bool shell = false;
 };
@@ -304,7 +307,7 @@ struct glz::meta<hawk::service::AcceptMessage> {
     using T                     = hawk::service::AcceptMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "statement", &T::statement,
                                          "signature", &T::signature, "wrapped_key", &T::wrapped_key, "clipboard", &T::clipboard,
-                                         "files", &T::files, "shell", &T::shell);
+                                         "files", &T::files, "shell", &T::shell, "analytics", &T::analytics);
 };
 
 template <>
@@ -524,6 +527,11 @@ struct Viewer {
     // And shell output, likewise queued with file data.
     crypto::AesGcm               shell_key;
     std::uint64_t                shell_counter = 0;
+    // And metrics, likewise.
+    crypto::AesGcm               metrics_key;
+    std::uint64_t                metrics_counter = 0;
+    // Whether the owner's grant allows analytics (always, for the owner).
+    bool                         analytics = false;
     // Shared by input and clipboard requests, which the dashboard numbers
     // from one counter.
     std::uint64_t                last_counter = 0;
@@ -541,6 +549,7 @@ struct Viewer {
 // What a grant lets a viewer do, once its signature and terms checked out.
 struct Admission {
     std::string                 role;
+    bool                        analytics = false;
     std::int64_t                grant_issued = 0;
     std::optional<std::int64_t> not_after;
     std::optional<std::string>  single_view_grant;
@@ -601,6 +610,7 @@ struct ViewerHub::Impl {
     ClipboardConfig              clipboard;
     bool                         files_enabled = false;
     bool                         shell_enabled = false;
+    bool                         metrics_enabled = false;
     Sender                       send;
     // Held from sealing a shell message to sending it: several threads send
     // them (one per shell, and the worker), and each viewer's counter only
@@ -623,6 +633,7 @@ struct ViewerHub::Impl {
           clipboard(config.clipboard),
           files_enabled(config.files.enabled),
           shell_enabled(config.shell.enabled),
+          metrics_enabled(config.metrics.enabled),
           send(std::move(sender)) {}
 
     // What each role may do. Not a ladder: dev has a shell and files but
@@ -642,6 +653,11 @@ struct ViewerHub::Impl {
 
     [[nodiscard]] bool may_use_shell(const Viewer& viewer) const {
         return shell_enabled && !viewer.refused && (viewer.role == "owner" || viewer.role == "dev");
+    }
+
+    // Read-only, and only what the owner allowed: not part of any role.
+    [[nodiscard]] bool may_use_metrics(const Viewer& viewer) const {
+        return metrics_enabled && !viewer.refused && viewer.analytics;
     }
 
     [[nodiscard]] bool may_set_clipboard(const Viewer& viewer) const {
@@ -790,7 +806,7 @@ struct ViewerHub::Impl {
     [[nodiscard]] std::expected<Admission, std::string> admit(const std::string& viewer_key,
                                                               const std::optional<SignedStatement>& grant) {
         if (viewer_key == owner_key_text) {
-            return Admission{.role = "owner"};
+            return Admission{.role = "owner", .analytics = true};
         }
         if (!grant.has_value()) {
             return std::unexpected("the owner hasn't signed a grant for this account");
@@ -799,9 +815,15 @@ struct ViewerHub::Impl {
             return std::unexpected("the grant isn't signed by the owner");
         }
         const auto fields = parse_statement(grant->statement, kGrantContext);
-        if (!fields.has_value() || fields->size() != 7 || field(*fields, "machine") != machine_id ||
-            field(*fields, "viewer") != viewer_key) {
+        // Seven fields, or eight with analytics: grants signed before it
+        // existed still work, and allow none.
+        if (!fields.has_value() || (fields->size() != 7 && fields->size() != 8) ||
+            field(*fields, "machine") != machine_id || field(*fields, "viewer") != viewer_key) {
             return std::unexpected("the grant is for someone or something else");
+        }
+        const auto analytics = field(*fields, "analytics");
+        if (fields->size() == 8 && analytics != "0" && analytics != "1") {
+            return std::unexpected("the grant is malformed");
         }
         const auto role = std::string(field(*fields, "role"));
         const auto issued = parse_int(field(*fields, "issued"));
@@ -848,8 +870,11 @@ struct ViewerHub::Impl {
             state.latest_grant[viewer_key] = *issued;
             state.save();
         }
-        return Admission{
-            .role = role, .grant_issued = *issued, .not_after = not_after, .single_view_grant = std::move(single_view)};
+        return Admission{.role = role,
+                         .analytics = analytics == "1",
+                         .grant_issued = *issued,
+                         .not_after = not_after,
+                         .single_view_grant = std::move(single_view)};
     }
 };
 
@@ -899,18 +924,19 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     const auto join_hash = crypto::sha256(crypto::as_bytes(request.statement));
     // HKDF output is a prefix of any longer output: the first 64 bytes are
     // the input and wrap keys whatever length is asked for.
-    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 160);
+    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 192);
     auto input_key = crypto::AesGcm::create(std::span(keys).first(32));
     auto wrap_key = crypto::AesGcm::create(std::span(keys).subspan(32, 32));
     auto reply_key = crypto::AesGcm::create(std::span(keys).subspan(64, 32));
     auto file_key = crypto::AesGcm::create(std::span(keys).subspan(96, 32));
     auto shell_key = crypto::AesGcm::create(std::span(keys).subspan(128, 32));
+    auto metrics_key = crypto::AesGcm::create(std::span(keys).subspan(160, 32));
     const auto accept = std::format("{}\nmachine={}\njoin={}\nephemeral={}\nrole={}", kAcceptContext, impl.machine_id,
                                     crypto::base64_encode(join_hash), crypto::base64_encode(exchange->public_key()),
                                     admission->role);
     const auto signature = impl.machine_key.sign(crypto::as_bytes(accept));
     if (!input_key.has_value() || !wrap_key.has_value() || !reply_key.has_value() || !file_key.has_value() ||
-        !shell_key.has_value() || !signature.has_value()) {
+        !shell_key.has_value() || !metrics_key.has_value() || !signature.has_value()) {
         impl.reject(viewer, "the machine couldn't sign its answer");
         return;
     }
@@ -925,6 +951,8 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
         .reply_key = std::move(*reply_key),
         .file_key = std::move(*file_key),
         .shell_key = std::move(*shell_key),
+        .metrics_key = std::move(*metrics_key),
+        .analytics = admission->analytics,
         .grant_issued = admission->grant_issued,
         .not_after = admission->not_after,
         .single_view_grant = admission->single_view_grant,
@@ -941,6 +969,7 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     auto       clipboard = impl.clipboard_access(session);
     const bool files = impl.may_use_files(session);
     const bool shell = impl.may_use_shell(session);
+    const bool analytics = impl.may_use_metrics(session);
     spdlog::info("e2e: viewer {} ({}) admitted as {}", viewer, session.fingerprint, admission->role);
     impl.viewers.insert_or_assign(viewer, std::move(session));
     impl.send(to_json(AcceptMessage{.viewer = viewer,
@@ -949,6 +978,7 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
                                     .wrapped_key = wrapped,
                                     .clipboard = std::move(clipboard),
                                     .files = files,
+                                    .analytics = analytics,
                                     .shell = shell}));
 }
 
@@ -1133,6 +1163,37 @@ bool ViewerHub::send_shell(std::uint64_t viewer, const ChannelMessage& message) 
     Viewer&    session = found->second;
     const auto json = Impl::seal_channel(viewer, "shell", session.shell_key, session.shell_counter, kShellAad, message);
     // Outside the main lock, as with files; still inside the ordering one.
+    lock.unlock();
+    impl.send(json);
+    return true;
+}
+
+std::optional<ChannelMessage> ViewerHub::metrics(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !impl.may_use_metrics(found->second)) {
+        return std::nullopt;
+    }
+    const auto plain = Impl::open_request(found->second, sealed, kMetricsAad);
+    return plain.has_value() ? Impl::parse_channel(*plain) : std::nullopt;
+}
+
+bool ViewerHub::send_metrics(std::uint64_t viewer, const ChannelMessage& message) {
+    if (message.header.size() > 0xFFFFU) {
+        return false;
+    }
+    auto&            impl = *impl_;
+    std::unique_lock lock(impl.mutex);
+    const auto       found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !impl.may_use_metrics(found->second)) {
+        return false;
+    }
+    Viewer&    session = found->second;
+    const auto json =
+        Impl::seal_channel(viewer, "metrics", session.metrics_key, session.metrics_counter, kMetricsAad, message);
+    // Outside the lock, as with files: only MetricsChannel's one thread
+    // sends these, so they stay in order.
     lock.unlock();
     impl.send(json);
     return true;

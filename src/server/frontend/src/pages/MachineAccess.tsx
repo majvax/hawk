@@ -111,6 +111,7 @@ export function SharingPanel({ machine, identity }: { machine: Machine; identity
   const [startLater, setStartLater] = useState(false);
   const [startAt, setStartAt] = useState("");
   const [singleView, setSingleView] = useState(false);
+  const [analytics, setAnalytics] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [keyChange, setKeyChange] = useState<KeyChange | null>(null);
   // Shares from before grants, signed once per panel when the key allows.
@@ -149,6 +150,7 @@ export function SharingPanel({ machine, identity }: { machine: Machine; identity
     startsAt: share.startsAt,
     expiresAt: share.expiresAt,
     singleView: share.singleView,
+    analytics: share.analytics,
   });
 
   // Same person, new terms: a new grant, newer than the one it replaces.
@@ -192,7 +194,7 @@ export function SharingPanel({ machine, identity }: { machine: Machine; identity
       return;
     }
     const existing = shares?.find((share) => share.email === email.trim().toLowerCase())?.grant ?? null;
-    const next = { role, startsAt, expiresAt, singleView };
+    const next = { role, startsAt, expiresAt, singleView, analytics };
     if (await run(() => signShare(identity, machine.id, email, next, existing))) setEmail("");
   };
 
@@ -243,13 +245,14 @@ export function SharingPanel({ machine, identity }: { machine: Machine; identity
                 <th>Key</th>
                 <th>Access</th>
                 <th>Window</th>
+                <th>Extras</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {shares !== null && shares.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="muted">
+                  <td colSpan={6} className="muted">
                     Only you. Share it below.
                   </td>
                 </tr>
@@ -275,6 +278,16 @@ export function SharingPanel({ machine, identity }: { machine: Machine; identity
                     />
                   </td>
                   <td className="num muted">{describeShareTerms(share) || "until revoked"}</td>
+                  <td>
+                    <label className="check" title="Health and processes">
+                      <input
+                        type="checkbox"
+                        checked={share.analytics}
+                        onChange={() => void reshare(share, { ...terms(share), analytics: !share.analytics })}
+                      />
+                      Analytics
+                    </label>
+                  </td>
                   <td className="actions">
                     {share.expiresAt !== null && (
                       <button type="button" className="btn btn-sm" onClick={() => void extend(share)}>
@@ -356,6 +369,10 @@ export function SharingPanel({ machine, identity }: { machine: Machine; identity
             <input type="checkbox" checked={singleView} onChange={(e) => setSingleView(e.target.checked)} />
             One viewing only
           </label>
+          <label className="check" title="CPU, memory, disks, network, GPU and the process list">
+            <input type="checkbox" checked={analytics} onChange={(e) => setAnalytics(e.target.checked)} />
+            Analytics
+          </label>
           <button type="submit" className="btn btn-primary" style={{ marginLeft: 8 }}>
             Share
           </button>
@@ -363,7 +380,7 @@ export function SharingPanel({ machine, identity }: { machine: Machine; identity
         <p className="prose" style={{ fontSize: 12 }}>
           They need an account on this server first. View only can watch the screen but never send input. A
           temporary share is revoked when it runs out, cutting off a live view; one viewing only ends the share once
-          they stop watching. Sharing again with the same person replaces the terms. Your browser signs each share,
+          they stop watching. Analytics lets them see the machine's health and its processes. Sharing again with the same person replaces the terms. Your browser signs each share,
           and the machine checks the signature itself.
         </p>
       </form>

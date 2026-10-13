@@ -129,6 +129,11 @@ public:
     [[nodiscard]] std::optional<ChannelMessage> shell(std::uint64_t viewer, std::string_view sealed);
     bool send_shell(std::uint64_t viewer, const ChannelMessage& message);
 
+    // The same for the metrics channel (metrics.hpp): the owner, and viewers
+    // whose grant says analytics=1, while the config has metrics on.
+    [[nodiscard]] std::optional<ChannelMessage> metrics(std::uint64_t viewer, std::string_view sealed);
+    bool send_metrics(std::uint64_t viewer, const ChannelMessage& message);
+
     // "AB12 CD34 ..." for the viewer's identity key, for the log; empty
     // for a viewer that isn't here.
     [[nodiscard]] std::string fingerprint_of(std::uint64_t viewer);

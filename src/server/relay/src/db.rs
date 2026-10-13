@@ -179,6 +179,10 @@ const MIGRATIONS: &[&str] = &["
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+", "
+    -- Analytics: whether the owner let this share read the machine's
+    -- health and processes. Part of the signed grant; the machine checks it.
+    ALTER TABLE machine_shares ADD COLUMN analytics INTEGER NOT NULL DEFAULT 0;
 "];
 
 #[derive(Clone)]
@@ -943,6 +947,8 @@ pub struct MachineRow {
     pub share_expires_at: Option<i64>,
     /// A share that one viewing uses up.
     pub single_view: bool,
+    /// May read the machine's analytics: always for the owner.
+    pub analytics: bool,
     /// The machine's key; None for a machine that must be re-enrolled.
     pub public_key: Option<Vec<u8>>,
     pub owner_public_key: Option<Vec<u8>>,
@@ -988,6 +994,8 @@ pub struct ShareTerms {
     pub expires_at: Option<i64>,
     /// Used up when the viewer's first viewing ends.
     pub single_view: bool,
+    /// May read the machine's analytics (health, processes).
+    pub analytics: bool,
 }
 
 /// A share as a (machine, user) pair, for mirroring into the registry.
@@ -1154,6 +1162,7 @@ fn machine_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRow> {
         enroll_code_hash: row.get(13)?,
         enroll_binding: row.get(14)?,
         grant: signed_from(row.get(15)?, row.get(16)?),
+        analytics: row.get(17)?,
     })
 }
 
@@ -1163,13 +1172,13 @@ fn machine_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineRow> {
 pub fn accessible_machines(conn: &Connection, user_id: i64, now: i64) -> rusqlite::Result<Vec<MachineRow>> {
     let mut statement = conn.prepare(
         "SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, 'owner',
-                NULL, 0, m.public_key, o.public_key, m.endorsement, m.enroll_code_hash, m.enroll_binding, NULL, NULL
+                NULL, 0, m.public_key, o.public_key, m.endorsement, m.enroll_code_hash, m.enroll_binding, NULL, NULL, 1
            FROM machines m JOIN users o ON o.id = m.owner_id
           WHERE m.owner_id = ?1
          UNION ALL
          SELECT m.public_id, m.owner_id, o.email, m.name, m.hostname, m.last_seen_at, m.key_storage, s.role,
                 s.expires_at, s.single_view, m.public_key, o.public_key, m.endorsement, NULL, NULL,
-                s.grant_statement, s.grant_signature
+                s.grant_statement, s.grant_signature, s.analytics
            FROM machine_shares s
            JOIN machines m ON m.id = s.machine_id
            JOIN users o ON o.id = m.owner_id
@@ -1232,7 +1241,7 @@ pub fn list_shares(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlit
     let Some(machine_id) = owned_machine_id(conn, public_id, owner_id)? else { return Ok(None) };
     let mut statement = conn.prepare(
         "SELECT u.id, u.email, s.role, s.starts_at, s.expires_at, s.single_view, u.public_key,
-                s.grant_statement, s.grant_signature
+                s.grant_statement, s.grant_signature, s.analytics
            FROM machine_shares s JOIN users u ON u.id = s.user_id
           WHERE s.machine_id = ?1 ORDER BY u.email",
     )?;
@@ -1246,6 +1255,7 @@ pub fn list_shares(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlit
                     starts_at: row.get(3)?,
                     expires_at: row.get(4)?,
                     single_view: row.get(5)?,
+                    analytics: row.get(9)?,
                 },
                 public_key: row.get(6)?,
                 grant: signed_from(row.get(7)?, row.get(8)?),
@@ -1284,12 +1294,14 @@ pub fn upsert_share(
     }
     conn.execute(
         "INSERT INTO machine_shares
-             (machine_id, user_id, role, created_at, starts_at, expires_at, single_view, grant_statement, grant_signature)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             (machine_id, user_id, role, created_at, starts_at, expires_at, single_view, grant_statement, grant_signature,
+              analytics)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT (machine_id, user_id) DO UPDATE SET
              role = excluded.role, starts_at = excluded.starts_at,
              expires_at = excluded.expires_at, single_view = excluded.single_view,
-             grant_statement = excluded.grant_statement, grant_signature = excluded.grant_signature",
+             grant_statement = excluded.grant_statement, grant_signature = excluded.grant_signature,
+             analytics = excluded.analytics",
         params![
             machine_id,
             user_id,
@@ -1299,7 +1311,8 @@ pub fn upsert_share(
             terms.expires_at,
             terms.single_view,
             grant.statement,
-            grant.signature
+            grant.signature,
+            terms.analytics
         ],
     )?;
     Ok(())
@@ -1454,7 +1467,8 @@ mod tests {
     #[test]
     fn mfa_migration_and_replay() {
         let conn = Connection::open_in_memory().unwrap();
-        let before = MIGRATIONS.len() - 1;
+        // Up to just before the two-factor migration, whichever came after.
+        let before = MIGRATIONS.iter().position(|migration| migration.contains("CREATE TABLE settings")).unwrap();
         for migration in &MIGRATIONS[..before] {
             conn.execute_batch(migration).unwrap();
         }

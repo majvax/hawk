@@ -6,6 +6,7 @@
 #include "shell.hpp"
 #include "machine_identity.hpp"
 #include "machine_key.hpp"
+#include "metrics.hpp"
 #include "updater.hpp"
 #include "websocket/websocket.hpp"
 
@@ -51,7 +52,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 1;
+constexpr std::uint32_t kProtocolVersion = 2;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -104,7 +105,7 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
@@ -428,6 +429,8 @@ struct Connection {
     std::unique_ptr<svc::ViewerHub>&     hub;
     std::unique_ptr<svc::FileTransfers>& files;
     std::unique_ptr<svc::ShellSessions>& shells;
+    std::unique_ptr<svc::MetricsChannel>& metrics;
+    svc::MetricsRecorder*                recorder;  // null with [[metrics]] off
     const svc::MachineConfig&            config;
     svc::Updater&                        updater;
 };
@@ -458,6 +461,9 @@ void OpenViewerHub(Connection& connection) {
     if (connection.config.shell.enabled) {
         connection.shells = std::make_unique<svc::ShellSessions>(connection.config.shell, *connection.hub);
     }
+    if (connection.recorder != nullptr) {
+        connection.metrics = std::make_unique<svc::MetricsChannel>(*connection.recorder, *connection.hub);
+    }
 }
 
 void HandleRelayCommand(std::string_view text, Connection& connection) {
@@ -466,7 +472,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
-    auto& [client, capture, session, hub, files, shells, config, updater] = connection;
+    auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -503,6 +509,9 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         if (shells != nullptr) {
             shells->drop_viewer(command.viewer);
         }
+        if (metrics != nullptr) {
+            metrics->drop_viewer(command.viewer);
+        }
     } else if (command.type == "input") {
         if (const auto packet = hub->input(command.viewer, command.sealed); packet.has_value()) {
             ForwardInput(capture, *packet);
@@ -523,6 +532,10 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
     } else if (command.type == "shell") {
         if (auto message = hub->shell(command.viewer, command.sealed); message.has_value() && shells != nullptr) {
             shells->handle(command.viewer, std::move(*message));
+        }
+    } else if (command.type == "metrics") {
+        if (auto message = hub->metrics(command.viewer, command.sealed); message.has_value() && metrics != nullptr) {
+            metrics->handle(command.viewer, std::move(*message));
         }
     } else if (command.type == "revocations") {
         hub->apply_revocations(command.revocations);
@@ -572,6 +585,10 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
     // Declared after `client` so it's destroyed (stopped) first: its reader
     // thread sends through `client`.
     svc::CaptureHost capture;
+    // Samples for as long as the service runs, connected or not, so the
+    // history has no hole where the relay was unreachable.
+    const auto recorder =
+        config.metrics.enabled ? std::make_unique<svc::MetricsRecorder>(config.metrics) : nullptr;
 
     const std::string& relay_url = config.relay.url;
     if (relay_url.empty()) {
@@ -638,12 +655,15 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         std::unique_ptr<svc::ViewerHub>     hub;
         std::unique_ptr<svc::FileTransfers> files;
         std::unique_ptr<svc::ShellSessions> shells;
+        std::unique_ptr<svc::MetricsChannel> metrics;
         Connection                          connection{.client = client,
                                                        .capture = capture,
                                                        .session = *session,
                                                        .hub = hub,
                                                        .files = files,
                                                        .shells = shells,
+                                                       .metrics = metrics,
+                                                       .recorder = recorder.get(),
                                                        .config = config,
                                                        .updater = updater};
         OpenViewerHub(connection);
@@ -673,6 +693,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         capture.stop();
         files.reset();  // these answer through the hub
         shells.reset();
+        metrics.reset();
         hub.reset();
         active_client.store(nullptr);
         client.close();

@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -50,6 +50,9 @@ export interface Machine {
   keyStorage: "tpm" | "software" | null; // null: must be re-enrolled
   accessExpiresAt: number | null; // unix seconds; when a temporary share ends
   singleView: boolean; // the share is used up by one viewing
+  // May read the machine's analytics: always for the owner, for a share
+  // only if its owner allowed it. The machine checks the signed grant.
+  analytics?: boolean;
   viewers: string[] | null; // who's watching; owner only
   // Base64 keys: the machine's and its owner's identity key; null for a
   // machine that must be re-enrolled.
@@ -87,6 +90,8 @@ export type DashboardEvent =
       files?: boolean;
       // Whether it may open shells.
       shell?: boolean;
+      // Whether it may read the machine's analytics.
+      analytics?: boolean;
     }
   | { type: "view_rejected"; deviceId: string; reason: string }
   // Whether the relay passes on this view's input, files and shells. False
@@ -98,7 +103,9 @@ export type DashboardEvent =
   // A file-channel message the machine sealed for this viewer (ViewSession.openFile).
   | { type: "file"; deviceId: string; sealed: string }
   // A shell-channel message the machine sealed for this viewer (ViewSession.openShell).
-  | { type: "shell"; deviceId: string; sealed: string };
+  | { type: "shell"; deviceId: string; sealed: string }
+  // A metrics-channel message the machine sealed for this viewer (ViewSession.openMetrics).
+  | { type: "metrics"; deviceId: string; sealed: string };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -133,6 +140,8 @@ export type DashboardCommand =
   | { type: "file"; deviceId: string; sealed: string }
   // A shell-channel message (ViewSession.sealShell); dev and owner.
   | { type: "shell"; deviceId: string; sealed: string }
+  // A metrics request (ViewSession.sealMetrics); owner, and shares with analytics.
+  | { type: "metrics"; deviceId: string; sealed: string }
   // Owner only: install the update the machine is holding. The machine
   // checks the release's signature itself.
   | { type: "install_update"; deviceId: string };

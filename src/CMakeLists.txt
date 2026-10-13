@@ -20,6 +20,7 @@ add_executable(hawk-service
     service/updater.cpp
     service/machine_identity.cpp
     service/machine_key.cpp
+    service/metrics.cpp
     service/websocket/websocket.cpp
     ${HAWK_VERSION_RC}
 )
@@ -46,6 +47,11 @@ target_link_libraries(hawk-service PRIVATE
     crypt32
     ncrypt
     bcrypt
+    # metrics: performance counters, network interfaces, GPUs, process memory
+    pdh
+    iphlpapi
+    dxgi
+    psapi
 )
 
 # ServiceMain's entry point is wmain(); mingw needs -municode to select the
