@@ -5,7 +5,7 @@
 
 use std::process::Command;
 
-use crate::release::{Overrides, Staging};
+use crate::release::Overrides;
 use crate::report::Report;
 
 const ARTIFACT: &str = "app-windows-x64";
@@ -23,8 +23,13 @@ pub fn installed_version() -> Option<String> {
 }
 
 pub fn install(overrides: &Overrides, report: &Report) -> Result<(), String> {
+    // Its installer is per machine, so it runs elevated.
+    if !crate::windows::is_admin() {
+        return Err("run hawk-setup as an administrator".into());
+    }
     report.step("Getting the desktop app");
-    let source = overrides.over("", "", hawk_update::Channel::Stable);
+    // No channel set: the build's own, so a release candidate finds itself.
+    let source = overrides.over("", "", hawk_update::Channel::of_this_build());
     let release = source.resolve(report)?;
     if let Some(current) = installed_version()
         && !release.manifest.is_newer_than(&current).map_err(|error| error.to_string())?
@@ -32,7 +37,7 @@ pub fn install(overrides: &Overrides, report: &Report) -> Result<(), String> {
         report.ok(format!("The app is already installed ({current})"));
         return Ok(());
     }
-    let staging = Staging::new()?;
+    let staging = crate::machine::app_staging()?;
     let setup = release.fetch(ARTIFACT, &staging.0, report)?;
     report.step(format!("Installing the app {}", release.manifest.version));
     let status = Command::new(&setup).arg("/S").status().map_err(|error| format!("running the app's installer: {error}"))?;

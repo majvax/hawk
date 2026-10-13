@@ -112,11 +112,38 @@ pub fn human_size(bytes: u64) -> String {
 pub struct Staging(pub PathBuf);
 
 impl Staging {
+    /// A new folder in the temporary folder. The relay's: on Windows,
+    /// what's checked is staged where only administrators can write.
+    #[cfg(unix)]
     pub fn new() -> Result<Self, String> {
-        let path = std::env::temp_dir().join(format!("hawk-setup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        Ok(Self(path))
+        Self::under(&std::env::temp_dir())
+    }
+
+    /// A new folder in `parent`, made by this run: never one that was
+    /// already there, which whoever made it could still write to and so swap
+    /// the checked files for others before they're installed. On Unix only
+    /// its owner may enter it.
+    pub fn under(parent: &Path) -> Result<Self, String> {
+        use std::hash::{BuildHasher, Hasher};
+
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        for _ in 0..16 {
+            // RandomState is seeded from the OS; the name only has to be
+            // hard to guess, the create failing on an existing one is what
+            // keeps it ours.
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u32(std::process::id());
+            let path = parent.join(format!("hawk-setup-{:016x}", hasher.finish()));
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        }
+        Err(format!("couldn't make a scratch folder in {}", parent.display()))
     }
 }
 
@@ -188,5 +215,22 @@ mod tests {
         std::fs::write(folder.join("hawk-machine-1.2.0-windows-x64.zip"), b"swapped zip").unwrap();
         assert!(release.fetch("machine-windows-x64", &folder.join("out2"), &report).is_err());
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Each run gets a folder of its own, made fresh and gone when done.
+    #[test]
+    fn staging_is_new_and_private() {
+        let first = Staging::under(&std::env::temp_dir()).unwrap();
+        let second = Staging::under(&std::env::temp_dir()).unwrap();
+        assert_ne!(first.0, second.0);
+        assert!(first.0.is_dir() && second.0.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&first.0).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let path = first.0.clone();
+        drop(first);
+        assert!(!path.exists());
     }
 }

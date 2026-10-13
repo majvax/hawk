@@ -1,5 +1,6 @@
 //! The machine side on Windows: hawk-service and hawk-capture as the
-//! `HawkService` service, running as LocalSystem from Program Files, with
+//! `HawkService` service, running as LocalSystem from Program Files\Hawk\Service
+//! (Program Files\Hawk itself is the desktop app's), with
 //! its settings and keys in ProgramData (readable and writable by SYSTEM and
 //! administrators only).
 
@@ -32,9 +33,46 @@ const PROGRAM_FILES: [&str; 3] = ["hawk-service.exe", "hawk-capture.exe", "hawk-
 /// The oldest Windows with what the service relies on (ConPTY): 10 1809.
 const MIN_BUILD: u32 = 17763;
 
-pub fn install_dir() -> PathBuf {
+/// Program Files\Hawk, shared with the desktop app, which installs there.
+fn hawk_dir() -> PathBuf {
     let base = std::env::var_os("ProgramFiles").map_or_else(|| PathBuf::from(r"C:\Program Files"), PathBuf::from);
     base.join("Hawk")
+}
+
+/// Where the service is: Program Files\Hawk\Service. Releases before
+/// 1.0.0-rc.6 used Program Files\Hawk itself, the app's folder too, so
+/// uninstalling the machine took the app with it; such an install stays
+/// where it is until its next install or update moves it
+/// (move_from_old_folder).
+pub fn install_dir() -> PathBuf {
+    let service = hawk_dir().join("Service");
+    if !service.join("hawk-service.exe").exists() && hawk_dir().join("hawk-service.exe").exists() {
+        return hawk_dir();
+    }
+    service
+}
+
+/// Moves an install from before 1.0.0-rc.6 into Program Files\Hawk\Service,
+/// with the service stopped; register_service then points it there. A
+/// rename, so it works on the running hawk-setup.exe too.
+fn move_from_old_folder(report: &Report) -> Result<(), String> {
+    let old = hawk_dir();
+    if install_dir() != old {
+        return Ok(());
+    }
+    let new = old.join("Service");
+    fs::create_dir_all(&new).map_err(|error| format!("{}: {error}", new.display()))?;
+    let names = PROGRAM_FILES.iter().flat_map(|name| [(*name).to_owned(), format!("{name}.old")]);
+    for name in names.chain(["install.json".to_owned()]) {
+        let from = old.join(&name);
+        if from.exists() {
+            let to = new.join(&name);
+            let _ = fs::remove_file(&to);
+            fs::rename(&from, &to).map_err(|error| format!("moving {name} to {}: {error}", new.display()))?;
+        }
+    }
+    report.detail(format!("Moved the service to {}", new.display()));
+    Ok(())
 }
 
 pub fn data_dir() -> PathBuf {
@@ -278,18 +316,95 @@ fn delete_service(report: &Report) -> Result<(), String> {
 
 // ---- files --------------------------------------------------------------------
 
+/// Makes the settings folder SYSTEM's and the administrators' alone, before
+/// anything in it is read. ProgramData lets any user of the PC make a
+/// folder there, or files in one an administrator made, so on a PC Hawk was
+/// never installed on someone could have left a config.toml naming their
+/// own update feed and signing key, or turning the shell on. Anything in it
+/// that another account owns means just that, and stops the install.
+fn secure_data_dir(report: &Report) -> Result<(), String> {
+    let dir = data_dir();
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("{}: {error}", dir.display())),
+    }
+    // The folder's owner first: it could undo the lockdown.
+    check_owner(&dir)?;
+    // What's in it before icacls goes through it: a junction left there
+    // would have icacls lock whatever folder it points to.
+    check_contents(&dir)?;
+    report.detail(format!("Restricting {} to SYSTEM and administrators", dir.display()));
+    // The folder alone, so no one else can add to it from here on...
+    lock_down(&dir, false)?;
+    // ...what's in it again, for anything added meanwhile...
+    check_contents(&dir)?;
+    // ...and then all of it.
+    lock_down(&dir, true)
+}
+
+fn check_contents(dir: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    for entry in entries {
+        let path = entry.map_err(|error| format!("{}: {error}", dir.display()))?.path();
+        if let Some(metadata) = check_owner(&path)?
+            && metadata.is_dir()
+        {
+            check_contents(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn untrusted(path: &Path) -> String {
+    format!(
+        "{} belongs to an account that isn't an administrator, or is a link, so Hawk can't trust what's in {}.          If you didn't put it there, someone else on this PC may have: delete {} and run hawk-setup again.",
+        path.display(),
+        data_dir().display(),
+        data_dir().display()
+    )
+}
+
+/// Opens the entry itself, never what a link there points to, and only
+/// when SYSTEM or the administrators own it; None when it's not there.
+fn open_checked(path: &Path, contents: bool) -> Result<Option<(fs::File, fs::Metadata)>, String> {
+    let file = match windows::open_unfollowed(path, contents) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let metadata = file.metadata().map_err(|error| format!("{}: {error}", path.display()))?;
+    let owned = windows::owned_by_admins(&file).map_err(|error| format!("reading who owns {}: {error}", path.display()))?;
+    if windows::is_reparse_point(&metadata) || !owned {
+        return Err(untrusted(path));
+    }
+    Ok(Some((file, metadata)))
+}
+
+fn check_owner(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    Ok(open_checked(path, false)?.map(|(_, metadata)| metadata))
+}
+
+/// A settings file, read from the handle that was checked.
+fn read_checked(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let Some((mut file, _)) = open_checked(path, true)? else { return Ok(None) };
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(Some(text))
+}
+
 /// Only SYSTEM and administrators may read or change the machine's
 /// settings and keys. ProgramData's default would let any user of the PC
-/// create files there: a config.toml that turns the shell on, say.
-fn lock_down_data_dir(report: &Report) -> Result<(), String> {
-    let dir = data_dir();
-    fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    report.detail(format!("Restricting {} to SYSTEM and administrators", dir.display()));
-    let output = Command::new("icacls")
-        .arg(&dir)
-        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/C", "/Q"])
-        .output()
-        .map_err(|error| format!("running icacls: {error}"))?;
+/// create files there: a config.toml that turns the shell on, say. `tree`
+/// does what's in the folder too.
+fn lock_down(dir: &Path, tree: bool) -> Result<(), String> {
+    let mut command = Command::new("icacls");
+    command.arg(dir).args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/C", "/Q"]);
+    if tree {
+        command.arg("/T");
+    }
+    let output = command.output().map_err(|error| format!("running icacls: {error}"))?;
     if !output.status.success() {
         return Err(format!("icacls failed: {}", String::from_utf8_lossy(&output.stdout).trim()));
     }
@@ -334,12 +449,24 @@ fn roll_back(report: &Report) -> Result<(), String> {
     Ok(())
 }
 
-/// `.old` and `.failed` copies from an earlier run, once nothing runs them.
+/// `.old` and `.failed` copies from an earlier run, once nothing runs them,
+/// and the scratch folders of runs that didn't get to remove theirs. One
+/// made in the last half hour may be a running update's.
 pub fn clean_leftovers() {
     let target = install_dir();
     for name in PROGRAM_FILES {
         for suffix in ["old", "failed"] {
             let _ = fs::remove_file(target.join(format!("{name}.{suffix}")));
+        }
+    }
+    let Ok(entries) = fs::read_dir(&target) else { return };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.created())
+            .is_ok_and(|at| at.elapsed().unwrap_or_default() > Duration::from_secs(30 * 60));
+        if stale && entry.file_name().to_string_lossy().starts_with("hawk-setup-") {
+            let _ = fs::remove_dir_all(entry.path());
         }
     }
 }
@@ -370,11 +497,12 @@ fn unregister_uninstall() {
     let _ = RegKey::predef(HKEY_LOCAL_MACHINE).delete_subkey_all(UNINSTALL_KEY);
 }
 
+/// Refused when someone other than SYSTEM or the administrators owns it:
+/// its update feed and key decide what runs as SYSTEM.
 fn read_config() -> Result<toml_edit::DocumentMut, String> {
-    match fs::read_to_string(config_path()) {
-        Ok(text) => machine_config::parse(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => machine_config::parse(machine_config::NEW_CONFIG),
-        Err(error) => Err(format!("{}: {error}", config_path().display())),
+    match read_checked(&config_path())? {
+        Some(text) => machine_config::parse(&text),
+        None => machine_config::parse(machine_config::NEW_CONFIG),
     }
 }
 
@@ -382,6 +510,26 @@ fn write_atomically(path: &Path, contents: &str) -> Result<(), String> {
     let partial = path.with_extension("tmp");
     fs::write(&partial, contents).map_err(|error| format!("{}: {error}", partial.display()))?;
     fs::rename(&partial, path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Scratch space where only administrators can write, so the checked
+/// release can't be swapped before it's installed or run elevated.
+/// SYSTEM's temporary folder may be C:\Windows\Temp, where any user can
+/// make folders, and an administrator's own is open to every program they
+/// run unelevated.
+pub fn staging() -> Result<Staging, String> {
+    staging_in(&install_dir())
+}
+
+/// The same, for the desktop app's installer: in Program Files\Hawk, the
+/// app's own folder, so a PC with only the app gets no empty Service folder.
+pub fn app_staging() -> Result<Staging, String> {
+    staging_in(&hawk_dir())
+}
+
+fn staging_in(target: &Path) -> Result<Staging, String> {
+    fs::create_dir_all(target).map_err(|error| format!("{}: {error}", target.display()))?;
+    Staging::under(target)
 }
 
 /// Stops an install that took the release from a folder of loose binaries
@@ -446,7 +594,11 @@ pub struct InstallOptions {
 }
 
 pub fn install(options: InstallOptions, report: &Report) -> Result<(), String> {
+    if !windows::is_admin() {
+        return Err("run hawk-setup as an administrator".into());
+    }
     clean_leftovers();
+    secure_data_dir(report)?;
     let mut config = read_config()?;
     let relay_text = options.relay.clone().or_else(|| machine_config::relay_url(&config));
     let Some(relay_text) = relay_text else {
@@ -484,7 +636,7 @@ pub fn install(options: InstallOptions, report: &Report) -> Result<(), String> {
     }
 
     report.step("Getting the release");
-    let staging = Staging::new()?;
+    let staging = staging()?;
     let staged = match &options.unsigned_from {
         Some(folder) if cfg!(debug_assertions) => Staged::Unsigned(folder.clone()),
         Some(_) => return Err("--unsigned-from only exists in development builds".into()),
@@ -499,8 +651,8 @@ pub fn install(options: InstallOptions, report: &Report) -> Result<(), String> {
 
     report.step(format!("Installing Hawk {version}"));
     stop_service(report)?;
+    move_from_old_folder(report)?;
     swap_in(&unpacked, report)?;
-    lock_down_data_dir(report)?;
 
     machine_config::set_relay_url(&mut config, &relay.socket_url());
     let mut update = UpdateSettings { policy: options.policy.clone(), ..UpdateSettings::default() };
@@ -538,7 +690,9 @@ pub fn install(options: InstallOptions, report: &Report) -> Result<(), String> {
 }
 
 fn existing_pins() -> Vec<String> {
-    fs::read_to_string(data_dir().join("relay-pins.txt"))
+    read_checked(&data_dir().join("relay-pins.txt"))
+        .ok()
+        .flatten()
         .map(|text| text.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned).collect())
         .unwrap_or_default()
 }
@@ -625,10 +779,15 @@ pub fn update(check_only: bool, overrides: &Overrides, report: &Report) -> Resul
         return Ok(UpdateOutcome::Available(available));
     }
 
-    let staging = Staging::new()?;
+    let staging = staging()?;
     let unpacked = stage_files(&Staged::Release(release), &staging, report)?;
     report.step(format!("Updating {current} to {available}"));
     stop_service(report)?;
+    if install_dir() == hawk_dir() {
+        move_from_old_folder(report)?;
+        // The service still points at the old folder.
+        register_service(report)?;
+    }
     swap_in(&unpacked, report)?;
     let _ = fs::remove_file(data_dir().join("status.json"));
     if let Err(error) = start_service().and_then(|()| healthy(&available)) {
@@ -726,22 +885,59 @@ pub fn uninstall(keep_data: bool, report: &Report) -> Result<(), String> {
     Ok(())
 }
 
-/// Deletes Program Files\Hawk. When this hawk-setup.exe is the one in
-/// there, the folder goes once it has exited.
+/// Deletes the service's folder, and Program Files\Hawk once it's empty:
+/// the desktop app may be installed there, and stays. When this
+/// hawk-setup.exe is the one in there, what's left goes once it has exited.
 fn remove_program_files(report: &Report) -> Result<(), String> {
     let target = install_dir();
     if !target.exists() {
         return Ok(());
     }
     let running_from_there = std::env::current_exe().is_ok_and(|exe| exe.starts_with(&target));
-    if running_from_there {
-        let script = format!("ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{}\"", target.display());
+    let parent = hawk_dir();
+    if target == parent {
+        // An install from before 1.0.0-rc.6, in the app's folder: only the
+        // service's own files go.
+        remove_service_files(&target);
+        if running_from_there {
+            let script = format!(
+                "ping -n 4 127.0.0.1 >nul & del /f /q \"{}\" & rmdir \"{}\"",
+                target.join("hawk-setup.exe").display(),
+                target.display()
+            );
+            windows::run_detached("cmd.exe", &["/d", "/c", &script]);
+        } else {
+            let _ = fs::remove_dir(&target);
+        }
+    } else if running_from_there {
+        let script =
+            format!("ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{}\" & rmdir \"{}\"", target.display(), parent.display());
         windows::run_detached("cmd.exe", &["/d", "/c", &script]);
     } else {
         fs::remove_dir_all(&target).map_err(|error| format!("{}: {error}", target.display()))?;
+        let _ = fs::remove_dir(&parent);
     }
     report.detail(format!("Removed {}", target.display()));
     Ok(())
+}
+
+/// The service's files in `folder`, and nothing else that's there.
+fn remove_service_files(folder: &Path) {
+    for name in PROGRAM_FILES {
+        for file in [(*name).to_owned(), format!("{name}.old"), format!("{name}.failed")] {
+            let _ = fs::remove_file(folder.join(file));
+        }
+    }
+    for file in ["install.json", "update.lock"] {
+        let _ = fs::remove_file(folder.join(file));
+    }
+    if let Ok(entries) = fs::read_dir(folder) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("hawk-setup-") {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
 }
 
 // ---- status -------------------------------------------------------------------------

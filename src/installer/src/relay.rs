@@ -308,6 +308,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart={INSTALL_DIR}/hawk-setup update relay --scheduled
+# Its scratch folder away from the /tmp every user of the server shares.
+PrivateTmp=true
 "
     );
     let timer = r"[Unit]

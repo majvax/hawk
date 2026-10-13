@@ -30,7 +30,7 @@ tauri = { version = "2", optional = true, features = [] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
-windows-sys = { version = "0.60", features = ["Win32_System_TpmBaseServices", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_TpmBaseServices", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
 winreg = "0.55"
 
 [target.'cfg(unix)'.dependencies]

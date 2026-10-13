@@ -35,7 +35,7 @@ it changes anything:
 - whether there's a TPM for the machine's key;
 - that the relay answers, **with the key you pinned**.
 
-Then it installs to `C:\Program Files\Hawk`, registers `HawkService`
+Then it installs to `C:\Program Files\Hawk\Service`, registers `HawkService`
 (LocalSystem, starts at boot, restarts if it ever fails), and shows the
 machine enrolling. The service:
 
@@ -87,7 +87,7 @@ trust it: remove the machine and enroll it again with a new code.
 
 | Path | What |
 |---|---|
-| `C:\Program Files\Hawk` | The service, the capture helper and hawk-setup. |
+| `C:\Program Files\Hawk\Service` | The service, the capture helper and hawk-setup. (`C:\Program Files\Hawk` itself is the desktop app's.) |
 | `C:\ProgramData\HawkService\hawk-service.log` | The service's log. It has no console window; look here. |
 | `C:\ProgramData\HawkService\config.toml` | What the machine allows. See [Machine config file](/docs/machine-config). |
 | `C:\ProgramData\HawkService\machine.txt` | Which machine it enrolled as, and its key's name. Not secret. |

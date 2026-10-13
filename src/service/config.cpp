@@ -1,14 +1,13 @@
 #include "config.hpp"
 
 #include "common/clipboard_pipe.hpp"
+#include "win_util.hpp"
 
 #include <glaze/toml.hpp>
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <optional>
 #include <string>
 #include <vector>
@@ -252,12 +251,23 @@ namespace {
 
 MachineConfig load_machine_config() {
     MachineConfig config;
-    std::ifstream file(kConfigPath, std::ios::binary);
-    if (!file) {
+    const auto    read = win::read_protected_file(kConfigPath);
+    if (!read.has_value()) {
+        // Someone else's file could name its own update feed and key, or
+        // turn the shell on: trust none of it.
+        spdlog::error("config: ignoring {} ({}); the clipboard, file transfer, shell and relay connection are off",
+                      kConfigPath.string(), read.error());
+        config.clipboard.mode = ClipboardMode::off;
+        config.files.enabled = false;
+        config.shell.enabled = false;
+        config.relay.url.clear();
+        return config;
+    }
+    if (!read->has_value()) {
         spdlog::info("config: no {}; using the defaults", kConfigPath.string());
         return config;
     }
-    const std::string text(std::istreambuf_iterator<char>(file), {});
+    const std::string& text = **read;
     // glaze reads an empty buffer as an error; an empty file says nothing.
     if (text.find_first_not_of(" \t\r\n") == std::string::npos) {
         return config;

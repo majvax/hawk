@@ -1,5 +1,7 @@
 #include "machine_identity.hpp"
 
+#include "win_util.hpp"
+
 #include <windows.h>
 #include <bcrypt.h>
 
@@ -24,11 +26,12 @@ const std::filesystem::path kLegacyCredentialPath = kDataDirectory / "credential
 const std::filesystem::path kRelayPinsPath = kDataDirectory / "relay-pins.txt";
 
 [[nodiscard]] std::optional<std::string> read_file(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
+    auto contents = win::read_protected_file(path);
+    if (!contents.has_value()) {
+        spdlog::error("identity: ignoring {}: {}", path.string(), contents.error());
         return std::nullopt;
     }
-    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    return *std::move(contents);
 }
 
 void remove_file(const std::filesystem::path& path) {

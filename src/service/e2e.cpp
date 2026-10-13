@@ -1,5 +1,7 @@
 #include "e2e.hpp"
 
+#include "win_util.hpp"
+
 #include <glaze/glaze.hpp>
 #include <spdlog/spdlog.h>
 
@@ -128,11 +130,12 @@ using Fields = std::map<std::string, std::string, std::less<>>;
 }
 
 [[nodiscard]] std::optional<std::string> read_file(const fs::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
+    auto contents = win::read_protected_file(path);
+    if (!contents.has_value()) {
+        spdlog::error("e2e: ignoring {}: {}", path.string(), contents.error());
         return std::nullopt;
     }
-    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    return *std::move(contents);
 }
 
 // Writes to a temporary file and renames it over the old one, so a crash
