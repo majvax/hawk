@@ -134,7 +134,7 @@ jobs:
         run: cargo build --locked --release -p hawk-setup --features gui
       - name: Desktop app and its installer
         working-directory: src/app
-        run: bun x --bun @tauri-apps/cli@2 build --ci
+        run: bun x --bun @tauri-apps/cli@2 build --ci --bundles nsis
       - name: Package
         shell: pwsh
         run: |
@@ -150,8 +150,46 @@ jobs:
           name: release-windows
           path: out/*
 
+  app-linux:
+    # The desktop app for Linux, as an AppImage: one file that runs on any
+    # distribution and updates itself. Built on the oldest Ubuntu runner so
+    # its glibc is old enough for older distributions too.
+    needs: prepare
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tauri's build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev patchelf file libfuse2
+      - uses: oven-sh/setup-bun@v2
+      - name: The app's page
+        working-directory: src/server
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd frontend build:app
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: app-linux
+      - name: Desktop app (AppImage, and a .deb for the Arch PKGBUILD)
+        working-directory: src/app
+        run: bun x --bun @tauri-apps/cli@2 build --ci --bundles appimage,deb
+      - name: Package
+        run: |
+          mkdir out
+          cp target/release/bundle/appimage/*.AppImage "out/hawk-app-$VERSION-linux-x64.AppImage"
+          cp target/release/bundle/deb/*.deb "out/hawk-app-$VERSION-linux-x64.deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-app-linux
+          path: out/*
+
   draft:
-    needs: [prepare, linux, windows, frontend]
+    needs: [prepare, linux, windows, app-linux, frontend]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

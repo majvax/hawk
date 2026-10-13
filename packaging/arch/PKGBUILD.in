@@ -1,0 +1,22 @@
+# Hawk's desktop app for Arch Linux. Each release carries this file filled
+# in (scripts/release/make-manifest.py): download it, then `makepkg -si`.
+# It repackages the release's .deb, built by CI against WebKitGTK 4.1.
+pkgname=hawk-app-bin
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="Hawk's desktop dashboard: your machines, end-to-end encrypted, through your own relay"
+arch=('x86_64')
+url="https://github.com/@REPO@"
+license=('AGPL-3.0-only')
+depends=('webkit2gtk-4.1' 'gtk3')
+provides=('hawk-app')
+conflicts=('hawk-app')
+options=('!strip' '!debug')
+source=("hawk-app-@VERSION@-linux-x64.deb::https://github.com/@REPO@/releases/download/v@VERSION@/hawk-app-@VERSION@-linux-x64.deb")
+noextract=("hawk-app-@VERSION@-linux-x64.deb")
+sha256sums=('@SHA256@')
+
+package() {
+  # A .deb is an ar archive: data.tar.* holds the files, laid out from /.
+  bsdtar -xOf "hawk-app-@VERSION@-linux-x64.deb" 'data.tar.*' | bsdtar -xf - -C "$pkgdir"
+}

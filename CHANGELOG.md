@@ -22,7 +22,8 @@ The first release.
   one release feed, with `notify`, `auto` or `off` per install, `stable`
   and `beta` channels, and rollback when a new version doesn't come up.
   Forks follow their own feed and key with nothing to edit.
-- **Desktop app**: the dashboard in its own window, signing in to any relay
+- **Desktop app** for Windows and Linux (an AppImage, and a `PKGBUILD` for
+  Arch): the dashboard in its own window, signing in to any relay
   that allows it (`HAWK_ALLOWED_ORIGINS`), several relays remembered.
 - Machines show their version, and offer an update in the owner's
   dashboard.

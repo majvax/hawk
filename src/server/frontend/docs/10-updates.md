@@ -13,7 +13,7 @@ signed one, is never installed over a newer one.
 |---|---|---|
 | Machine service | `hawk-setup` (installed beside the service) checks once a day, and installs when the policy says so or when you press **Update** in the dashboard. If the new service doesn't come back up, it rolls back. | `[[update]]` in `C:\ProgramData\HawkService\config.toml` |
 | Relay and dashboard | A daily systemd timer runs `hawk-setup update relay`. The database is backed up before each update, and the previous version and database come back if the new relay doesn't answer `/healthz`. | `/etc/hawk/update.toml` |
-| Desktop app | The app checks when it starts. | The app's **Settings → App updates** |
+| Desktop app | The app checks when it starts. On Linux only the AppImage installs updates itself; installed from the `PKGBUILD`, the app says an update is out and pacman installs it (each release has a new `PKGBUILD`). | The app's **Settings → App updates** |
 
 ## Policies
 

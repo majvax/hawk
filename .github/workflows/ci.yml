@@ -44,6 +44,27 @@ jobs:
       - run: cargo test --locked -p hawk-relay -p hawk-update -p hawk-setup
       - run: cargo clippy --locked -p hawk-relay -p hawk-update -p hawk-setup
 
+  app-linux:
+    # The desktop app on Linux (release.yml bundles it as an AppImage).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tauri's build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev patchelf file libfuse2
+      - uses: oven-sh/setup-bun@v2
+      - name: The app's page
+        working-directory: src/server
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd frontend build:app
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked -p hawk-app
+      - run: cargo clippy --locked -p hawk-app
+
   windows:
     # The service, hawk-setup with its window, and the desktop app.
     runs-on: windows-2022

@@ -10,9 +10,10 @@ access to the repository) and `minisign`.
 
 What it does, stopping at the first problem:
 
-1. Downloads the draft release's manifests and the desktop app's installer,
-   and checks the installer against the manifest.
-2. Signs each hawk-<channel>.json, and the app's installer for its updater,
+1. Downloads the draft release's manifests and the desktop app's packages
+   (the Windows installer, the Linux AppImage), and checks them against the
+   manifest.
+2. Signs each hawk-<channel>.json, and each app package for its updater,
    with minisign (it asks for the key's password).
 3. Checks every signature against the public key the builds were made with
    (the HAWK_UPDATE_PUBKEY repository variable), so a wrong key is caught
@@ -35,6 +36,13 @@ import tempfile
 from pathlib import Path
 
 FEED_TAG = "feed"
+# The app's packages, each signed for Tauri's updater: platform -> (artifact
+# in the manifest, file name). Keep in step with APP_PLATFORMS in
+# make-manifest.py.
+APP_FILES = {
+    "windows-x86_64": ("app-windows-x64", "hawk-app-{v}-windows-x64-setup.exe"),
+    "linux-x86_64": ("app-linux-x64", "hawk-app-{v}-linux-x64.AppImage"),
+}
 
 
 def run(*args: str, capture: bool = False) -> str:
@@ -73,7 +81,7 @@ def main() -> None:
         work = Path(temporary)
         print(f"Downloading {tag} from {repo}")
         patterns = [f"hawk-{c}.json" for c in channels] + [f"app-{c}.json" for c in channels]
-        patterns.append(f"hawk-app-{version}-windows-x64-setup.exe")
+        patterns += [file.format(v=version) for _, file in APP_FILES.values()]
         download = ["gh", "release", "download", tag, "--repo", repo, "--dir", str(work)]
         for pattern in patterns:
             download += ["--pattern", pattern]
@@ -82,9 +90,9 @@ def main() -> None:
         manifest = json.loads((work / f"hawk-{channels[0]}.json").read_text())
         if manifest["version"] != version:
             sys.exit(f"the manifest says {manifest['version']}, not {version}")
-        installer = work / f"hawk-app-{version}-windows-x64-setup.exe"
-        if sha256(installer) != manifest["artifacts"]["app-windows-x64"]["sha256"]:
-            sys.exit("the app installer doesn't match the manifest")
+        for artifact, file in APP_FILES.values():
+            if sha256(work / file.format(v=version)) != manifest["artifacts"][artifact]["sha256"]:
+                sys.exit(f"{file.format(v=version)} doesn't match the manifest")
 
         public_key_file = work / "release.pub"
         public_key_file.write_text(f"untrusted comment: minisign public key\n{public_key}\n")
@@ -95,15 +103,19 @@ def main() -> None:
             return path.with_name(path.name + ".minisig")
 
         print("Signing (minisign asks for the key's password)")
-        app_signature = sign(installer, f"hawk-app {version}")
-        app_signature_b64 = base64.b64encode(app_signature.read_bytes()).decode()
+        # Tauri's updater wants each package's minisign signature, base64'd.
+        app_signatures = {}
+        for platform, (_, file) in APP_FILES.items():
+            signature = sign(work / file.format(v=version), f"hawk-app {version} {platform}")
+            app_signatures[platform] = base64.b64encode(signature.read_bytes()).decode()
 
         uploads = []
         for channel in channels:
             uploads.append(sign(work / f"hawk-{channel}.json", f"hawk {version} {channel}"))
             app_manifest_path = work / f"app-{channel}.json"
             app_manifest = json.loads(app_manifest_path.read_text())
-            app_manifest["platforms"]["windows-x86_64"]["signature"] = app_signature_b64
+            for platform, signature in app_signatures.items():
+                app_manifest["platforms"][platform]["signature"] = signature
             app_manifest_path.write_text(json.dumps(app_manifest, indent=2) + "\n")
             uploads.append(app_manifest_path)
 

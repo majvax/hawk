@@ -124,7 +124,10 @@ The dashboard is a static bundle, so it doesn't have to be served by the relay. 
    ```powershell
    hawk-setup install machine --relay relay.example.com --pin <pin> --code <code>
    ```
-4. **Desktop app** (optional): `hawk-setup install app`, or `hawk-app-<version>-windows-x64-setup.exe` from the release, then enter the relay's address. A relay installed by hawk-setup accepts the app out of the box.
+4. **Desktop app** (optional; any browser does the same at the relay's address), then enter the relay's address. A relay installed by hawk-setup accepts the app out of the box.
+   * **Windows:** `hawk-setup install app`, or `hawk-app-<version>-windows-x64-setup.exe` from the release.
+   * **Arch Linux:** download the release's `PKGBUILD` into an empty folder, then `makepkg -si`. pacman updates it with the next release's `PKGBUILD`.
+   * **Other Linux:** `hawk-app-<version>-linux-x64.AppImage`: `chmod +x` and run it. It updates itself. AppImages need FUSE 2 (`libfuse2`, or `fuse2` on Arch).
 
 Releases aren't signed with a Windows code-signing certificate, so SmartScreen warns on the first run. What protects the install is hawk-setup's own check: everything it installs must match a manifest signed with the project's key (`minisign.pub`).
 
@@ -132,7 +135,7 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 
 * **Machine (Windows):** `hawk-setup install machine --relay … --pin … --code …`, the same three values the dashboard shows under *Add machine*. Preflight in plain words before anything is written (administrator, Windows version, TPM, relay reachable with the pinned key), then Program Files, the `HawkService` service (LocalSystem, auto-start, restart on failure), ProgramData locked to SYSTEM and administrators, an *Apps & features* entry, and enrollment followed live. Uninstall deletes the TPM key too.
 * **Relay (Linux):** `hawk-setup install relay --public-url https://… --tls certbot|self-signed|existing`. A hardened systemd unit under its own `hawk` user, TLS whose key survives renewals (certbot `--reuse-key` and a deploy hook), firewall, and the pin and first admin invite printed at the end.
-* **Desktop app (Windows):** `hawk-setup install app`, or its own installer from the release.
+* **Desktop app:** on Windows `hawk-setup install app` or its own installer; on Linux an AppImage, or the release's `PKGBUILD` on Arch.
 * **Updates:** every part checks a signed release feed (see `src/update`). The machine service runs `hawk-setup update machine` daily and the relay a systemd timer; each rolls back if the new version doesn't come up, the relay with its database. The app uses Tauri's updater against the same key. The policy (`notify`, `auto`, `off`), channel (`stable`, `beta`), feed URL and key are set per install, and builds default to the feed of the repository they were built from, so a fork works with nothing to edit.
 
 ### Releasing

@@ -13,7 +13,8 @@ with a suffix like -rc.1: beta only) this writes, into the same folder:
                         updater (Tauri) reads. Its signature field is filled
                         in by release-sign.py.
 
-and SHA256SUMS for people checking downloads by hand.
+a PKGBUILD for Arch Linux (from packaging/arch/PKGBUILD.in, with the
+.deb's checksum), and SHA256SUMS for people checking downloads by hand.
 
 Artifacts are recognised by name (see ARTIFACTS); a release missing one is
 refused, so a half-built release never goes out.
@@ -32,12 +33,17 @@ ARTIFACTS = {
     "machine-windows-x64": "hawk-machine-{v}-windows-x64.zip",
     "setup-windows-x64": "hawk-setup-{v}-windows-x64.exe",
     "app-windows-x64": "hawk-app-{v}-windows-x64-setup.exe",
+    "app-linux-x64": "hawk-app-{v}-linux-x64.AppImage",
+    "app-linux-x64-deb": "hawk-app-{v}-linux-x64.deb",
     "relay-linux-x64": "hawk-relay-{v}-linux-x64.tar.gz",
     "relay-linux-arm64": "hawk-relay-{v}-linux-arm64.tar.gz",
     "setup-linux-x64": "hawk-setup-{v}-linux-x64",
     "setup-linux-arm64": "hawk-setup-{v}-linux-arm64",
     "dashboard": "hawk-dashboard-{v}.tar.gz",
 }
+# The app's updater platforms (Tauri's names) -> their artifact. Keep in
+# step with APP_FILES in release-sign.py, which signs them.
+APP_PLATFORMS = {"windows-x86_64": "app-windows-x64", "linux-x86_64": "app-linux-x64"}
 PROTOCOL = 1  # PROTOCOL_VERSION in src/server/relay/src/protocol.rs
 
 
@@ -90,10 +96,23 @@ def main() -> None:
             "notes": f"Hawk {version}: {notes}",
             "pub_date": released_at,
             "platforms": {
-                "windows-x86_64": {"signature": "", "url": artifacts["app-windows-x64"]["url"]},
+                platform: {"signature": "", "url": artifacts[artifact]["url"]}
+                for platform, artifact in APP_PLATFORMS.items()
             },
         }
         (args.folder / f"app-{channel}.json").write_text(json.dumps(app, indent=2) + "\n")
+
+    # Arch Linux: a PKGBUILD for the .deb, its checksum filled in.
+    template = Path(__file__).resolve().parents[2] / "packaging" / "arch" / "PKGBUILD.in"
+    pkgbuild = (
+        template.read_text()
+        .replace("@PKGVER@", version.replace("-", ""))  # pacman versions have no '-'
+        .replace("@VERSION@", version)
+        .replace("@REPO@", args.repo)
+        .replace("@SHA256@", artifacts["app-linux-x64-deb"]["sha256"])
+    )
+    (args.folder / "PKGBUILD").write_text(pkgbuild, newline="\n")
+    sums.append(f"{sha256(args.folder / 'PKGBUILD')}  PKGBUILD")
 
     (args.folder / "SHA256SUMS").write_text("\n".join(sums) + "\n")
     print(f"manifests for {', '.join(channels)}; {len(artifacts)} artifacts")

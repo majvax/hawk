@@ -104,6 +104,18 @@ async fn find_update(app: &AppHandle) -> Result<Option<tauri_plugin_updater::Upd
     updater.check().await.map_err(|error| error.to_string())
 }
 
+/// Whether this copy can replace itself. On Linux only the AppImage can;
+/// a copy installed by a package manager (the PKGBUILD) belongs to it, and
+/// updates come from it too.
+fn can_self_update() -> Result<(), String> {
+    if cfg!(target_os = "linux") && std::env::var_os("APPIMAGE").is_none() {
+        return Err("this copy was installed by your package manager: update it there \
+                    (each release has a new PKGBUILD)"
+            .into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn settings(app: AppHandle) -> Settings {
     Settings::load(&app)
@@ -135,6 +147,7 @@ async fn check_update(app: AppHandle, pending: State<'_, Pending>) -> Result<Opt
 /// Downloads, checks and installs the update found last, then restarts.
 #[tauri::command]
 async fn install_update(app: AppHandle, pending: State<'_, Pending>) -> Result<(), String> {
+    can_self_update()?;
     let update = pending.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     let update = match update {
         Some(update) => update,
@@ -150,14 +163,15 @@ fn app_version(app: AppHandle) -> String {
 }
 
 /// At start: with "auto", install a waiting update before anything is
-/// open; with "notify", tell the page so it can offer it.
+/// open; with "notify", or when this copy can't replace itself, tell the
+/// page so it can offer it.
 async fn startup_check(app: AppHandle) {
     let settings = Settings::load(&app);
     if settings.policy == "off" {
         return;
     }
     let Ok(Some(update)) = find_update(&app).await else { return };
-    if settings.policy == "auto" {
+    if settings.policy == "auto" && can_self_update().is_ok() {
         if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
             app.restart();
         }
