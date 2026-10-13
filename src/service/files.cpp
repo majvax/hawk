@@ -15,6 +15,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cwctype>
 #include <deque>
 #include <format>

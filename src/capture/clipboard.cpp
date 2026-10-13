@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <memory>

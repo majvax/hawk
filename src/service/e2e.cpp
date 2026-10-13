@@ -8,6 +8,7 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>

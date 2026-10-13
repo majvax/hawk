@@ -5,6 +5,7 @@
 #include <glaze/toml.hpp>
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>

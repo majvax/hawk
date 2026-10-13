@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <expected>
 #include <format>

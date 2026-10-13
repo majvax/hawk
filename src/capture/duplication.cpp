@@ -4,6 +4,7 @@
 #include <dxgi1_2.h>
 
 #include <array>
+#include <cstdint>
 #include <format>
 #include <utility>
 
