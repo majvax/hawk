@@ -5,6 +5,7 @@
 // macro explicitly specializes. Included in the other order, GCC rejects
 // those specializations as targeting a non-template.
 #include <d3d11.h>
+#include <d3d11_1.h>  // ID3D11VideoContext1: colour spaces by DXGI type
 #include <codecapi.h>
 #include <d3d10.h>  // ID3D10Multithread, which also guards D3D11 devices
 #include <icodecapi.h>
@@ -119,6 +120,26 @@ struct VideoProcessor {
         return std::unexpected(make_error(EncoderError::Code::convert_failed, hresult, "CreateVideoProcessor"));
     }
 
+    // The screen is full-range RGB; the stream is studio-range BT.709 YUV,
+    // which is what its colour description says (see set_colour_description)
+    // and what decoders assume for HD anyway. Left unset, the processor
+    // converts with BT.601: decoded as BT.709, reds and greens come out
+    // shifted and dull, and thin red text gets hard to read.
+    ComPtr<ID3D11VideoContext1> context1;
+    if (SUCCEEDED(video.context.As(&context1))) {
+        context1->VideoProcessorSetStreamColorSpace1(video.processor.Get(), 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        context1->VideoProcessorSetOutputColorSpace1(video.processor.Get(),
+                                                     DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+    } else {
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE rgb_full{};
+        rgb_full.RGB_Range = 0;  // 0-255
+        video.context->VideoProcessorSetStreamColorSpace(video.processor.Get(), 0, &rgb_full);
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE yuv_709_studio{};
+        yuv_709_studio.YCbCr_Matrix = 1;  // BT.709
+        yuv_709_studio.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        video.context->VideoProcessorSetOutputColorSpace(video.processor.Get(), &yuv_709_studio);
+    }
+
     const D3D11_TEXTURE2D_DESC nv12_desc{
         .Width = config.width,
         .Height = config.height,
@@ -186,6 +207,23 @@ struct VideoProcessor {
     return transform;
 }
 
+// Studio-range BT.709, as the video processor converts to: on the input
+// type so the encoder knows what it gets, on the output type so it writes
+// it into the stream's VUI and decoders don't have to guess.
+[[nodiscard]] HRESULT set_colour_description(IMFMediaType& type) {
+    HRESULT hresult = type.SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+    if (SUCCEEDED(hresult)) {
+        hresult = type.SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = type.SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = type.SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+    }
+    return hresult;
+}
+
 [[nodiscard]] std::expected<void, EncoderError> configure_output_type(IMFTransform&        transform,
                                                                        const EncoderConfig& config) {
     ComPtr<IMFMediaType> out_type;
@@ -210,6 +248,9 @@ struct VideoProcessor {
     }
     if (SUCCEEDED(hresult)) {
         hresult = MFSetAttributeRatio(out_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = set_colour_description(*out_type.Get());
     }
     if (SUCCEEDED(hresult)) {
         hresult = transform.SetOutputType(0, out_type.Get(), 0);
@@ -241,6 +282,9 @@ struct VideoProcessor {
     }
     if (SUCCEEDED(hresult)) {
         hresult = MFSetAttributeRatio(in_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    }
+    if (SUCCEEDED(hresult)) {
+        hresult = set_colour_description(*in_type.Get());
     }
     if (SUCCEEDED(hresult)) {
         hresult = transform.SetInputType(0, in_type.Get(), 0);
