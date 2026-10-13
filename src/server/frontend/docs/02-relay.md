@@ -89,7 +89,7 @@ roots.
 
 | Variable | Default | What it sets |
 |---|---|---|
-| `HOST` | `127.0.0.1` | Address to listen on. `0.0.0.0` for every interface. |
+| `HOST` | `127.0.0.1` | Address to listen on. `0.0.0.0` for every IPv4 interface, `[::]` for IPv6 and IPv4 both (what hawk-setup sets). |
 | `PORT` | `8080` | Port to listen on. |
 | `PUBLIC_URL` | the listen address | The address people reach the dashboard at. Used in the links the relay logs and emails. Set it in production. |
 | `TLS_CERT_PATH` | `certs/dev-cert.pem` | TLS certificate (PEM). |

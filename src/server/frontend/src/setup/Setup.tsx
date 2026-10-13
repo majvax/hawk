@@ -435,7 +435,11 @@ const MARK: Record<LineKind, string> = { step: "›", detail: " ", ok: "✓", wa
 
 function ProgressLog({ lines }: { lines: Line[] }): JSX.Element {
   const end = useRef<HTMLDivElement | null>(null);
-  useEffect(() => end.current?.scrollIntoView({ block: "end" }), [lines]);
+  // Braces: newer browsers return a Promise from scrollIntoView, and React
+  // would call whatever an effect returns as its cleanup.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: "end" });
+  }, [lines]);
   return (
     <div className="setup-log" role="log" aria-live="polite">
       {lines.map((line, index) => (

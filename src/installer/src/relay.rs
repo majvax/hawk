@@ -199,6 +199,8 @@ fn set_up_tls(tls: &Tls, host: &str, report: &Report) -> Result<(), String> {
             if Command::new("certbot").arg("--version").output().is_err() {
                 return Err("certbot isn't installed (apt install certbot, or dnf install certbot)".into());
             }
+            // Let's Encrypt checks over port 80, now and at every renewal.
+            open_firewall(80, report);
             report.detail(format!("Asking Let's Encrypt for a certificate for {host} (port 80 must be reachable)"));
             let hook = format!("{INSTALL_DIR}/hawk-setup relay-cert-deploy");
             run(
@@ -414,7 +416,8 @@ pub fn install(options: InstallOptions, report: &Report) -> Result<(), String> {
     let mut env = format!(
         "# Hawk relay settings (see the relay docs). Restart after a change:\n\
          #   systemctl restart hawk-relay\n\
-         HOST=0.0.0.0\nPORT={listen_port}\nPUBLIC_URL={public_url}\n\
+         # [::] is IPv6 and IPv4 both (a name with an AAAA record needs both).\n\
+         HOST=[::]\nPORT={listen_port}\nPUBLIC_URL={public_url}\n\
          FRONTEND_DIST={INSTALL_DIR}/dashboard\nTLS_CERT_PATH={}\nTLS_KEY_PATH={}\n\
          HAWK_DB_PATH={DATA_DIR}/hawk.db\nHAWK_SECRET_KEY_PATH={DATA_DIR}/secret.key\n\
          # The desktop app, and any separately hosted dashboard.\nHAWK_ALLOWED_ORIGINS={}\n",

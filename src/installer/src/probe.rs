@@ -157,13 +157,29 @@ fn connect(address: &RelayAddress) -> Result<(TlsStream, String), String> {
     let mut connection =
         rustls::ClientConnection::new(Arc::new(config), name).map_err(|error| error.to_string())?;
 
-    let target = (address.host.as_str(), address.port)
+    let targets: Vec<_> = (address.host.as_str(), address.port)
         .to_socket_addrs()
         .map_err(|error| format!("can't find {}: {error}", address.display()))?
-        .next()
-        .ok_or_else(|| format!("can't find {}", address.display()))?;
-    let mut socket = TcpStream::connect_timeout(&target, Duration::from_secs(10))
-        .map_err(|error| format!("can't reach {}: {error}", address.display()))?;
+        .collect();
+    // Every address in turn, as the service does: a name with an IPv6
+    // address that drops packets mustn't hide a working IPv4 one.
+    let mut failures = Vec::new();
+    let mut socket = targets
+        .iter()
+        .find_map(|target| match TcpStream::connect_timeout(target, Duration::from_secs(5)) {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                failures.push(format!("{}: {error}", target.ip()));
+                None
+            }
+        })
+        .ok_or_else(|| {
+            if failures.is_empty() {
+                format!("can't find {}", address.display())
+            } else {
+                format!("can't reach {} ({})", address.display(), failures.join("; "))
+            }
+        })?;
     socket.set_read_timeout(Some(Duration::from_secs(10))).map_err(|error| error.to_string())?;
     socket.set_write_timeout(Some(Duration::from_secs(10))).map_err(|error| error.to_string())?;
     while connection.is_handshaking() {

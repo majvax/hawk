@@ -193,5 +193,8 @@ export function useNow(intervalMs = 1000): number {
 }
 
 export function errorMessage(error: unknown, fallback = "request failed"): string {
-  return error instanceof Error ? error.message : fallback;
+  if (error instanceof Error) return error.message;
+  // Tauri commands fail with their error as a plain string.
+  if (typeof error === "string" && error !== "") return error;
+  return fallback;
 }
