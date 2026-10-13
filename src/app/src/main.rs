@@ -190,7 +190,22 @@ async fn startup_check(app: AppHandle) {
     let _ = app.emit("update-available", info);
 }
 
+/// On Linux the page decodes video through GStreamer, whose software H.264
+/// decoder (avdec_h264) holds frames back for its threads: a remote screen,
+/// which only sends frames when something changes, then lags by up to a
+/// second. Hardware decoders hand each frame straight on, so rank them first
+/// (VA-API for Intel and AMD, NVDEC for NVIDIA); GStreamer skips any that
+/// isn't installed or has no device. A rank set by the user wins.
+fn prefer_hardware_decoders() {
+    if cfg!(target_os = "linux") && std::env::var_os("GST_PLUGIN_FEATURE_RANK").is_none() {
+        // SAFETY: first thing in main, before Tauri or GStreamer start any
+        // thread that could read the environment.
+        unsafe { std::env::set_var("GST_PLUGIN_FEATURE_RANK", "vah264dec:MAX,nvh264dec:MAX") };
+    }
+}
+
 fn main() {
+    prefer_hardware_decoders();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())

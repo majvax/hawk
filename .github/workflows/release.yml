@@ -165,6 +165,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
             libxdo-dev libssl-dev patchelf file libfuse2
+          # Bundled into the AppImage (bundleMediaFramework): the video decoders.
+          sudo apt-get install -y gstreamer1.0-libav gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
       - uses: oven-sh/setup-bun@v2
       - name: The app's page
         working-directory: src/server

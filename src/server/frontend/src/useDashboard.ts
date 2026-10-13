@@ -1,6 +1,7 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
 import { getSession } from "./api.js";
+import { IN_APP } from "./desktop.js";
 import { socketProtocols, socketUrl } from "./relay.js";
 import { type EnrollmentCheck, type MachineTrust, ViewSession, checkEnrollment, trustMachine } from "./e2e.js";
 import {
@@ -59,7 +60,13 @@ async function detectBackend(): Promise<Backend> {
   return mseSupported(DECODER_CODEC) ? "mse" : "none";
 }
 
-const UNSUPPORTED_MESSAGE = "This browser can't play H.264 video. Try an up-to-date Chrome or Firefox.";
+// The Linux app decodes through the system's GStreamer, whose H.264
+// decoder is a separate package on most distributions.
+const UNSUPPORTED_MESSAGE =
+  IN_APP && navigator.userAgent.includes("Linux")
+    ? "This app can't decode H.264: install GStreamer's decoders (Arch: gst-libav gst-plugins-bad; " +
+      "Debian and Ubuntu: gstreamer1.0-libav gstreamer1.0-plugins-bad), then restart it."
+    : "This browser can't play H.264 video. Try an up-to-date Chrome or Firefox.";
 
 // Decode errors in a row, with no picture in between, before giving up on
 // a backend.
