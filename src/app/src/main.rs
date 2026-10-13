@@ -35,7 +35,9 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { policy: "notify".into(), channel: "stable".into(), feed_url: String::new(), public_key: String::new() }
+        // A release candidate follows beta, the only channel that has it.
+        let channel = if env!("CARGO_PKG_VERSION").contains('-') { "beta" } else { "stable" };
+        Self { policy: "notify".into(), channel: channel.into(), feed_url: String::new(), public_key: String::new() }
     }
 }
 

@@ -92,9 +92,17 @@ impl Channel {
         }
     }
 
+    /// The channel when none is set: what this build is. A release candidate
+    /// follows beta, which is the only channel that has it; a release
+    /// follows stable.
+    pub fn of_this_build() -> Self {
+        if env!("CARGO_PKG_VERSION").contains('-') { Self::Beta } else { Self::Stable }
+    }
+
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim() {
-            "" | "stable" => Some(Self::Stable),
+            "" => Some(Self::of_this_build()),
+            "stable" => Some(Self::Stable),
             "beta" => Some(Self::Beta),
             _ => None,
         }
@@ -428,7 +436,8 @@ mod tests {
             channel: Channel::Beta,
         };
         assert_eq!(feed.manifest_url(), "https://github.com/o/r/releases/download/feed/hawk-beta.json");
-        assert_eq!(Channel::parse(""), Some(Channel::Stable));
+        assert_eq!(Channel::parse(""), Some(Channel::of_this_build()));
+        assert_eq!(Channel::parse("stable"), Some(Channel::Stable));
         assert_eq!(Channel::parse("nightly"), None);
     }
 }
