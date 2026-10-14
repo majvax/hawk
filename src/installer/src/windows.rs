@@ -97,6 +97,75 @@ pub fn owned_by_admins(file: &std::fs::File) -> std::io::Result<bool> {
     Ok(trusted)
 }
 
+/// Everyone the open folder's or file's own access list names besides
+/// SYSTEM and the administrators, as SIDs ("S-1-5-21-…"). icacls' /grant:r
+/// replaces what those two may do but leaves anyone else's entry there.
+pub fn other_trustees(file: &std::fs::File) -> std::io::Result<Vec<String>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, IsWellKnownSid, PSECURITY_DESCRIPTOR,
+        PSID, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the handle is open for the call's length, and the two
+    // out-pointers are valid; the parts not asked for may be null.
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut dacl,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result as i32));
+    }
+    let mut others = Vec::new();
+    // A null DACL lets everyone in, and has no entries to take away; the
+    // /grant:r before this replaced it.
+    // SAFETY: `dacl` points into `descriptor`, which lives until the
+    // LocalFree below; every ACE GetAce returns lies within it, and allowed
+    // and denied ACEs share ACCESS_ALLOWED_ACE's layout.
+    unsafe {
+        let count = if dacl.is_null() { 0 } else { u32::from((*dacl).AceCount) };
+        for index in 0..count {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, index, &raw mut ace) == 0 {
+                continue;
+            }
+            let kind = (*ace.cast::<ACE_HEADER>()).AceType;
+            if kind != ACCESS_ALLOWED_ACE_TYPE && kind != ACCESS_DENIED_ACE_TYPE {
+                continue;
+            }
+            let sid: PSID = (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast();
+            if IsWellKnownSid(sid, WinLocalSystemSid) != 0 || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0 {
+                continue;
+            }
+            let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &raw mut text) != 0 {
+                let length = (0..).take_while(|&i| *text.add(i) != 0).count();
+                let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+                if !others.contains(&sid) {
+                    others.push(sid);
+                }
+                LocalFree(text.cast());
+            }
+        }
+        LocalFree(descriptor);
+    }
+    Ok(others)
+}
+
 /// Whether the open entry is a link, a junction or another reparse point.
 pub fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -104,9 +173,16 @@ pub fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-/// Starts a program that outlives this one, with no window.
-pub fn run_detached(program: &str, args: &[&str]) {
-    let _ = Command::new(program).args(args).creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS).spawn();
+/// Runs a cmd.exe script that outlives this process, with no window. The
+/// script goes on cmd's command line as written: quoted as one argument,
+/// its quotes would become \", which cmd doesn't understand, and every
+/// command in it would fail.
+pub fn run_script_detached(script: &str) {
+    let _ = Command::new("cmd.exe")
+        .args(["/d", "/c"])
+        .raw_arg(script)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn();
 }
 
 /// Starts this program again elevated (a UAC prompt), with the same

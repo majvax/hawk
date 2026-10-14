@@ -399,12 +399,29 @@ fn read_checked(path: &Path) -> Result<Option<String>, String> {
 /// create files there: a config.toml that turns the shell on, say. `tree`
 /// does what's in the folder too.
 fn lock_down(dir: &Path, tree: bool) -> Result<(), String> {
-    let mut command = Command::new("icacls");
-    command.arg(dir).args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/C", "/Q"]);
-    if tree {
-        command.arg("/T");
+    icacls(dir, &["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])?;
+    // /grant:r leaves anyone else's own entry on the folder: a folder made
+    // by hand, or by an older Hawk, can still give an account full control.
+    let (folder, _) = open_checked(dir, false)?.ok_or_else(|| format!("{} disappeared", dir.display()))?;
+    let others = windows::other_trustees(&folder).map_err(|error| format!("reading {}'s access: {error}", dir.display()))?;
+    for sid in others {
+        icacls(dir, &["/remove", &format!("*{sid}")])?;
     }
-    let output = command.output().map_err(|error| format!("running icacls: {error}"))?;
+    if tree && fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?.next().is_some() {
+        // What's in it gets the folder's access and nothing else: /reset
+        // drops each entry's own list, whoever it named.
+        icacls(&dir.join("*"), &["/reset", "/T"])?;
+    }
+    Ok(())
+}
+
+fn icacls(path: &Path, args: &[&str]) -> Result<(), String> {
+    let output = Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .args(["/C", "/Q"])
+        .output()
+        .map_err(|error| format!("running icacls: {error}"))?;
     if !output.status.success() {
         return Err(format!("icacls failed: {}", String::from_utf8_lossy(&output.stdout).trim()));
     }
@@ -743,7 +760,7 @@ fn clean_leftovers_soon() {
     for name in PROGRAM_FILES {
         script.push_str(&format!(" & del /f /q \"{}\" 2>nul", target.join(format!("{name}.old")).display()));
     }
-    windows::run_detached("cmd.exe", &["/d", "/c", &script]);
+    windows::run_script_detached(&script);
 }
 
 // ---- update ---------------------------------------------------------------------
@@ -779,6 +796,9 @@ pub fn update(check_only: bool, overrides: &Overrides, report: &Report) -> Resul
         return Ok(UpdateOutcome::Available(available));
     }
 
+    // An install from before the folder was locked down properly gets it
+    // now; with the service still running if it can't be.
+    secure_data_dir(report)?;
     let staging = staging()?;
     let unpacked = stage_files(&Staged::Release(release), &staging, report)?;
     report.step(format!("Updating {current} to {available}"));
@@ -905,14 +925,14 @@ fn remove_program_files(report: &Report) -> Result<(), String> {
                 target.join("hawk-setup.exe").display(),
                 target.display()
             );
-            windows::run_detached("cmd.exe", &["/d", "/c", &script]);
+            windows::run_script_detached(&script);
         } else {
             let _ = fs::remove_dir(&target);
         }
     } else if running_from_there {
         let script =
             format!("ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{}\" & rmdir \"{}\"", target.display(), parent.display());
-        windows::run_detached("cmd.exe", &["/d", "/c", &script]);
+        windows::run_script_detached(&script);
     } else {
         fs::remove_dir_all(&target).map_err(|error| format!("{}: {error}", target.display()))?;
         let _ = fs::remove_dir(&parent);
@@ -961,5 +981,51 @@ pub fn summary() -> Summary {
         status: service_status(),
         relay: config.as_ref().and_then(machine_config::relay_url),
         update_policy: config.as_ref().map(|config| machine_config::update_settings(config).policy.unwrap_or("notify".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Needs an elevated prompt: `cargo test -p hawk-setup -- --ignored`.
+    /// A folder and file that give another account full control, as one
+    /// made by hand or an older Hawk would, end up SYSTEM's and the
+    /// administrators' alone.
+    #[test]
+    #[ignore]
+    fn lock_down_leaves_only_system_and_administrators() {
+        let dir = std::env::temp_dir().join(format!("hawk-lock-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), "x").unwrap();
+        fs::write(dir.join("sub").join("b.txt"), "y").unwrap();
+        // Everyone (S-1-1-0) on the folder, and a file of its own.
+        icacls(&dir, &["/grant", "*S-1-1-0:(OI)(CI)F"]).unwrap();
+        icacls(&dir.join("a.txt"), &["/inheritance:r", "/grant", "*S-1-1-0:F"]).unwrap();
+
+        lock_down(&dir, false).unwrap();
+        lock_down(&dir, true).unwrap();
+
+        for path in [dir.clone(), dir.join("a.txt"), dir.join("sub"), dir.join("sub").join("b.txt")] {
+            let file = windows::open_unfollowed(&path, false).unwrap();
+            assert_eq!(windows::other_trustees(&file).unwrap(), Vec::<String>::new(), "{}", path.display());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The scripts that clean up after this process quote paths with
+    /// spaces, as C:\Program Files is; they have to reach cmd as written.
+    #[test]
+    fn detached_scripts_handle_quoted_paths() {
+        let dir = std::env::temp_dir().join(format!("hawk script test {}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hawk-setup.exe.old");
+        fs::write(&file, "x").unwrap();
+        windows::run_script_detached(&format!("del /f /q \"{}\" & rmdir \"{}\"", file.display(), dir.display()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while dir.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!dir.exists(), "{} is still there", dir.display());
     }
 }
