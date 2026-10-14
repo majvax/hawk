@@ -135,6 +135,7 @@ pub enum Answer {
         clipboard: &'static str,
         files: bool,
         shell: bool,
+        analytics: bool,
     },
     Reject { reason: String },
     StreamKey { wrapped_key: String },
@@ -575,8 +576,17 @@ impl Registry {
         }
         let device_id = machine_id.to_owned();
         let event = match answer {
-            Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell } => {
-                DashboardEvent::ViewAccepted { device_id, statement, signature, wrapped_key, clipboard, files, shell }
+            Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell, analytics } => {
+                DashboardEvent::ViewAccepted {
+                    device_id,
+                    statement,
+                    signature,
+                    wrapped_key,
+                    clipboard,
+                    files,
+                    shell,
+                    analytics,
+                }
             }
             Answer::StreamKey { wrapped_key } => DashboardEvent::StreamKey { device_id, wrapped_key },
             Answer::Clipboard { sealed } => DashboardEvent::Clipboard { device_id, sealed },

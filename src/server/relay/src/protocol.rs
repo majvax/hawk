@@ -85,6 +85,9 @@ pub enum DeviceMessage {
         /// Whether this viewer may open shells.
         #[serde(default)]
         shell: Option<bool>,
+        /// Whether this viewer may read the machine's analytics.
+        #[serde(default)]
+        analytics: Option<bool>,
     },
     /// The machine refused a viewer (no valid grant, revoked, expired...).
     ViewerReject { viewer: u64, reason: String },
@@ -330,6 +333,8 @@ pub enum DashboardEvent {
         files: bool,
         /// Whether the machine lets this viewer open shells.
         shell: bool,
+        /// Whether the machine lets this viewer read its analytics.
+        analytics: bool,
     },
     /// The machine refused to stream to this viewer.
     ViewRejected { device_id: String, reason: String },
@@ -425,6 +430,32 @@ mod tests {
         assert_eq!(clipboard_access(clipboard.as_deref()), "off");
         assert_eq!(clipboard_access(Some("sync")), "sync");
         assert_eq!(clipboard_access(Some("everything")), "off");
+    }
+
+    /// What the machine allows reaches the dashboard: a field dropped here
+    /// leaves its tab saying the machine refused.
+    #[test]
+    fn accepts_carry_what_the_machine_allows() {
+        let message: DeviceMessage = serde_json::from_str(
+            r#"{"type":"viewer_accept","viewer":1,"statement":"s","signature":"g","wrapped_key":"k",
+                "files":true,"shell":true,"analytics":true}"#,
+        )
+        .unwrap();
+        let DeviceMessage::ViewerAccept { files, shell, analytics, .. } = message else { panic!("not an accept") };
+        let json = serde_json::to_value(DashboardEvent::ViewAccepted {
+            device_id: "m1".into(),
+            statement: "s".into(),
+            signature: "g".into(),
+            wrapped_key: "k".into(),
+            clipboard: "off",
+            files: files.unwrap_or(false),
+            shell: shell.unwrap_or(false),
+            analytics: analytics.unwrap_or(false),
+        })
+        .unwrap();
+        assert_eq!(json["files"], true);
+        assert_eq!(json["shell"], true);
+        assert_eq!(json["analytics"], true);
     }
 
     /// The largest text the dashboard or the machine sends fits; a byte

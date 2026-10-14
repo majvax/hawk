@@ -322,13 +322,21 @@ fn route_device_answer(
     clipboard_budgets: &mut HashMap<u64, Budget>,
 ) {
     let (viewer, answer) = match serde_json::from_str::<DeviceMessage>(text) {
-        Ok(DeviceMessage::ViewerAccept { viewer, statement, signature, wrapped_key, clipboard, files, shell })
-            if answer_fits(&[&statement, &signature, &wrapped_key]) =>
-        {
+        Ok(DeviceMessage::ViewerAccept {
+            viewer,
+            statement,
+            signature,
+            wrapped_key,
+            clipboard,
+            files,
+            shell,
+            analytics,
+        }) if answer_fits(&[&statement, &signature, &wrapped_key]) => {
             let clipboard = clipboard_access(clipboard.as_deref());
             let files = files.unwrap_or(false);
             let shell = shell.unwrap_or(false);
-            (viewer, Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell })
+            let analytics = analytics.unwrap_or(false);
+            (viewer, Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell, analytics })
         }
         Ok(DeviceMessage::ViewerReject { viewer, reason }) => {
             (viewer, Answer::Reject { reason: reason.chars().take(200).collect() })
