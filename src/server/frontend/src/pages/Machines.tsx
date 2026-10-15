@@ -13,6 +13,7 @@ import type { Identity } from "../keys.js";
 import {
   MAX_CLIPBOARD_BYTES,
   type Machine,
+  type PowerAction,
   type Role,
   canControl as roleCanControl,
   canFiles,
@@ -291,7 +292,7 @@ function RailItem({
       aria-current={selected}
       onClick={onSelect}
     >
-      <Dot tone={machine.online ? "ok" : "idle"} title={machine.online ? "Online" : "Offline"} />
+      <Dot tone={statusTone(machine)} title={statusText(machine)} />
       <span className="rail-name truncate">{machine.name}</span>
       {live ? (
         <Tag tone="accent">Live</Tag>
@@ -315,6 +316,17 @@ function RailItem({
   );
 }
 
+// Online, offline, or on its way back from a restart it announced.
+function statusText(machine: Machine): string {
+  if (machine.restarting === true) return machine.online ? "Restarting…" : "Restarting";
+  return machine.online ? "Online" : "Offline";
+}
+
+function statusTone(machine: Machine): "ok" | "warn" | "idle" {
+  if (machine.restarting === true) return "warn";
+  return machine.online ? "ok" : "idle";
+}
+
 function MachineStrip({
   machine,
   now,
@@ -329,8 +341,8 @@ function MachineStrip({
   return (
     <div className="strip">
       <Metric label="Status">
-        <Dot tone={machine.online ? "ok" : "idle"} />
-        {machine.online ? "Online" : "Offline"}
+        <Dot tone={statusTone(machine)} />
+        {statusText(machine)}
       </Metric>
       {machine.online ? (
         <Metric label="Uptime">
@@ -456,7 +468,7 @@ function Overview({
                 <tr key={machine.id} className="clickable" onClick={() => onSelect(machine.id)}>
                   <td>
                     <span className="cell">
-                      <Dot tone={machine.online ? "ok" : "idle"} />
+                      <Dot tone={statusTone(machine)} title={statusText(machine)} />
                       <span className="truncate">{machine.name}</span>
                       {machine.id === viewingId && <Tag tone="accent">Live</Tag>}
                       {machine.role === "owner" && machine.keyStorage === null && <Tag tone="err">Re-enroll</Tag>}
@@ -581,6 +593,34 @@ function formatSize(bytes: number): string {
   return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
 }
 
+// The Power menu. Anything that closes apps asks for a second click.
+const POWER_ITEMS: { action: PowerAction; label: string; warning: string | null; sent: (name: string) => string }[] = [
+  {
+    action: "lock",
+    label: "Lock",
+    warning: null,
+    sent: (name) => `Locked ${name}: its sign-in screen comes up, and the session waits behind it.`,
+  },
+  {
+    action: "sign_out",
+    label: "Sign out",
+    warning: "Signs out whoever is using it; unsaved work is lost.",
+    sent: (name) => `Signing out of ${name}. The view stays, at its sign-in screen.`,
+  },
+  {
+    action: "restart",
+    label: "Restart",
+    warning: "Every app is closed, saved or not.",
+    sent: (name) => `Restarting ${name}. The view comes back by itself, at its sign-in screen.`,
+  },
+  {
+    action: "shut_down",
+    label: "Shut down",
+    warning: "Every app is closed, and it stays off until someone turns it on.",
+    sent: (name) => `Shutting down ${name}.`,
+  },
+];
+
 function Viewer({
   dashboard,
   shown,
@@ -607,6 +647,7 @@ function Viewer({
     fileActions,
     sendInput,
     sendClipboard,
+    sendPower,
     elevated,
   } = dashboard;
   const requestStepUp = useStepUp();
@@ -618,6 +659,10 @@ function Viewer({
   const [dropping, setDropping] = useState(false);
   const [dropNote, setDropNote] = useState<string | null>(null);
   const [clipMenu, setClipMenu] = useState(false);
+  const [powerMenu, setPowerMenu] = useState(false);
+  // The power action waiting for its second click.
+  const [armed, setArmed] = useState<PowerAction | null>(null);
+  const [powerNote, setPowerNote] = useState<string | null>(null);
 
   const onScreen = shown && viewing !== null && selected?.id === viewing.id;
   // Nothing to send input to unless a picture is actually up, and the relay
@@ -644,6 +689,9 @@ function Viewer({
   const secured = onScreen && viewing.online && status === "open" && security?.kind === "secured";
   const canReadClipboard = secured && clipboard.access !== "off";
   const canPaste = canReadClipboard && roleCanControl(security.role);
+  // Lock, sign out, restart, shut down: control, elevated, on a machine new
+  // enough to take them. The machine checks the role again.
+  const canPower = secured && viewing.power === true && roleCanControl(security.role) && elevated;
 
   const canSendFiles = secured && files.enabled && elevated;
   // Dropping files on the screen sends them; the Files tab follows them.
@@ -674,6 +722,31 @@ function Viewer({
     setDropNote(null);
     setClipMenu(false);
   }, [viewing?.id, canReadClipboard]);
+
+  useEffect(() => {
+    setPowerMenu(false);
+    setArmed(null);
+    setPowerNote(null);
+  }, [viewing?.id]);
+
+  // A second click has to come soon after the first.
+  useEffect(() => {
+    if (armed === null) return;
+    const timer = window.setTimeout(() => setArmed(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [armed]);
+
+  const choosePower = (action: PowerAction): void => {
+    const item = POWER_ITEMS.find((candidate) => candidate.action === action);
+    if (item === undefined || viewing === null) return;
+    if (item.warning !== null && armed !== action) {
+      setArmed(action);
+      return;
+    }
+    setArmed(null);
+    setPowerMenu(false);
+    if (sendPower(action)) setPowerNote(item.sent(viewing.name));
+  };
 
   // Text from the machine: straight onto this computer's clipboard where
   // the browser allows it, otherwise shown to copy by hand.
@@ -758,6 +831,18 @@ function Viewer({
     document.addEventListener("pointerdown", onPointer);
     return () => document.removeEventListener("pointerdown", onPointer);
   }, [clipMenu]);
+  useEffect(() => {
+    if (!powerMenu) return;
+    const onPointer = (event: PointerEvent): void => {
+      const target = event.target as Element | null;
+      if (target?.closest(".stage-menu, [data-power-menu]") == null) {
+        setPowerMenu(false);
+        setArmed(null);
+      }
+    };
+    document.addEventListener("pointerdown", onPointer);
+    return () => document.removeEventListener("pointerdown", onPointer);
+  }, [powerMenu]);
 
   useEffect(() => {
     const onChange = (): void => {
@@ -848,8 +933,30 @@ function Viewer({
             </button>
           )}
           {clipboardMenu && (
-            <button type="button" data-clip-menu aria-expanded={clipMenu} onClick={() => setClipMenu(!clipMenu)}>
+            <button
+              type="button"
+              data-clip-menu
+              aria-expanded={clipMenu}
+              onClick={() => {
+                setPowerMenu(false);
+                setClipMenu(!clipMenu);
+              }}
+            >
               {clipboard.waiting ? "Getting…" : "Clipboard ▾"}
+            </button>
+          )}
+          {canPower && (
+            <button
+              type="button"
+              data-power-menu
+              aria-expanded={powerMenu}
+              onClick={() => {
+                setClipMenu(false);
+                setArmed(null);
+                setPowerMenu(!powerMenu);
+              }}
+            >
+              Power ▾
             </button>
           )}
           {onScreen && (
@@ -885,6 +992,21 @@ function Viewer({
                 Copy the machine's clipboard to mine
               </button>
             )}
+          </div>
+        )}
+        {canPower && powerMenu && (
+          <div className="stage-menu" role="menu">
+            {POWER_ITEMS.map((item) => (
+              <button
+                key={item.action}
+                type="button"
+                role="menuitem"
+                className={armed === item.action ? "armed" : undefined}
+                onClick={() => choosePower(item.action)}
+              >
+                {armed === item.action ? `${item.label} ${viewing.name}? ${item.warning} Click again.` : item.label}
+              </button>
+            ))}
           </div>
         )}
         <div
@@ -929,6 +1051,7 @@ function Viewer({
             <span>Text copied on the machine comes to your clipboard while this page has focus.</span>
           )}
           {clipNote !== null && <span>{clipNote}</span>}
+          {powerNote !== null && <span>{powerNote}</span>}
           {input.active && (
             <span>
               The machine's own pointer isn't in the picture; yours stands in for it.{" "}
@@ -1215,6 +1338,9 @@ function signalFor({
   if (selected === null) return null;
 
   if (!onScreen) {
+    if (!selected.online && selected.restarting === true) {
+      return <Signal label="Restarting">{selected.name} is restarting, and can be connected to once it's back.</Signal>;
+    }
     if (!selected.online) {
       return (
         <Signal label="Offline">
@@ -1243,7 +1369,11 @@ function signalFor({
     );
   }
   if (!selected.online) {
-    return (
+    return selected.restarting === true ? (
+      <Signal label="Restarting" over={over} searching>
+        {selected.name} is restarting. The view resumes when it's back, at its sign-in screen.
+      </Signal>
+    ) : (
       <Signal label="Machine offline" over={over} searching>
         {selected.name} went offline. The view resumes when it reconnects.
       </Signal>

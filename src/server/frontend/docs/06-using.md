@@ -36,6 +36,34 @@ control**, enter a code from your authenticator first (see
 If your connection drops, the dashboard reconnects on its own and the
 view picks up where it was.
 
+## Signing in remotely
+
+When nobody is signed in, after a restart, a crash or a sign-out, the
+screen shows the Windows sign-in screen. Click it and type the password
+as you would at the PC. When the session opens, the view follows it.
+
+This works unless the PC asks for `Ctrl+Alt+Del` before signing in,
+because the dashboard can't send it. Turning that requirement off is a
+trade-off you have to choose yourself. The requirement protects against
+fake sign-in screens from someone at the PC. To turn it off, open
+`secpol.msc` > Local Policies > Security Options and enable
+**Interactive logon: Do not require CTRL+ALT+DEL**.
+
+## Power
+
+**Power ▾** above the screen (needs control, and a fresh code):
+
+- **Lock** puts the sign-in screen up. The session and its apps wait
+  behind it.
+- **Sign out** ends the session that's signed in.
+- **Restart** restarts the machine. It shows as **Restarting** until it's
+  back, then the view comes back by itself at the sign-in screen.
+- **Shut down** turns it off. It stays off until someone turns it on.
+
+Sign out, Restart and Shut down close every app, **saved or not**, so
+they ask for a second click. A machine older than this dashboard has no
+Power menu until it's updated.
+
 ## Clipboard
 
 **Clipboard ▾** under the screen:

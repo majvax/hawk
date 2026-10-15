@@ -17,7 +17,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
-use crate::protocol::{DashboardEvent, DeviceCommand, MachineView, SignedView, is_keyframe};
+use crate::protocol::{DashboardEvent, DeviceCommand, MachineView, POWER_PROTOCOL, SignedView, is_keyframe};
 
 pub type DashboardId = u64;
 
@@ -118,7 +118,22 @@ struct Device {
     /// As the machine reports them: its release, and an update it holds.
     version: Option<String>,
     update_available: Option<String>,
+    /// The protocol the machine said it speaks in its hello.
+    protocol: u32,
 }
+
+/// What a machine says about itself in its hello.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceInfo {
+    /// Its release, e.g. "1.0.0".
+    pub version: Option<String>,
+    /// The protocol it speaks; 0 for one older than the field.
+    pub protocol: u32,
+}
+
+/// How long a machine that said it's restarting shows as such before it's
+/// simply offline. A restart with updates to install can take a while.
+pub const RESTART_GRACE: i64 = 10 * 60;
 
 impl Device {
     fn send(&self, command: DeviceCommand) {
@@ -145,6 +160,9 @@ pub enum Answer {
 #[derive(Default)]
 struct Inner {
     devices: HashMap<String, Device>,
+    /// Machines that said they're restarting: until when to show them so.
+    /// Kept apart from `devices`, since they're mostly offline meanwhile.
+    restarting: HashMap<String, i64>,
     dashboards: HashMap<DashboardId, Dashboard>,
     /// Where single-view endings are reported; unset in a registry that
     /// nothing listens to.
@@ -185,6 +203,8 @@ impl Inner {
             update_available: device
                 .filter(|_| row.role == Role::Owner)
                 .and_then(|device| device.update_available.clone()),
+            restarting: self.restarting.get(&row.public_id).is_some_and(|until| *until > auth::now()),
+            power: row.role.can_control() && device.is_some_and(|device| device.protocol >= POWER_PROTOCOL),
         }
     }
 
@@ -294,7 +314,7 @@ impl Registry {
         &self,
         machine_id: &str,
         owner_id: i64,
-        version: Option<String>,
+        info: DeviceInfo,
         outbound: mpsc::UnboundedSender<DeviceOutbound>,
     ) -> u64 {
         let connection = self.next_id();
@@ -308,10 +328,12 @@ impl Registry {
             connected_at: OffsetDateTime::now_utc(),
             outbound,
             viewers: HashMap::new(),
-            version,
+            version: info.version,
             update_available: None,
+            protocol: info.protocol,
         };
         inner.devices.insert(machine_id.to_owned(), device);
+        inner.restarting.remove(machine_id); // it's back
         inner.publish(machine_id);
         connection
     }
@@ -621,6 +643,34 @@ impl Registry {
         }
     }
 
+    /// The machine said it's restarting: show it so until it's back, or
+    /// for RESTART_GRACE. Only from its current connection.
+    pub fn going_down(&self, machine_id: &str, connection: u64, restart: bool) {
+        let mut inner = self.lock();
+        if !restart || inner.devices.get(machine_id).is_none_or(|device| device.connection != connection) {
+            return;
+        }
+        inner.restarting.insert(machine_id.to_owned(), auth::now() + RESTART_GRACE);
+        inner.publish(machine_id);
+    }
+
+    /// A restarting machine's grace ran out: if it isn't back, show it as
+    /// just offline.
+    pub fn restart_overdue(&self, machine_id: &str) {
+        let mut inner = self.lock();
+        let now = auth::now();
+        if inner.restarting.get(machine_id).is_some_and(|until| *until <= now) {
+            inner.restarting.remove(machine_id);
+            inner.publish(machine_id);
+        }
+    }
+
+    /// Passes a sealed power action on to the machine if this dashboard may
+    /// control it and is watching it, elevated.
+    pub fn power(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        self.pass_on(dashboard_id, machine_id, Role::can_control, DeviceCommand::Power { viewer: dashboard_id, sealed })
+    }
+
     /// Passes the owner's go-ahead for an update on. Anyone else is ignored.
     pub fn install_update(&self, dashboard_id: DashboardId, machine_id: &str) {
         let inner = self.lock();
@@ -790,7 +840,7 @@ mod tests {
         let (handle, events_rx) = handle(user_id);
         let dashboard = registry.add_dashboard(handle, vec![row(role)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, None, outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture)));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
@@ -803,7 +853,7 @@ mod tests {
         let (handle, _events) = handle(2);
         let dashboard = registry.add_dashboard(handle, vec![row(Role::View)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, None, outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture)));
         let Some(DeviceCommand::ViewerJoin { viewer, grant, .. }) = next(&mut device_rx) else { panic!("no join") };
@@ -838,13 +888,14 @@ mod tests {
         handle.step_up = StepUp { mfa: true, at: None };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Owner)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, None, outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert_eq!(next_elevation(&mut events), Some(false));
         while next(&mut device_rx).is_some() {}
 
         assert!(!registry.input(dashboard, MACHINE, "sealed".to_owned()));
         assert!(!registry.shell(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.power(dashboard, MACHINE, "sealed".to_owned()));
         registry.elevate(dashboard, MACHINE);
         assert_eq!(next_elevation(&mut events), Some(false));
 
@@ -853,6 +904,83 @@ mod tests {
         assert_eq!(next_elevation(&mut events), Some(true));
         assert!(registry.input(dashboard, MACHINE, "sealed".to_owned()));
         assert!(registry.shell(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(registry.power(dashboard, MACHINE, "sealed".to_owned()));
+    }
+
+    /// Restarting or signing out is control's to ask for, never a view
+    /// share's or a dev share's.
+    #[test]
+    fn power_needs_control() {
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
+        assert!(registry.power(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Power { viewer, .. }) if viewer == dashboard));
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::View);
+        assert!(!registry.power(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        // A dev share watches no stream, so it isn't `watching`'s shape.
+        let registry = Registry::default();
+        let (handle, _events) = handle(2);
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::Dev)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.power(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// The last machine view `events` carries.
+    fn last_view(events: &mut mpsc::UnboundedReceiver<Outbound>) -> Option<MachineView> {
+        let mut last = None;
+        while let Ok(Outbound::Event(event)) = events.try_recv() {
+            match *event {
+                DashboardEvent::MachineUpdated { machine } => last = Some(machine),
+                DashboardEvent::Snapshot { mut machines } => last = machines.pop(),
+                _ => {}
+            }
+        }
+        last
+    }
+
+    /// A machine that said it's restarting shows so while it's gone, and
+    /// stops the moment it's back.
+    #[test]
+    fn restarting_lasts_until_the_machine_is_back() {
+        let registry = Registry::default();
+        let (handle, mut events) = handle(1);
+        registry.add_dashboard(handle, vec![row(Role::Owner)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        let info = DeviceInfo { version: None, protocol: POWER_PROTOCOL };
+        let connection = registry.add_device(MACHINE, 1, info.clone(), outbound);
+        assert!(last_view(&mut events).is_some_and(|view| view.power && !view.restarting));
+
+        registry.going_down(MACHINE, connection + 1, true); // not its connection
+        assert!(last_view(&mut events).is_none());
+        registry.going_down(MACHINE, connection, true);
+        assert!(last_view(&mut events).is_some_and(|view| view.restarting));
+        registry.remove_device(MACHINE, connection, auth::now());
+        assert!(last_view(&mut events).is_some_and(|view| view.restarting && !view.online && !view.power));
+        registry.restart_overdue(MACHINE); // not overdue yet
+        assert!(last_view(&mut events).is_none());
+
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, info, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| view.online && !view.restarting));
+    }
+
+    /// A shut down isn't a restart: the machine is just offline after it.
+    #[test]
+    fn shutting_down_is_not_restarting() {
+        let registry = Registry::default();
+        let (handle, mut events) = handle(1);
+        registry.add_dashboard(handle, vec![row(Role::Owner)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        let connection = registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
+        assert!(last_view(&mut events).is_some_and(|view| !view.power));
+        registry.going_down(MACHINE, connection, false);
+        registry.remove_device(MACHINE, connection, auth::now());
+        assert!(last_view(&mut events).is_some_and(|view| !view.restarting));
     }
 
     #[test]
@@ -973,7 +1101,7 @@ mod tests {
             };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Control)]);
         let (outbound, _device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, None, outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
         let file = |sealed: &str| DashboardEvent::File { device_id: MACHINE.to_owned(), sealed: sealed.to_owned() };
         assert!(!registry.forward_bulk(MACHINE, dashboard, file("early")));
         assert!(registry.start_view(dashboard, MACHINE, join()));
@@ -992,7 +1120,7 @@ mod tests {
         let (handle, _events) = handle(2);
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Dev)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, None, outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
         assert!(next(&mut device_rx).is_none(), "no capture for a dev share");

@@ -181,7 +181,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [ ] Audio (WASAPI loopback, Opus) alongside the video stream
 - [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
 - [x] File transfer into and out of one drop folder, resumable and hash-checked, off unless the machine's config turns it on
-- [ ] Remote power actions, reboot-and-reconnect, Wake-on-LAN via a LAN peer
+- [x] Remote power actions (lock, sign out, restart, shut down), reboot-and-reconnect, remote sign-in at the sign-in screen
+- [ ] Wake-on-LAN via a LAN peer, sleep and hibernate
 - [ ] Relay operations: container image, health endpoints, metrics, backups
 - [ ] Trusted devices (remember a browser after MFA)
 - [x] Separately hosted dashboard: bearer-token sessions, `HAWK_ALLOWED_ORIGINS` (CORS + socket `Origin` allow-list), relay address entered in the browser, protocol version in the handshake
@@ -600,7 +601,16 @@ table, turns file transfer off.
 Both pair especially well with the **dev** role: a shell plus a clipboard
 plus a file drop covers most of what the GUI was being used for.
 
-### Remote power actions, reboot-and-reconnect and Wake-on-LAN
+### Remote power actions, reboot-and-reconnect and Wake-on-LAN (built, except Wake-on-LAN, sleep and hibernate)
+
+Built: lock, sign out, restart and shut down from the live view's **Power
+▾** menu, sealed end to end like input. The relay holds a machine that
+announced a restart as *restarting* for up to ten minutes. hawk-capture
+runs at the sign-in screen when nobody is signed in, and the service
+relaunches it whenever the console moves to another session. Still to
+come: sleep, hibernate and Wake-on-LAN. Lock is a disconnect of the
+console session (`WTSDisconnectSession`), which the service can do
+without going through the helper. The original plan:
 
 The usual reason to still need someone physically at the machine is that it
 needs a restart, or it's off.

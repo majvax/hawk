@@ -17,7 +17,7 @@ namespace hawk::service {
 struct CaptureHostError {
     enum class Code : std::uint8_t {
         already_running,
-        no_user_session,
+        no_user_session,  // no session is attached to the console
         pipe_failed,
         launch_failed,
     };
@@ -98,6 +98,11 @@ public:
     // False once stopped, or once hawk-capture exits or breaks the pipe on
     // its own (stop() must still be called to clean up in that case).
     [[nodiscard]] bool is_running() const noexcept;
+
+    // The console session the last start() launched hawk-capture into. The
+    // console moves to another session when someone signs out or switches
+    // user, and capture has to be started again to follow it.
+    [[nodiscard]] std::uint32_t session() const noexcept;
 
 private:
     struct Impl;

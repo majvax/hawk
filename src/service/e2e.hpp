@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "crypto.hpp"
 #include "machine_key.hpp"
+#include "power.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -133,6 +134,10 @@ public:
     // whose grant says analytics=1, while the config has metrics on.
     [[nodiscard]] std::optional<ChannelMessage> metrics(std::uint64_t viewer, std::string_view sealed);
     bool send_metrics(std::uint64_t viewer, const ChannelMessage& message);
+
+    // Opens one sealed power request; returns the action if it's genuine,
+    // new, and from a viewer with control (or the owner).
+    [[nodiscard]] std::optional<PowerAction> power(std::uint64_t viewer, std::string_view sealed);
 
     // "AB12 CD34 ..." for the viewer's identity key, for the log; empty
     // for a viewer that isn't here.

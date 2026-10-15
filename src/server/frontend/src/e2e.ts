@@ -44,7 +44,7 @@ import {
 } from "./crypto.js";
 import type { Identity } from "./keys.js";
 import { checkContact, forgetPendingEnrollment, pendingEnrollment, savePendingEnrollment } from "./keystore.js";
-import type { InputEvent, Machine, ParsedVideoFrame, Role } from "./protocol.js";
+import type { InputEvent, Machine, ParsedVideoFrame, PowerAction, Role } from "./protocol.js";
 
 const NO_SALT = new Uint8Array(0);
 
@@ -226,6 +226,10 @@ const CLIPBOARD_PUSH = 4;
 const FILE_AAD = utf8("hawk-file-v1");
 const SHELL_AAD = utf8("hawk-shell-v1");
 const METRICS_AAD = utf8("hawk-metrics-v1");
+const POWER_AAD = utf8("hawk-power-v1");
+// The byte a sealed power request carries; must match PowerAction in
+// src/service/power.hpp.
+const POWER_ACTIONS: Record<PowerAction, number> = { lock: 1, sign_out: 2, restart: 3, shut_down: 4 };
 
 // One file- or shell-channel message from the machine, opened.
 export interface ChannelMessage {
@@ -447,6 +451,12 @@ export class ViewSession {
   // The same for the metrics channel (owner, and shares with analytics).
   sealMetrics(op: number, header: object): Promise<string> | null {
     return this.sealChannel(op, header, undefined, METRICS_AAD);
+  }
+
+  // Seals a power action: one byte saying which. Numbered from the input
+  // counter like everything sent.
+  sealPower(action: PowerAction): Promise<string> | null {
+    return this.sealRequest(new Uint8Array([POWER_ACTIONS[action]]), POWER_AAD);
   }
 
   // A file-channel message from the machine; null for anything that

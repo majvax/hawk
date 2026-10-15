@@ -23,10 +23,10 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
+    MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
-use crate::registry::{Answer, DashboardHandle, DeviceOutbound, Outbound, Registry, StepUp};
+use crate::registry::{Answer, DashboardHandle, DeviceInfo, DeviceOutbound, Outbound, RESTART_GRACE, Registry, StepUp};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -142,13 +142,14 @@ async fn send_command(sink: &mut DeviceSink, command: &DeviceCommand) -> bool {
     }
 }
 
-/// Runs hello -> challenge -> proof. Returns the authenticated machine, and
-/// who it was enrolled for if this connection enrolled it.
+/// Runs hello -> challenge -> proof. Returns the authenticated machine, who
+/// it was enrolled for if this connection enrolled it, and what it said
+/// about itself.
 async fn authenticate_device(
     state: &AppState,
     sink: &mut DeviceSink,
     stream: &mut DeviceStream,
-) -> Result<(MachineAuth, Option<EnrollmentOwner>, Option<String>), Refusal> {
+) -> Result<(MachineAuth, Option<EnrollmentOwner>, DeviceInfo), Refusal> {
     let Some(DeviceMessage::Hello {
         machine_id: hostname,
         machine,
@@ -167,6 +168,7 @@ async fn authenticate_device(
     }
     let hostname: String = hostname.chars().take(255).collect();
     let version = version.map(|version| version.chars().take(32).collect::<String>());
+    let info = DeviceInfo { version, protocol: protocol.unwrap_or(0) };
     let claim =
         resolve_claim(state, HelloClaim { machine, enroll_code_hash, public_key, key_storage, binding }).await?;
 
@@ -188,7 +190,7 @@ async fn authenticate_device(
         Claim::Existing { public_id, owner_id, .. } => {
             let id = public_id.clone();
             state.db.call(move |conn| db::record_connect(conn, &id, &hostname, now)).await?;
-            Ok((MachineAuth { public_id, owner_id }, None, version))
+            Ok((MachineAuth { public_id, owner_id }, None, info))
         }
         Claim::Enroll { code_hash, public_key, key_storage, binding } => {
             let public_id = uuid::Uuid::new_v4().to_string();
@@ -209,7 +211,7 @@ async fn authenticate_device(
                 // The code was used by another connection while this one signed.
                 .ok_or(Refusal::Unknown)?;
             let (machine, owner) = enrolled;
-            Ok((machine, Some(owner), version))
+            Ok((machine, Some(owner), info))
         }
     }
 }
@@ -217,7 +219,7 @@ async fn authenticate_device(
 async fn handle_device(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
-    let (machine, enrolled, version) = match authenticate_device(&state, &mut sink, &mut stream).await {
+    let (machine, enrolled, info) = match authenticate_device(&state, &mut sink, &mut stream).await {
         Ok(result) => result,
         Err(Refusal::Malformed) => {
             warn!("relay: device sent a malformed or incomplete handshake, closing");
@@ -258,7 +260,7 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     }
 
     let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
-    let connection = state.registry.add_device(&machine_id, machine.owner_id, version, outbound);
+    let connection = state.registry.add_device(&machine_id, machine.owner_id, info, outbound);
     info!(%machine_id, "relay: machine connected");
 
     // Before any viewer can join, so a revoked one is refused.
@@ -290,10 +292,27 @@ async fn handle_device(socket: WebSocket, state: AppState) {
         match message {
             Message::Binary(frame) => state.registry.forward_frame(&machine_id, frame),
             Message::Text(text) => {
-                if let Ok(DeviceMessage::UpdateStatus { available }) = serde_json::from_str::<DeviceMessage>(&text) {
-                    let available = available.map(|version| version.chars().take(32).collect());
-                    state.registry.set_update_available(&machine_id, connection, available);
-                    continue;
+                match serde_json::from_str::<DeviceMessage>(&text) {
+                    Ok(DeviceMessage::UpdateStatus { available }) => {
+                        let available = available.map(|version| version.chars().take(32).collect());
+                        state.registry.set_update_available(&machine_id, connection, available);
+                        continue;
+                    }
+                    Ok(DeviceMessage::GoingDown { restart }) => {
+                        info!(%machine_id, restart, "relay: machine is going down");
+                        state.registry.going_down(&machine_id, connection, restart);
+                        if restart {
+                            // Back to plain offline if it doesn't come back.
+                            let registry = Arc::clone(&state.registry);
+                            let overdue = machine_id.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(RESTART_GRACE.unsigned_abs() + 1)).await;
+                                registry.restart_overdue(&overdue);
+                            });
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
                 route_device_answer(&state.registry, &machine_id, &text, &mut clipboard_budgets);
             }
@@ -518,6 +537,12 @@ async fn handle_dashboard(
                 // Keystrokes, the odd paste, resizes and acks.
                 if sealed.len() <= MAX_SEALED_SHELL_LEN && shell_budget.take_n(sealed.len() as f64) {
                     registry.shell(dashboard_id, &device_id, sealed);
+                }
+            }
+            Ok(DashboardCommand::Power { device_id, sealed }) => {
+                // By hand, after a confirmation: the input budget is plenty.
+                if sealed.len() <= MAX_SEALED_POWER_LEN && input_budget.take() {
+                    registry.power(dashboard_id, &device_id, sealed);
                 }
             }
             Ok(DashboardCommand::Metrics { device_id, sealed }) => {

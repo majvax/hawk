@@ -84,6 +84,28 @@ private:
     return UniqueHandle(token);
 }
 
+// Enables one privilege on this process's token. SYSTEM holds the ones the
+// service needs but Windows leaves them disabled until asked.
+[[nodiscard]] inline bool enable_privilege(const wchar_t* name) {
+    HANDLE raw = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &raw) == FALSE) {
+        return false;
+    }
+    const UniqueHandle token(raw);
+    LUID               luid{};
+    if (LookupPrivilegeValueW(nullptr, name, &luid) == FALSE) {
+        return false;
+    }
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (AdjustTokenPrivileges(token.get(), FALSE, &privileges, 0, nullptr, nullptr) == FALSE) {
+        return false;
+    }
+    return GetLastError() == ERROR_SUCCESS;  // ERROR_NOT_ALL_ASSIGNED comes back here, not as a failure
+}
+
 // nullopt for text that isn't UTF-8.
 [[nodiscard]] inline std::optional<std::wstring> to_wide(std::string_view text) {
     if (text.empty()) {

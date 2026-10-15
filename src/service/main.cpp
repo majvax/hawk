@@ -7,6 +7,7 @@
 #include "machine_identity.hpp"
 #include "machine_key.hpp"
 #include "metrics.hpp"
+#include "power.hpp"
 #include "updater.hpp"
 #include "websocket/websocket.hpp"
 
@@ -30,6 +31,7 @@
 #include <format>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -52,7 +54,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 2;
+constexpr std::uint32_t kProtocolVersion = 3;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -88,6 +90,14 @@ struct UpdateStatusMessage {
     std::optional<std::string> available;
 };
 
+// Tells the relay this machine is about to restart or shut down, so the
+// dashboards show it as restarting rather than just gone. Only ever sent
+// once Windows has accepted the shutdown.
+struct GoingDownMessage {
+    std::string type = "going_down";
+    bool        restart = false;
+};
+
 // Answers the relay's challenge.
 struct ProofMessage {
     std::string type = "proof";
@@ -109,7 +119,7 @@ struct RelayCommand {
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard, file, shell
+    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power
     std::vector<svc::SignedStatement>            revocations;    // revocations
 };
 
@@ -128,6 +138,12 @@ template <>
 struct glz::meta<hawk::service::SignedStatement> {
     using T                     = hawk::service::SignedStatement;
     static constexpr auto value = object("statement", &T::statement, "signature", &T::signature);
+};
+
+template <>
+struct glz::meta<GoingDownMessage> {
+    using T                     = GoingDownMessage;
+    static constexpr auto value = object("type", &T::type, "restart", &T::restart);
 };
 
 template <>
@@ -337,7 +353,8 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
     return {};
 }
 
-// Launches hawk-capture in the logged-on user's session and forwards every
+// Launches hawk-capture in the console session (the sign-in screen when
+// nobody is signed in) and forwards every
 // packet it produces to the relay, sealed for the machine's viewers. With
 // the clipboard allowed, what hawk-capture reads off it goes to the viewers
 // that asked (or, in sync mode, everyone who may read it).
@@ -433,7 +450,28 @@ struct Connection {
     svc::MetricsRecorder*                recorder;  // null with [[metrics]] off
     const svc::MachineConfig&            config;
     svc::Updater&                        updater;
+    // A viewer asked for the stream (start_capture) and hasn't stopped it:
+    // CaptureSupervisor keeps hawk-capture running until then.
+    bool capture_wanted = false;
 };
+
+// Carries out a power action a viewer asked for, and for a restart or shut
+// down tells the relay before the connection drops.
+void RunPowerAction(net::WebSocketClient& client, svc::PowerAction action) {
+    if (auto done = svc::perform(action); !done.has_value()) {
+        spdlog::error("power: couldn't {}: {}", svc::to_string(action), done.error());
+        return;
+    }
+    if (!svc::goes_down(action)) {
+        return;
+    }
+    const GoingDownMessage message{.restart = action == svc::PowerAction::restart};
+    if (auto json = glz::write_json(message); json.has_value()) {
+        if (auto sent = client.send_text(*json); !sent.has_value()) {
+            spdlog::warn("relay: failed to say the machine is going down: {}", net::to_string(sent.error()));
+        }
+    }
+}
 
 // The connection's viewers, once the machine knows its id.
 void OpenViewerHub(Connection& connection) {
@@ -472,7 +510,8 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
-    auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater] = connection;
+    auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater, capture_wanted] =
+        connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -493,8 +532,10 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         // Not enrolled, or the owner key didn't check out: nothing to serve.
         spdlog::debug("relay: ignoring \"{}\" before enrollment", command.type);
     } else if (command.type == "start_capture") {
+        capture_wanted = true;
         StartCapture(client, capture, *hub, config.clipboard);
     } else if (command.type == "stop_capture") {
+        capture_wanted = false;
         capture.stop();
     } else if (command.type == "viewer_join") {
         hub->join(command.viewer, {.statement = command.statement, .signature = command.signature}, command.grant);
@@ -537,6 +578,10 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         if (auto message = hub->metrics(command.viewer, command.sealed); message.has_value() && metrics != nullptr) {
             metrics->handle(command.viewer, std::move(*message));
         }
+    } else if (command.type == "power") {
+        if (const auto action = hub->power(command.viewer, command.sealed); action.has_value()) {
+            RunPowerAction(client, *action);
+        }
     } else if (command.type == "revocations") {
         hub->apply_revocations(command.revocations);
     } else {
@@ -563,6 +608,54 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
             }
         },
         message);
+}
+
+// How often CaptureSupervisor looks at hawk-capture, and how long it waits
+// before relaunching one that keeps failing.
+constexpr std::chrono::seconds kCaptureCheckInterval{1};
+constexpr std::chrono::seconds kCaptureRetryMax{30};
+
+// Keeps hawk-capture running for as long as a viewer wants the stream.
+// Signing in, signing out or switching user moves the console to another
+// session or ends the one hawk-capture ran in; this relaunches it there, so
+// the view goes from the sign-in screen into the session that opens without
+// the viewer doing anything. A helper that keeps failing is retried less
+// and less often. Everything it touches is the relay thread's, so it holds
+// `lock` while it works, which the relay thread holds around each command.
+void CaptureSupervisor(const std::stop_token& stop_token, std::mutex& lock, Connection& connection) {
+    auto retry_delay = kCaptureCheckInterval;
+    auto next_attempt = std::chrono::steady_clock::now();
+    auto started_at = std::chrono::steady_clock::now();
+    while (!stop_token.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const auto now = std::chrono::steady_clock::now();
+        const std::scoped_lock guard(lock);
+        if (!connection.capture_wanted || connection.hub == nullptr) {
+            retry_delay = kCaptureCheckInterval;
+            continue;
+        }
+        const DWORD console = WTSGetActiveConsoleSessionId();
+        auto&       capture = connection.capture;
+        if (capture.is_running() && capture.session() == console) {
+            if (now - started_at > kCaptureRetryMax) {
+                retry_delay = kCaptureCheckInterval;  // it ran fine; a later failure starts the backoff over
+            }
+            continue;
+        }
+        if (now < next_attempt) {
+            continue;
+        }
+        if (capture.is_running()) {
+            spdlog::info("capture: the console moved to session {}, following it", console);
+        } else {
+            spdlog::info("capture: hawk-capture isn't running, starting it again");
+        }
+        capture.stop();
+        StartCapture(connection.client, capture, *connection.hub, connection.config.clipboard);
+        started_at = now;
+        next_attempt = now + retry_delay;
+        retry_delay = std::min(retry_delay * 2, kCaptureRetryMax);
+    }
 }
 
 // Sleeps for `duration`, waking early if the service is stopping.
@@ -674,6 +767,11 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
             SendUpdateStatus(client, available);
         }
 
+        std::mutex   capture_lock;
+        std::jthread supervisor([&capture_lock, &connection](const std::stop_token& token) {
+            CaptureSupervisor(token, capture_lock, connection);
+        });
+
         std::optional<std::uint16_t> close_code;
         while (!stop_token.stop_requested()) {
             auto message = client.receive();
@@ -681,11 +779,14 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
                 spdlog::warn("relay: receive failed: {}", net::to_string(message.error()));
                 break;
             }
+            const std::scoped_lock guard(capture_lock);
             close_code = HandleRelayMessage(*message, connection);
             if (close_code.has_value()) {
                 break;
             }
         }
+        supervisor.request_stop();
+        supervisor.join();
 
         // Capture only runs on behalf of a viewer reached through this
         // connection; stop it before the socket it forwards to goes away,

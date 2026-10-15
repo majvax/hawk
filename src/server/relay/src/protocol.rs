@@ -11,7 +11,10 @@ use crate::db::{Role, Signed};
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The first protocol whose machines take power actions.
+pub const POWER_PROTOCOL: u32 = 3;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -106,6 +109,13 @@ pub enum DeviceMessage {
     /// A metrics-channel message sealed for one viewer: a sample, a range of
     /// history, the process list. Queued with file data.
     Metrics { viewer: u64, sealed: String },
+    /// The machine is about to restart (or shut down): Windows has accepted
+    /// it, and the connection drops shortly. Only ever about the machine
+    /// itself, so nothing a viewer could be misled by.
+    GoingDown {
+        #[serde(default)]
+        restart: bool,
+    },
 }
 
 /// Messages the relay sends down to a device.
@@ -150,6 +160,10 @@ pub enum DeviceCommand {
     /// A metrics-channel request sealed by the viewer. Only passed on for
     /// the owner and shares with analytics.
     Metrics { viewer: u64, sealed: String },
+    /// A power action (lock, sign out, restart, shut down) sealed by the
+    /// viewer. Only passed on for control, elevated; the machine checks the
+    /// role again before acting on it.
+    Power { viewer: u64, sealed: String },
     /// Every revocation the owner has signed for this machine.
     Revocations { revocations: Vec<SignedView> },
     /// The owner asks the machine to install the update it's holding now.
@@ -188,6 +202,9 @@ pub const MAX_STATEMENT_LEN: usize = 1024;
 /// A sealed input event: a JSON event of a few dozen bytes, plus counter
 /// and tag, in base64.
 pub const MAX_SEALED_INPUT_LEN: usize = 512;
+/// A sealed power request: counter, one byte saying which action, and the
+/// tag, in base64.
+pub const MAX_SEALED_POWER_LEN: usize = (8 + 1 + 16_usize).div_ceil(3) * 4;
 /// A sealed clipboard message, either way: counter, one byte saying what it
 /// is, up to 256 KB of text and the tag, in base64.
 pub const MAX_SEALED_CLIPBOARD_LEN: usize = (8 + 1 + 256 * 1024 + 16_usize).div_ceil(3) * 4;
@@ -256,6 +273,9 @@ pub enum DashboardCommand {
     /// A sealed metrics request. Only passed on while viewing the machine
     /// as its owner, or with a share that allows analytics.
     Metrics { device_id: String, sealed: String },
+    /// A sealed power action. Only passed on while viewing the machine
+    /// with a control (or owner) role, elevated.
+    Power { device_id: String, sealed: String },
     /// The owner asks the machine to install the update it's holding.
     InstallUpdate { device_id: String },
 }
@@ -305,6 +325,12 @@ pub struct MachineView {
     /// its updater found and is holding until the owner says so.
     pub version: Option<String>,
     pub update_available: Option<String>,
+    /// The machine said it's restarting, and hasn't come back yet. Cleared
+    /// when it reconnects, or some minutes on if it doesn't.
+    pub restarting: bool,
+    /// While online: the machine takes power actions, and this user's role
+    /// may ask for them.
+    pub power: bool,
 }
 
 /// Messages pushed to connected dashboards.

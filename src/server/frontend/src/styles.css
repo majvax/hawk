@@ -1539,6 +1539,12 @@ select {
   background: var(--hover);
 }
 
+.stage-menu button.armed,
+.stage-menu button.armed:hover {
+  background: color-mix(in srgb, var(--err) 18%, transparent);
+  color: var(--err);
+}
+
 .stage-menu button:disabled {
   color: var(--fg-3);
   cursor: default;

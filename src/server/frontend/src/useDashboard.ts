@@ -23,6 +23,7 @@ import type {
   InputEvent,
   Machine,
   ParsedVideoFrame,
+  PowerAction,
   Role,
 } from "./protocol.js";
 
@@ -222,6 +223,11 @@ export interface Dashboard {
   elevate: () => void;
   // Owner only: tells the machine to install the update it's holding.
   installUpdate: (deviceId: string) => void;
+  // Asks the machine being watched to lock, sign out, restart or shut
+  // down. The relay drops it unless this view has control and is elevated,
+  // and the machine checks the role again. Returns false when there's no
+  // secured view with control to send it to.
+  sendPower: (action: PowerAction) => boolean;
   startView: (deviceId: string) => void;
   stopView: () => void;
   // Sends one input event to the machine being watched. The relay drops it
@@ -1047,6 +1053,27 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [send],
   );
 
+  const sendPower = useCallback(
+    (action: PowerAction): boolean => {
+      const deviceId = streamingRef.current;
+      const session = sessionRef.current;
+      if (deviceId === null || session === null || (session.role !== "owner" && session.role !== "control")) {
+        return false;
+      }
+      const sealed = session.sealPower(action);
+      if (sealed === null) return false;
+      // Through the input chain: it's numbered from the same counter.
+      inputChainRef.current = inputChainRef.current
+        .then(() => sealed)
+        .then((payload) => {
+          if (sessionRef.current === session) send({ type: "power", deviceId, sealed: payload });
+        })
+        .catch((error: unknown) => console.error("sealing power action:", error));
+      return true;
+    },
+    [send],
+  );
+
   return {
     machines,
     status,
@@ -1068,6 +1095,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     elevated,
     elevate,
     installUpdate,
+    sendPower,
     startView,
     stopView,
     sendInput,

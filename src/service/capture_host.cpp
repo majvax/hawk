@@ -3,6 +3,7 @@
 #include "common/capture_pipe.hpp"
 #include "common/clipboard_pipe.hpp"
 #include "common/input_pipe.hpp"
+#include "win_util.hpp"
 
 #include <windows.h>
 #include <sddl.h>
@@ -161,35 +162,13 @@ private:
     return path;
 }
 
-// Enables one privilege on this process's token. SYSTEM holds the ones we
-// need but Windows leaves them disabled until asked.
-[[nodiscard]] bool enable_privilege(const wchar_t* name) {
-    HANDLE raw = nullptr;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &raw) == FALSE) {
-        return false;
-    }
-    const UniqueHandle token(raw);
-    LUID               luid{};
-    if (LookupPrivilegeValueW(nullptr, name, &luid) == FALSE) {
-        return false;
-    }
-    TOKEN_PRIVILEGES privileges{};
-    privileges.PrivilegeCount = 1;
-    privileges.Privileges[0].Luid = luid;
-    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (AdjustTokenPrivileges(token.get(), FALSE, &privileges, 0, nullptr, nullptr) == FALSE) {
-        return false;
-    }
-    return GetLastError() == ERROR_SUCCESS;  // ERROR_NOT_ALL_ASSIGNED comes back here, not as a failure
-}
-
 // Builds a LocalSystem primary token aimed at `session`. The capture helper
 // runs from it, so it runs as SYSTEM *inside* the interactive session —
 // which is what lets it reach the secure desktop the UAC prompt and lock
 // screen live on (that desktop's DACL admits only SYSTEM) and follow the
 // switch to it. Retargeting a token's session needs SeTcbPrivilege.
 [[nodiscard]] std::expected<UniqueHandle, CaptureHostError> system_token_for_session(DWORD session) {
-    if (!enable_privilege(SE_TCB_NAME)) {
+    if (!win::enable_privilege(SE_TCB_NAME)) {
         return std::unexpected(make_error(CaptureHostError::Code::launch_failed, GetLastError(), "enable SeTcbPrivilege"));
     }
     HANDLE raw_self = nullptr;
@@ -369,6 +348,7 @@ struct CaptureHost::Impl {
     UniqueHandle      io_event;    // manual-reset; the reader's OVERLAPPED event
     std::jthread      reader;
     std::atomic<bool> running{false};
+    DWORD             session = 0;  // the console session hawk-capture was launched into
 
     // The input pipe is written from the thread that sends input, never from
     // the reader thread, so it gets its own OVERLAPPED event.
@@ -626,14 +606,9 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
                                                 .message = "no session is attached to the console"});
     }
 
-    // hawk-capture runs as SYSTEM, not as the user, but there is still only
-    // something to capture once someone is logged on.
-    HANDLE raw_token = nullptr;
-    if (WTSQueryUserToken(session, &raw_token) == FALSE) {
-        // ERROR_NO_TOKEN: nobody is logged on to the console session.
-        return std::unexpected(make_error(CaptureHostError::Code::no_user_session, GetLastError(), "WTSQueryUserToken"));
-    }
-    CloseHandle(raw_token);
+    // Nobody has to be signed in: hawk-capture runs as SYSTEM, so with no
+    // user it captures the sign-in screen, which is how a machine that just
+    // restarted gets signed in to remotely.
 
     static std::atomic<std::uint32_t> pipe_counter{0};
     const std::uint32_t               serial = pipe_counter.fetch_add(1);
@@ -693,6 +668,7 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
     impl_->clipboard_write_event = std::move(clipboard_write_event);
     impl_->clipboard_connected.store(false);
     impl_->clipboard_failed = false;
+    impl_->session = session;
     impl_->running.store(true);
     impl_->reader = std::jthread([impl = impl_.get(), handler = std::move(on_packet)] { impl->read_packets(handler); });
     if (impl_->clipboard_pipe) {
@@ -756,6 +732,10 @@ void CaptureHost::stop() noexcept {
 
 bool CaptureHost::is_running() const noexcept {
     return impl_->running.load();
+}
+
+std::uint32_t CaptureHost::session() const noexcept {
+    return impl_->session;
 }
 
 }  // namespace hawk::service

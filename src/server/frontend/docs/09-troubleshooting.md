@@ -43,8 +43,9 @@ Its key hasn't been checked, so nobody can watch it. See
 
 ## The screen stays black or never starts
 
-- **Nobody is signed in at the PC.** Capture needs an interactive
-  session. Sign in at the PC.
+- **Nobody is signed in at the PC.** An up-to-date machine shows the
+  sign-in screen (see [signing in remotely](/docs/using#signing-in-remotely)).
+  An older one needs someone to sign in at the PC, or an update.
 - Check that `hawk-capture.exe` sits beside `hawk-service.exe`, and look
   in the machine's log for why capture didn't start.
 

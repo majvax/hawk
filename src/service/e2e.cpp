@@ -41,6 +41,7 @@ constexpr std::string_view kClipboardAad = "hawk-clipboard-v1";
 constexpr std::string_view kFileAad = "hawk-file-v1";
 constexpr std::string_view kShellAad = "hawk-shell-v1";
 constexpr std::string_view kMetricsAad = "hawk-metrics-v1";
+constexpr std::string_view kPowerAad = "hawk-power-v1";
 // A file- or shell-channel plaintext: op, header length (u16, big-endian),
 // the JSON header, then bytes.
 constexpr std::size_t kChannelPreamble = 3;
@@ -658,6 +659,12 @@ struct ViewerHub::Impl {
     // Read-only, and only what the owner allowed: not part of any role.
     [[nodiscard]] bool may_use_metrics(const Viewer& viewer) const {
         return metrics_enabled && !viewer.refused && viewer.analytics;
+    }
+
+    // Restarting or signing out takes the machine from whoever sits at it:
+    // control or owner, as with input.
+    [[nodiscard]] static bool may_use_power(const Viewer& viewer) {
+        return !viewer.refused && can_control(viewer);
     }
 
     [[nodiscard]] bool may_set_clipboard(const Viewer& viewer) const {
@@ -1281,6 +1288,25 @@ crypto::Bytes ViewerHub::seal_frame(std::span<const std::byte> access_unit, bool
     frame.insert(frame.end(), nonce.begin(), nonce.end());
     frame.insert(frame.end(), sealed.begin(), sealed.end());
     return frame;
+}
+
+std::optional<PowerAction> ViewerHub::power(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !Impl::may_use_power(found->second)) {
+        spdlog::warn("power: viewer {} asked for a power action its role doesn't allow; ignored", viewer);
+        return std::nullopt;
+    }
+    const auto plain = Impl::open_request(found->second, sealed, kPowerAad);
+    if (!plain.has_value() || plain->size() != 1) {
+        return std::nullopt;
+    }
+    const auto action = to_power_action(std::to_integer<std::uint8_t>(plain->front()));
+    if (action.has_value()) {
+        spdlog::info("power: viewer {} ({}) asked to {}", viewer, found->second.fingerprint, to_string(*action));
+    }
+    return action;
 }
 
 }  // namespace hawk::service

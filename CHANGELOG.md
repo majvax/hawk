@@ -3,6 +3,19 @@
 Each release's section becomes its release notes (see
 `.github/workflows/release.yml`). Newest first.
 
+## Unreleased
+
+- **Sign in remotely.** With nobody signed in, after a restart, a crash
+  or a sign-out, the view shows the Windows sign-in screen instead of
+  nothing. When the session opens, the view follows it on its own.
+  Capture also starts again by itself if `hawk-capture` exits.
+- **Power ▾** in the live view: lock, sign out, restart and shut down,
+  for control and the owner, after a fresh code. The command is end-to-end
+  encrypted like input, so the relay can neither read nor forge it.
+- A machine restarting from the dashboard shows as **Restarting**, not
+  offline, and the view comes back by itself.
+- Protocol version 3.
+
 ## 1.0.0
 
 The first release.

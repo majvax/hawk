@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -70,7 +70,15 @@ export interface Machine {
   // updater is holding until the owner says to install it.
   version?: string | null;
   updateAvailable?: string | null;
+  // The machine said it's restarting and isn't back yet.
+  restarting?: boolean;
+  // While online: the machine takes power actions, and this user's role
+  // may ask for them.
+  power?: boolean;
 }
+
+// What a viewer with control can ask the machine to do with itself.
+export type PowerAction = "lock" | "sign_out" | "restart" | "shut_down";
 
 export type DashboardEvent =
   | { type: "snapshot"; machines: Machine[] }
@@ -142,6 +150,8 @@ export type DashboardCommand =
   | { type: "shell"; deviceId: string; sealed: string }
   // A metrics request (ViewSession.sealMetrics); owner, and shares with analytics.
   | { type: "metrics"; deviceId: string; sealed: string }
+  // A power action (ViewSession.sealPower); control and owner, elevated.
+  | { type: "power"; deviceId: string; sealed: string }
   // Owner only: install the update the machine is holding. The machine
   // checks the release's signature itself.
   | { type: "install_update"; deviceId: string };
