@@ -149,7 +149,7 @@ impl SecretKey {
         Self::from_bytes(&bytes).ok_or_else(|| format!("{} is not a 32-byte key", path.display()))
     }
 
-    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != 32 {
             return None;
         }

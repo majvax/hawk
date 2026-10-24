@@ -4,7 +4,7 @@
 //! the registry so open dashboards update (and lose access) immediately.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use crate::audit::{AuditLog, Client, Event, Kind, Use, ViewContext, ViewLog};
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::protocol::{
@@ -67,6 +68,8 @@ pub struct DashboardHandle {
     pub session_id: i64,
     pub email: String,
     pub step_up: StepUp,
+    /// Where the dashboard connected from, for the audit log.
+    pub client: Client,
 }
 
 /// Where the session behind a dashboard stands on step-up: whether its
@@ -111,6 +114,8 @@ struct Viewer {
     // the view starts or is elevated within the step-up window, and kept
     // until the view ends.
     elevated: bool,
+    // What the audit log hears about this view.
+    log: ViewLog,
 }
 
 struct Device {
@@ -210,6 +215,8 @@ struct Inner {
     /// Where single-view endings are reported; unset in a registry that
     /// nothing listens to.
     view_ended: Option<mpsc::UnboundedSender<ViewEnded>>,
+    /// Where views and what's done in them are recorded; unset likewise.
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl Inner {
@@ -277,8 +284,18 @@ impl Inner {
             device.send(DeviceCommand::StopCapture);
             device.stream = Stream::default();
         }
+        if let Some(event) = left.log.ended(auth::now()) {
+            self.record(event);
+        }
         self.publish(machine_id); // the owner's viewer list changed
         true
+    }
+
+    /// Queues an event for the audit log, never waiting for it.
+    fn record(&self, event: Event) {
+        if let Some(audit) = &self.audit {
+            audit.record(event);
+        }
     }
 
     /// Takes `machine_id` away from one dashboard.
@@ -325,9 +342,13 @@ impl Inner {
     /// Drops a device connection and tells its viewers the stream ended.
     fn drop_device(&mut self, machine_id: &str) -> Option<Device> {
         let device = self.devices.remove(machine_id)?;
-        for dashboard_id in device.viewers.keys() {
+        let now = auth::now();
+        for (dashboard_id, viewer) in &device.viewers {
             if let Some(dashboard) = self.dashboards.get(dashboard_id) {
                 dashboard.handle.send(DashboardEvent::CaptureEnded { device_id: machine_id.to_owned() });
+            }
+            if let Some(event) = viewer.log.ended(now) {
+                self.record(event);
             }
         }
         Some(device)
@@ -341,9 +362,13 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// A registry that reports single-view endings to `view_ended`.
-    pub fn new(view_ended: mpsc::UnboundedSender<ViewEnded>) -> Self {
-        Self { inner: Mutex::new(Inner { view_ended: Some(view_ended), ..Inner::default() }), next_id: AtomicU64::new(0) }
+    /// A registry that reports single-view endings to `view_ended`, and
+    /// records views in `audit`.
+    pub fn new(view_ended: mpsc::UnboundedSender<ViewEnded>, audit: Arc<AuditLog>) -> Self {
+        Self {
+            inner: Mutex::new(Inner { view_ended: Some(view_ended), audit: Some(audit), ..Inner::default() }),
+            next_id: AtomicU64::new(0),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -565,6 +590,7 @@ impl Registry {
             video,
             awaiting_keyframe: true,
             elevated,
+            log: ViewLog::new(ViewContext::new(dashboard.handle.user_id, &dashboard.handle.client, row)),
         };
         let Some(device) = inner.devices.get_mut(machine_id) else { return false };
         // Capture starts with the first viewer that watches the screen.
@@ -572,11 +598,15 @@ impl Registry {
         // Asked again while already watching (a fresh key exchange): start
         // over from the next keyframe, and stay elevated if it was.
         let mut elevated = elevated;
+        let mut took_control = None;
         device
             .viewers
             .entry(dashboard_id)
             .and_modify(|viewer| {
                 viewer.awaiting_keyframe = true;
+                if elevated && !viewer.elevated {
+                    took_control = Some(viewer.log.elevated());
+                }
                 viewer.elevated |= elevated;
                 elevated = viewer.elevated;
             })
@@ -598,6 +628,9 @@ impl Registry {
                 dashboard.handle.send(quality);
             }
         }
+        if let Some(event) = took_control {
+            inner.record(event);
+        }
         inner.publish(machine_id);
         true
     }
@@ -614,10 +647,16 @@ impl Registry {
         else {
             return;
         };
+        // Control taken mid-view; a view that started elevated says so as it
+        // starts.
+        let event = (allowed && !viewer.elevated).then(|| viewer.log.elevated());
         viewer.elevated |= allowed;
         let elevated = viewer.elevated;
         if let Some(dashboard) = inner.dashboards.get(&dashboard_id) {
             dashboard.handle.send(DashboardEvent::Elevation { device_id: machine_id.to_owned(), elevated });
+        }
+        if let Some(event) = event {
+            inner.record(event);
         }
     }
 
@@ -642,7 +681,8 @@ impl Registry {
     /// machine right now. The machine checks the role again against the
     /// owner's grant before acting on it. Returns whether it was passed on.
     pub fn input(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
-        self.pass_on(dashboard_id, machine_id, Role::can_control, DeviceCommand::Input { viewer: dashboard_id, sealed })
+        let command = DeviceCommand::Input { viewer: dashboard_id, sealed };
+        self.pass_on(dashboard_id, machine_id, Role::can_control, command, None)
     }
 
     /// Passes a sealed clipboard request on to the machine if this dashboard
@@ -682,30 +722,41 @@ impl Registry {
     /// pass one off as an ack. No fresh factor, as with pasting text. The
     /// machine checks the role again.
     pub fn clipboard_image_put(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
-        let inner = self.lock();
+        let mut inner = self.lock();
         let may = inner
             .dashboards
             .get(&dashboard_id)
             .and_then(|dashboard| dashboard.access.get(machine_id))
             .is_some_and(|row| row.role.can_control());
-        let Some(device) = inner.devices.get(machine_id) else { return false };
+        let inner = &mut *inner;
+        let Some(device) = inner.devices.get_mut(machine_id) else { return false };
         if !may || !device.viewers.contains_key(&dashboard_id) || device.protocol < IMAGE_CLIPBOARD_PROTOCOL {
             return false;
         }
         device.send(DeviceCommand::ClipboardImagePut { viewer: dashboard_id, sealed });
+        // Once per view, at the first chunk of its first picture.
+        if let Some(event) = device.viewers.get_mut(&dashboard_id).and_then(|viewer| viewer.log.used(Use::ClipboardImage))
+            && let Some(audit) = &inner.audit
+        {
+            audit.record(event);
+        }
         true
     }
 
     /// Passes a sealed file-channel message on to the machine if this
     /// dashboard may control it and is watching it. Returns whether it was.
     pub fn file(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
-        self.pass_on(dashboard_id, machine_id, Role::can_files, DeviceCommand::File { viewer: dashboard_id, sealed })
+        let used = Use::Files(sealed.len());
+        let command = DeviceCommand::File { viewer: dashboard_id, sealed };
+        self.pass_on(dashboard_id, machine_id, Role::can_files, command, Some(used))
     }
 
     /// Passes a sealed shell-channel message on to the machine if this
     /// dashboard may open shells there and is watching it, elevated.
     pub fn shell(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
-        self.pass_on(dashboard_id, machine_id, Role::can_shell, DeviceCommand::Shell { viewer: dashboard_id, sealed })
+        let used = Use::Shell(sealed.len());
+        let command = DeviceCommand::Shell { viewer: dashboard_id, sealed };
+        self.pass_on(dashboard_id, machine_id, Role::can_shell, command, Some(used))
     }
 
     /// Passes a sealed metrics request on to the machine if this dashboard
@@ -725,25 +776,35 @@ impl Registry {
         true
     }
 
+    /// Passes `command` on if the dashboard's role is `allowed` and its view
+    /// of the machine is elevated, and tells the view's log it was `used`.
     fn pass_on(
         &self,
         dashboard_id: DashboardId,
         machine_id: &str,
         allowed: fn(Role) -> bool,
         command: DeviceCommand,
+        used: Option<Use>,
     ) -> bool {
-        let inner = self.lock();
+        let mut inner = self.lock();
         let may = inner
             .dashboards
             .get(&dashboard_id)
             .and_then(|dashboard| dashboard.access.get(machine_id))
             .is_some_and(|row| allowed(row.role));
-        let Some(device) = inner.devices.get(machine_id) else { return false };
+        let inner = &mut *inner;
+        let Some(device) = inner.devices.get_mut(machine_id) else { return false };
         // Not elevated: the session owes a fresh second factor first.
         if !may || !device.viewers.get(&dashboard_id).is_some_and(|viewer| viewer.elevated) {
             return false;
         }
         device.send(command);
+        if let Some(used) = used
+            && let Some(event) = device.viewers.get_mut(&dashboard_id).and_then(|viewer| viewer.log.used(used))
+            && let Some(audit) = &inner.audit
+        {
+            audit.record(event);
+        }
         true
     }
 
@@ -751,10 +812,24 @@ impl Registry {
     /// without waiting: false when that viewer isn't watching or its queue
     /// is full.
     pub fn forward_bulk(&self, machine_id: &str, viewer: DashboardId, event: DashboardEvent) -> bool {
-        let inner = self.lock();
-        let watching = inner.devices.get(machine_id).is_some_and(|device| device.viewers.contains_key(&viewer));
-        let Some(dashboard) = inner.dashboards.get(&viewer).filter(|_| watching) else { return false };
-        dashboard.handle.bulk.try_send(event).is_ok()
+        let mut inner = self.lock();
+        let inner = &mut *inner;
+        let Some(watcher) = inner.devices.get_mut(machine_id).and_then(|device| device.viewers.get_mut(&viewer)) else {
+            return false;
+        };
+        let Some(dashboard) = inner.dashboards.get(&viewer) else { return false };
+        // Counted for the log as it goes: how much came down, never what.
+        let (shell, files) = match &event {
+            DashboardEvent::Shell { sealed, .. } => (sealed.len(), 0),
+            DashboardEvent::File { sealed, .. } => (0, sealed.len()),
+            _ => (0, 0),
+        };
+        if dashboard.handle.bulk.try_send(event).is_err() {
+            return false;
+        }
+        watcher.log.shell_received(shell);
+        watcher.log.files_received(files);
+        true
     }
 
     /// Routes the machine's answer to one of its viewers. A refused viewer
@@ -768,6 +843,14 @@ impl Registry {
         let device_id = machine_id.to_owned();
         let event = match answer {
             Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell, analytics, clipboard_images } => {
+                let started = inner
+                    .devices
+                    .get_mut(machine_id)
+                    .and_then(|device| device.viewers.get_mut(&viewer))
+                    .and_then(|watcher| watcher.log.accepted(watcher.elevated, auth::now()));
+                if let Some(started) = started {
+                    inner.record(started);
+                }
                 DashboardEvent::ViewAccepted {
                     device_id,
                     statement,
@@ -786,6 +869,14 @@ impl Registry {
             Answer::Sas { sealed } => DashboardEvent::Sas { device_id, sealed },
             Answer::ClipboardImageReply { sealed } => DashboardEvent::ClipboardImageReply { device_id, sealed },
             Answer::Reject { reason } => {
+                let refused = inner
+                    .devices
+                    .get(machine_id)
+                    .and_then(|device| device.viewers.get(&viewer))
+                    .map(|watcher| watcher.log.rejected(&reason));
+                if let Some(refused) = refused {
+                    inner.record(refused);
+                }
                 inner.detach(viewer, machine_id);
                 DashboardEvent::ViewRejected { device_id, reason }
             }
@@ -841,7 +932,8 @@ impl Registry {
     /// Passes a sealed power action on to the machine if this dashboard may
     /// control it and is watching it, elevated.
     pub fn power(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
-        self.pass_on(dashboard_id, machine_id, Role::can_control, DeviceCommand::Power { viewer: dashboard_id, sealed })
+        let command = DeviceCommand::Power { viewer: dashboard_id, sealed };
+        self.pass_on(dashboard_id, machine_id, Role::can_control, command, Some(Use::Power))
     }
 
     /// Passes a sealed request for the output devices on to the machine if
@@ -883,6 +975,7 @@ impl Registry {
             machine_id,
             Role::can_control,
             DeviceCommand::AudioSelect { viewer: dashboard_id, sealed },
+            None,
         )
     }
 
@@ -917,6 +1010,7 @@ impl Registry {
             machine_id,
             |role| role == Role::Owner,
             DeviceCommand::ConfigSet { viewer: dashboard_id, sealed },
+            Some(Use::ConfigChange),
         )
     }
 
@@ -946,19 +1040,19 @@ impl Registry {
     /// machine checks the role again.
     pub fn sas(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
         let new_enough = self.lock().devices.get(machine_id).is_some_and(|device| device.protocol >= SAS_PROTOCOL);
-        new_enough
-            && self.pass_on(dashboard_id, machine_id, Role::can_control, DeviceCommand::Sas { viewer: dashboard_id, sealed })
+        let command = DeviceCommand::Sas { viewer: dashboard_id, sealed };
+        new_enough && self.pass_on(dashboard_id, machine_id, Role::can_control, command, Some(Use::CtrlAltDel))
     }
 
     /// Passes the owner's go-ahead for an update on. Anyone else is ignored.
     pub fn install_update(&self, dashboard_id: DashboardId, machine_id: &str) {
         let inner = self.lock();
         let Some(dashboard) = inner.dashboards.get(&dashboard_id) else { return };
-        if !dashboard.access.get(machine_id).is_some_and(|row| row.role == Role::Owner) {
-            return;
-        }
+        let Some(row) = dashboard.access.get(machine_id).filter(|row| row.role == Role::Owner) else { return };
         if let Some(device) = inner.devices.get(machine_id) {
             device.send(DeviceCommand::InstallUpdate);
+            let context = ViewContext::new(dashboard.handle.user_id, &dashboard.handle.client, row);
+            inner.record(context.event(Kind::UpdateInstall));
         }
     }
 
@@ -1093,6 +1187,7 @@ mod tests {
             session_id: user_id,
             email: format!("user{user_id}@example.com"),
             step_up: StepUp::default(),
+            client: Client::default(),
         };
         (handle, events_rx)
     }
@@ -1164,6 +1259,37 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Control taken by joining again after a step-up is in the audit log,
+    /// once, as it is when asked for with elevate.
+    #[test]
+    fn elevation_by_a_rejoin_is_recorded() {
+        let (audit, mut recorded) = crate::audit::AuditLog::new(16);
+        let (view_ended, _) = mpsc::unbounded_channel();
+        let registry = Registry::new(view_ended, std::sync::Arc::new(audit));
+        let (mut handle, _events) = handle(1);
+        handle.step_up = StepUp { mfa: true, at: None };
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::Owner)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: CONFIG_PROTOCOL }, outbound);
+        let mut kinds = || {
+            let mut kinds = Vec::new();
+            while let Ok(event) = recorded.try_recv() {
+                kinds.push(event.kind);
+            }
+            kinds
+        };
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert_eq!(kinds(), []);
+
+        registry.note_step_up(1, auth::now());
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert_eq!(kinds(), [Kind::ViewElevated]);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        registry.elevate(dashboard, MACHINE);
+        assert_eq!(kinds(), []);
     }
 
     /// A session that owes a second factor watches, but its input, files
@@ -1611,7 +1737,7 @@ mod tests {
         let (frames, mut frames_rx) = mpsc::channel(8);
         let (bulk, _) = mpsc::channel(1);
         let handle =
-            DashboardHandle { events, frames, bulk, user_id: 1, session_id: 1, email: "o@example.com".to_owned(), step_up: StepUp::default() };
+            DashboardHandle { events, frames, bulk, user_id: 1, session_id: 1, email: "o@example.com".to_owned(), step_up: StepUp::default(), client: Client::default() };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Owner)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
         registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
@@ -1785,6 +1911,7 @@ mod tests {
             session_id: 2,
             email: "user2@example.com".to_owned(),
             step_up: StepUp::default(),
+            client: Client::default(),
         };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::View)]);
         let (other_handle, mut other_events) = self::handle(3);
@@ -1845,6 +1972,7 @@ mod tests {
             session_id: 2,
             email: "user2@example.com".to_owned(),
             step_up: StepUp::default(),
+            client: Client::default(),
         };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Control)]);
         let (outbound, _device_rx) = mpsc::unbounded_channel();
@@ -1896,6 +2024,7 @@ mod tests {
                 session_id: 2,
                 email: "user2@example.com".to_owned(),
                 step_up: StepUp::default(),
+                client: Client::default(),
             };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Control)]);
         let (outbound, _device_rx) = mpsc::unbounded_channel();
@@ -2148,6 +2277,7 @@ mod tests {
                 session_id: 3,
                 email: "fast@example.com".to_owned(),
                 step_up: StepUp::default(),
+                client: Client::default(),
             },
             vec![row(Role::View)],
         );

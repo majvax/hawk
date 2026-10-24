@@ -5,6 +5,18 @@ Each release's section becomes its release notes (see
 
 ## Unreleased
 
+- **Activity log.** The relay records who signed in (and who failed to,
+  from where), who watched which machine and for how long, when a view
+  took control, used a shell or files or pasted a picture (and how much
+  shell and file traffic went each way), power actions, Ctrl+Alt+Del,
+  config changes, update installs, shares, enrollments and account changes,
+  each with the address and browser. Never what was typed, shown or sent:
+  the relay can't read it, and no password, code or key is ever kept. A
+  machine's **Activity** tab shows its owner everything done on it and a
+  shared user only their own; **Settings → Activity** shows your account;
+  **Admin → Activity** shows everything. Kept 90 days, set by
+  `HAWK_AUDIT_RETENTION_DAYS` (`0` for forever). Writes go through a
+  bounded queue and never hold up a login or the stream.
 - **Touch and phones.** Fingers on the live view have a mapping of their
   own. **Trackpad** (the default on a phone): drag to move the pointer,
   faster for a quick flick, tap to click, two-finger tap to right-click,

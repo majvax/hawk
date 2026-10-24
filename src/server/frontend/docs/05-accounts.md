@@ -111,6 +111,34 @@ You can end any one, or all but this one.
 Signing in on a new browser asks for your password again. That's what
 unlocks your identity key in that browser.
 
+## Activity
+
+The relay keeps a log of who did what, and from which address:
+
+- **Settings → Activity**: your sign-ins (and failed ones, with the
+  address they came from), changes to your password and second factors,
+  what you did on any machine, and everything anyone did on the machines
+  you own.
+- **A machine's Activity tab**: for its owner, every view of it and what
+  was done in it. Someone it's shared with sees only their own.
+- **Admin → Activity**: everything, for the admin, including failed
+  sign-ins for addresses that have no account.
+
+What's recorded: sign-ins and failures, wrong second-factor codes,
+step-ups, password and two-factor changes, invites, accounts disabled,
+machines enrolled, renamed and removed, shares granted and revoked; each
+view's start, end and length, when it took control, and the first time it
+used a shell, files or pasted a picture, with how much shell and file
+traffic went each way; power actions, Ctrl+Alt+Del, config changes and
+update installs. Not what any of it carried: the relay can't read it.
+Never a password, a code or a key.
+
+Events are kept 90 days unless the relay's operator sets otherwise. The
+address is the one the relay sees: behind a reverse proxy, the proxy's.
+It's shown to whoever it was, the owner of the machine it was on, and the
+admin; not to the account something was done to (a shared user doesn't see
+the owner's address on the share).
+
 ## Disabling an account
 
 The admin can disable an account in the Admin tab. It's signed out at

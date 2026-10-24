@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::api;
+use crate::audit::{Client, Details, Event, Kind};
 use crate::auth::{self, AdminUser, SessionUser, SteppedUp, SteppedUpAdmin};
 use crate::db::{self, NewTotp};
 use crate::error::ApiError;
@@ -151,6 +152,7 @@ pub struct SteppedUpView {
 /// for the next few minutes, and so is control of a machine being watched.
 pub async fn step_up(
     State(state): State<AppState>,
+    client: Client,
     SessionUser(current): SessionUser,
     Json(body): Json<CodeRequest>,
 ) -> Result<Json<SteppedUpView>, ApiError> {
@@ -158,7 +160,13 @@ pub async fn step_up(
         return Err(ApiError::bad_request("this account has no second factor"));
     }
     let proof = check_code(&state, current.user.id, &body.code).await?;
-    let Some(proof) = proof else { return Err(ApiError::bad_request("that code isn't right")) };
+    let Some(proof) = proof else {
+        state.audit.record(Event::new(Kind::MfaFailed).by(current.user.id).client(&client));
+        return Err(ApiError::bad_request("that code isn't right"));
+    };
+    let recovery_code = (proof == Proof::RecoveryCode).then_some(true);
+    let details = Details { recovery_code, ..Details::default() };
+    state.audit.record(Event::new(Kind::StepUp).by(current.user.id).client(&client).details(details));
     let now = auth::now();
     let session_id = current.session_id;
     state.db.call(move |conn| db::set_step_up(conn, session_id, now)).await?;
@@ -255,6 +263,7 @@ pub struct AddedTotp {
 pub async fn add_totp(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    client: Client,
     SessionUser(current): SessionUser,
     Json(body): Json<AddTotp>,
 ) -> Result<Json<AddedTotp>, ApiError> {
@@ -287,6 +296,7 @@ pub async fn add_totp(
         .collect();
     let sealed = state.secret_key.seal(&seed, &totp::seed_context(user_id));
     let keep = current.session_id;
+    let added = Event::new(Kind::MfaAdded).by(user_id).client(&client).details(Details::name(label.clone()));
     state
         .db
         .call(move |conn| {
@@ -306,6 +316,7 @@ pub async fn add_totp(
     state.registry.close_other_sessions(user_id, keep);
     state.registry.set_mfa(user_id, true);
     state.registry.note_step_up(keep, now);
+    state.audit.record(added);
     notify(&state, &current.user.email, "An authenticator app was added to your account as a second factor.");
     Ok(Json(AddedTotp { recovery_codes }))
 }
@@ -314,6 +325,7 @@ pub async fn add_totp(
 /// the admin requires a second factor. Every other session is ended.
 pub async fn remove_factor(
     State(state): State<AppState>,
+    client: Client,
     SteppedUp(current): SteppedUp,
     Path(factor_id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
@@ -343,6 +355,7 @@ pub async fn remove_factor(
     if remaining == 0 {
         state.registry.set_mfa(user_id, false);
     }
+    state.audit.record(Event::new(Kind::MfaRemoved).by(user_id).client(&client));
     notify(&state, &current.user.email, "An authenticator app was removed from your account.");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -356,6 +369,7 @@ pub struct RecoveryCodes {
 /// A new set of recovery codes, replacing every old one; a step-up action.
 pub async fn regenerate_recovery_codes(
     State(state): State<AppState>,
+    client: Client,
     SteppedUp(current): SteppedUp,
 ) -> Result<Json<RecoveryCodes>, ApiError> {
     if !current.account.mfa {
@@ -365,6 +379,7 @@ pub async fn regenerate_recovery_codes(
     let hashes: Vec<Vec<u8>> = codes.iter().map(|code| auth::token_hash(&totp::normalize_recovery_code(code))).collect();
     let user_id = current.user.id;
     state.db.call(move |conn| db::replace_recovery_codes(conn, user_id, &hashes)).await?;
+    state.audit.record(Event::new(Kind::RecoveryCodesRegenerated).by(user_id).client(&client));
     notify(&state, &current.user.email, "New recovery codes were made for your account. The old ones no longer work.");
     Ok(Json(RecoveryCodes { recovery_codes: codes }))
 }
@@ -374,6 +389,7 @@ pub async fn regenerate_recovery_codes(
 /// alone and set up again.
 pub async fn admin_reset(
     State(state): State<AppState>,
+    client: Client,
     SteppedUpAdmin(admin): SteppedUpAdmin,
     Path(user_id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
@@ -393,6 +409,7 @@ pub async fn admin_reset(
         .ok_or(ApiError::NotFound)?;
     state.registry.close_other_sessions(user_id, -1);
     state.registry.set_mfa(user_id, false);
+    state.audit.record(Event::new(Kind::MfaReset).by(admin.user.id).about(user_id).client(&client));
     notify(&state, &email, "The server's admin removed every second factor from your account.");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -411,6 +428,7 @@ pub async fn get_policy(AdminUser(admin): AdminUser) -> Json<Policy> {
 /// one up. The admin needs one first, or they'd be confined too.
 pub async fn set_policy(
     State(state): State<AppState>,
+    client: Client,
     SteppedUpAdmin(admin): SteppedUpAdmin,
     Json(body): Json<Policy>,
 ) -> Result<Json<Policy>, ApiError> {
@@ -419,6 +437,8 @@ pub async fn set_policy(
     }
     let value = if body.require_mfa { "1" } else { "0" };
     state.db.call(move |conn| db::set_setting(conn, "require_mfa", value)).await?;
+    let details = Details { require_mfa: Some(body.require_mfa), ..Details::default() };
+    state.audit.record(Event::new(Kind::MfaPolicyChanged).by(admin.user.id).client(&client).details(details));
     Ok(Json(body))
 }
 

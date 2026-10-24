@@ -100,6 +100,7 @@ roots.
 | `HAWK_MAIL_FROM` | none | Sender address, e.g. `Hawk <hawk@example.com>`. |
 | `FRONTEND_DIST` | `frontend/dist` | The built dashboard to serve. |
 | `HAWK_ALLOWED_ORIGINS` | none | Other origins that may sign in to this relay, comma separated: the desktop app (`http://tauri.localhost,tauri://localhost`) and any separately hosted dashboard. They get bearer tokens instead of the cookie. |
+| `HAWK_AUDIT_RETENTION_DAYS` | `90` | How many days the activity log keeps events. `0` keeps them forever. Older ones are deleted hourly. |
 | `HAWK_SERVER_ROOT` | `src/server` | The directory the default paths above are relative to. |
 | `RUST_LOG` | `info` | Log detail, e.g. `debug`. |
 

@@ -28,6 +28,7 @@ import { useRemoteInput } from "../useRemoteInput.js";
 import { useTouchInput, useTouchKeyboard } from "../useTouchInput.js";
 import type { Modifier } from "../touchKeyboard.js";
 import { useStepUp } from "../stepUp.js";
+import { ActivityTable } from "./Activity.js";
 import { AnalyticsPanel, ProcessesPanel } from "./AnalyticsPanel.js";
 import { ANSWER_TIMEOUT_MS, ConfigPanel } from "./ConfigPanel.js";
 import { FilesPanel } from "./FilesPanel.js";
@@ -243,6 +244,11 @@ export function MachinesPage({
             )}
             {detailTab === "config" && (
               <ConfigTab dashboard={dashboard} machine={selected} viewing={viewing} onConnect={connect} />
+            )}
+            {detailTab === "activity" && (
+              <div className="pane-body">
+                <ActivityTable key={selected.id} machine={selected.id} showMachine={false} />
+              </div>
             )}
             {detailTab === "sharing" && <SharingPanel key={selected.id} machine={selected} identity={identity} />}
             {detailTab === "machine" && (
@@ -1677,7 +1683,16 @@ function Viewer({
   );
 }
 
-type DetailTab = "screen" | "terminal" | "files" | "analytics" | "processes" | "config" | "sharing" | "machine";
+type DetailTab =
+  | "screen"
+  | "terminal"
+  | "files"
+  | "analytics"
+  | "processes"
+  | "config"
+  | "activity"
+  | "sharing"
+  | "machine";
 
 // The tabs a machine's user gets: only what they can use. A dev share has
 // no screen, so it starts on the terminal; analytics is the owner's, or a
@@ -1691,6 +1706,8 @@ function tabsFor(machine: Machine): [DetailTab, string][] {
   if (canFiles(role)) tabs.push(["files", "Files"]);
   if (role === "owner" || machine.analytics === true) tabs.push(["analytics", "Analytics"], ["processes", "Processes"]);
   if (roleCanControl(role)) tabs.push(["config", "Config"]);
+  // The owner sees everyone's doings here; a share, only its own.
+  tabs.push(["activity", "Activity"]);
   if (role === "owner") tabs.push(["sharing", "Sharing"], ["machine", "Machine"]);
   return tabs;
 }

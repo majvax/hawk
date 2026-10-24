@@ -25,6 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+use crate::audit::{Client, Details, Event, Kind};
 use crate::auth::{self, AdminUser, CurrentUser, SessionUser, SteppedUp, SteppedUpAdmin};
 use crate::db::{self, AccountFlags, NewCredentials, SignupError, User};
 use crate::e2e;
@@ -175,12 +176,24 @@ pub async fn login(
     }
     // One message for every failure, so it doesn't reveal which emails exist.
     let invalid = || ApiError::bad_request("invalid email or password");
+    let client = Client::from(&session_origin(peer, &headers));
+    // What was typed for an unknown account isn't kept: it may well be a
+    // password typed in the wrong box.
+    let failed = |user_id: Option<i64>, reason: &str| {
+        let event = Event::new(Kind::SignInFailed).client(&client).details(Details::reason(reason));
+        state.audit.record(match user_id {
+            Some(user_id) => event.by(user_id),
+            None => event,
+        });
+    };
 
     let Some(email) = auth::normalize_email(&body.email) else {
         state.limiter.record_failure(ip);
+        failed(None, "no such account");
         return Err(invalid());
     };
     let found = state.db.call(move |conn| db::find_user_by_email(conn, &email)).await?;
+    let known = found.as_ref().map(|found| found.user.id);
 
     let password = body.password;
     let verified = tokio::task::spawn_blocking(move || match found {
@@ -196,9 +209,11 @@ pub async fn login(
 
     let Some(found) = verified else {
         state.limiter.record_failure(ip);
+        failed(known, if known.is_some() { "wrong password" } else { "no such account" });
         return Err(invalid());
     };
     if found.disabled {
+        failed(known, "account disabled");
         return Err(ApiError::Forbidden);
     }
     state.limiter.record_success(ip);
@@ -210,6 +225,7 @@ pub async fn login(
         return Ok((jar, None, Json(LoginOutcome::MfaRequired { mfa_required: true, ticket })));
     }
     let (jar, token) = start_session(&state, jar, &headers, user_id, session_origin(peer, &headers), false).await?;
+    state.audit.record(Event::new(Kind::SignIn).by(user_id).client(&client));
     Ok((jar, token, Json(LoginOutcome::SignedIn(UserView::new(&state, found.user, account)))))
 }
 
@@ -235,8 +251,10 @@ pub async fn login_mfa(
     }
     let expired = || ApiError::bad_request("this sign-in has expired: enter your password again");
     let user_id = state.mfa_tickets.attempt(&body.ticket).ok_or_else(expired)?;
+    let client = Client::from(&session_origin(peer, &headers));
     let Some(proof) = mfa::check_code(&state, user_id, &body.code).await? else {
         state.limiter.record_failure(ip);
+        state.audit.record(Event::new(Kind::MfaFailed).by(user_id).client(&client));
         return Err(ApiError::bad_request("that code isn't right"));
     };
     let redeemed = state.mfa_tickets.redeem(&body.ticket).ok_or_else(expired)?;
@@ -251,7 +269,10 @@ pub async fn login_mfa(
         .await?
         .ok_or(ApiError::Forbidden)?;
     let (jar, token) = start_session(&state, jar, &headers, redeemed.user_id, redeemed.origin, true).await?;
-    if proof == Proof::RecoveryCode {
+    let recovery_code = proof == Proof::RecoveryCode;
+    let details = Details { recovery_code: recovery_code.then_some(true), ..Details::default() };
+    state.audit.record(Event::new(Kind::SignIn).by(user.id).client(&client).details(details));
+    if recovery_code {
         mfa::notify(&state, &user.email, "Someone signed in to your account with a recovery code.");
     }
     Ok((jar, token, Json(UserView::new(&state, user, account))))
@@ -342,7 +363,9 @@ pub async fn signup(
         }
         send_verification(&state, &user).await?;
     }
-    let (jar, token) = start_session(&state, jar, &headers, user.id, session_origin(peer, &headers), false).await?;
+    let origin = session_origin(peer, &headers);
+    state.audit.record(Event::new(Kind::SignedUp).by(user.id).client(&Client::from(&origin)));
+    let (jar, token) = start_session(&state, jar, &headers, user.id, origin, false).await?;
     Ok((jar, token, Json(UserView::load(&state, user).await?)))
 }
 
@@ -399,7 +422,7 @@ const MAX_USER_AGENT_LEN: usize = 512;
 
 /// The browser and IP a sign-in came from. The IP is the TCP peer: behind a
 /// reverse proxy, that's the proxy.
-fn session_origin(peer: SocketAddr, headers: &HeaderMap) -> db::SessionOrigin {
+pub fn session_origin(peer: SocketAddr, headers: &HeaderMap) -> db::SessionOrigin {
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
@@ -474,6 +497,7 @@ pub async fn check_password(state: &AppState, peer: SocketAddr, user_id: i64, pa
 pub async fn change_password(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    client: Client,
     SteppedUp(current): SteppedUp,
     Json(body): Json<ChangePassword>,
 ) -> Result<StatusCode, ApiError> {
@@ -516,6 +540,7 @@ pub async fn change_password(
         return Err(ApiError::Conflict("your password was changed elsewhere; reload and try again".into()));
     }
     state.registry.close_other_sessions(user_id, keep);
+    state.audit.record(Event::new(Kind::PasswordChanged).by(user_id).client(&client));
     mfa::notify(&state, &current.user.email, "The password of your account was changed.");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -730,6 +755,7 @@ pub struct SetDisabled {
 
 pub async fn set_user_disabled(
     State(state): State<AppState>,
+    client: Client,
     SteppedUpAdmin(admin): SteppedUpAdmin,
     Path(user_id): Path<i64>,
     Json(body): Json<SetDisabled>,
@@ -745,6 +771,8 @@ pub async fn set_user_disabled(
     if disabled {
         state.registry.close_user(user_id);
     }
+    let kind = if disabled { Kind::UserDisabled } else { Kind::UserEnabled };
+    state.audit.record(Event::new(kind).by(admin.user.id).about(user_id).client(&client));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -779,6 +807,7 @@ pub struct CreatedInvite {
 
 pub async fn create_invite(
     State(state): State<AppState>,
+    client: Client,
     SteppedUpAdmin(admin): SteppedUpAdmin,
 ) -> Result<Json<CreatedInvite>, ApiError> {
     let token = auth::random_token();
@@ -787,14 +816,21 @@ pub async fn create_invite(
     let expires_at = now + auth::INVITE_TTL.whole_seconds();
     let admin_id = admin.user.id;
     let id = state.db.call(move |conn| db::create_invite(conn, &hash, Some(admin_id), false, now, expires_at)).await?;
+    let details = Details { expires_at: Some(expires_at), ..Details::default() };
+    state.audit.record(Event::new(Kind::InviteCreated).by(admin_id).client(&client).details(details));
     Ok(Json(CreatedInvite { id, token, expires_at }))
 }
 
 pub async fn delete_invite(
     State(state): State<AppState>,
-    _admin: SteppedUpAdmin,
+    client: Client,
+    SteppedUpAdmin(admin): SteppedUpAdmin,
     Path(invite_id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     let deleted = state.db.call(move |conn| db::delete_pending_invite(conn, invite_id)).await?;
-    if deleted { Ok(StatusCode::NO_CONTENT) } else { Err(ApiError::NotFound) }
+    if !deleted {
+        return Err(ApiError::NotFound);
+    }
+    state.audit.record(Event::new(Kind::InviteRevoked).by(admin.user.id).client(&client));
+    Ok(StatusCode::NO_CONTENT)
 }

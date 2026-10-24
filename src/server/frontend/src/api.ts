@@ -3,6 +3,7 @@
 // touches it; a standalone dashboard keeps a bearer token instead (relay.ts).
 // Nothing here sees a password either: keys.ts derives what's sent from it.
 
+import { type ActivityFilter, type ActivityPage, activityQuery } from "./activity.js";
 import { apiUrl, relayPageUrl, sessionToken, setSessionToken } from "./relay.js";
 
 export interface User {
@@ -214,6 +215,13 @@ export function describeUserAgent(userAgent: string | null): string {
   if (browser === undefined && system === undefined) return userAgent.slice(0, 60);
   return [browser ?? "Unknown browser", system].filter(Boolean).join(" on ");
 }
+
+// The audit log: what this account did or had done to it, and everything on
+// the machines it owns; the admin's covers everyone.
+export const listActivity = (filter: ActivityFilter) =>
+  request<ActivityPage>("GET", `/api/audit${activityQuery(filter)}`);
+export const listAllActivity = (filter: ActivityFilter) =>
+  request<ActivityPage>("GET", `/api/admin/audit${activityQuery(filter)}`);
 
 export const listUsers = () => request<AdminUserRow[]>("GET", "/api/admin/users");
 export const setUserDisabled = (id: number, disabled: boolean) =>

@@ -21,6 +21,7 @@ use tracing::{error, info};
 
 use crate::AppState;
 use crate::api;
+use crate::audit::{Client, Details, Event, Kind};
 use crate::auth::{self, CurrentUser, SteppedUp};
 use crate::db::{self, Role, ShareError, ShareTerms, Signed};
 use crate::e2e;
@@ -136,6 +137,7 @@ pub struct Rename {
 
 pub async fn rename(
     State(state): State<AppState>,
+    client: Client,
     SteppedUp(current): SteppedUp,
     Path(machine_id): Path<String>,
     Json(body): Json<Rename>,
@@ -152,6 +154,13 @@ pub async fn rename(
         .await?
         .ok_or(ApiError::NotFound)?;
     state.registry.rename(&machine_id, &name);
+    state.audit.record(
+        Event::new(Kind::MachineRenamed)
+            .by(owner_id)
+            .on(&machine_id, Some(name.clone()), owner_id)
+            .client(&client)
+            .details(Details::name(name)),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -159,15 +168,16 @@ pub async fn rename(
 /// and everyone it was shared with loses it.
 pub async fn remove(
     State(state): State<AppState>,
+    client: Client,
     SteppedUp(current): SteppedUp,
     Path(machine_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let owner_id = current.user.id;
     let id = machine_id.clone();
-    if !state.db.call(move |conn| db::delete_machine(conn, &id, owner_id)).await? {
-        return Err(ApiError::NotFound);
-    }
+    let name = state.db.call(move |conn| db::delete_machine(conn, &id, owner_id)).await?.ok_or(ApiError::NotFound)?;
     state.registry.remove_machine(&machine_id);
+    let removed = Event::new(Kind::MachineRemoved).by(owner_id).on(&machine_id, Some(name), owner_id);
+    state.audit.record(removed.client(&client));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -273,6 +283,7 @@ impl ShareRequest {
 /// an existing share. A share that starts later is granted when it starts.
 pub async fn share(
     State(state): State<AppState>,
+    client: Client,
     SteppedUp(current): SteppedUp,
     Path(machine_id): Path<String>,
     Json(body): Json<ShareRequest>,
@@ -306,7 +317,7 @@ pub async fn share(
             if let Err(error) = db::upsert_share(conn, &id, owner_id, user_id, terms, &grant, now) {
                 return Ok(Err(error));
             }
-            Ok(Ok((user_id, db::machine_for_user(conn, &id, user_id, now)?)))
+            Ok(Ok((db::machine_for_user(conn, &id, user_id, now)?, db::machine_name(conn, &id)?)))
         })
         .await?
         .map_err(|error| match error {
@@ -314,7 +325,24 @@ pub async fn share(
             ShareError::SelfShare => ApiError::bad_request("you already own this machine"),
             ShareError::Db(error) => error.into(),
         })?;
-    match granted {
+    let (granted, name) = granted;
+    let details = Details {
+        starts_at: terms.starts_at,
+        expires_at: terms.expires_at,
+        single_view: terms.single_view.then_some(true),
+        analytics: terms.analytics.then_some(true),
+        ..Details::default()
+    };
+    state.audit.record(
+        Event::new(Kind::ShareGranted)
+            .by(owner_id)
+            .about(user_id)
+            .on(&machine_id, name, owner_id)
+            .role(terms.role)
+            .client(&client)
+            .details(details),
+    );
+    match (user_id, granted) {
         (user_id, Some(row)) => state.registry.grant(user_id, &row),
         // Starts later: if it was live before this change, it isn't now.
         (user_id, None) => state.registry.revoke(user_id, &machine_id),
@@ -335,6 +363,7 @@ pub struct UnshareRequest {
 /// and the machine is handed the signed revocation.
 pub async fn unshare(
     State(state): State<AppState>,
+    client: Client,
     SteppedUp(current): SteppedUp,
     Path((machine_id, user_id)): Path<(String, i64)>,
     Json(body): Json<UnshareRequest>,
@@ -361,10 +390,25 @@ pub async fn unshare(
 
     let id = machine_id.clone();
     let now = auth::now();
-    if !state.db.call(move |conn| db::delete_share(conn, &id, owner_id, user_id, revocation.as_ref(), now)).await? {
+    let (deleted, name) = state
+        .db
+        .call(move |conn| {
+            let name = db::machine_name(conn, &id)?;
+            Ok((db::delete_share(conn, &id, owner_id, user_id, revocation.as_ref(), now)?, name))
+        })
+        .await?;
+    if !deleted {
         return Err(ApiError::NotFound);
     }
     state.registry.revoke(user_id, &machine_id);
+    state.audit.record(
+        Event::new(Kind::ShareRevoked)
+            .by(owner_id)
+            .about(user_id)
+            .on(&machine_id, name, owner_id)
+            .role(share.terms.role)
+            .client(&client),
+    );
     let id = machine_id.clone();
     let revocations = state.db.call(move |conn| db::revocations(conn, &id)).await?;
     state.registry.send_revocations(&machine_id, &revocations);

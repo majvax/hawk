@@ -1,10 +1,11 @@
 //! WebSocket endpoints for devices and dashboards.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
@@ -17,6 +18,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::AppState;
+use crate::api;
+use crate::audit::{self, Client, Kind};
 use crate::auth::{self, CurrentUser};
 use crate::db::{self, EnrollmentOwner, MachineAuth};
 use crate::e2e;
@@ -46,8 +49,12 @@ const VIEWER_FRAME_QUEUE: usize = 32;
 /// [`DeviceMessage`]); anything else is closed with 1008 before the machine
 /// is registered. After that, binary messages are video frames to fan out,
 /// and the relay sends capture commands down.
-pub async fn device_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| handle_device(socket, state))
+pub async fn device_socket(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_device(socket, state, peer))
 }
 
 /// Signing happens in the machine's TPM, which can take a moment.
@@ -219,7 +226,7 @@ async fn authenticate_device(
     }
 }
 
-async fn handle_device(socket: WebSocket, state: AppState) {
+async fn handle_device(socket: WebSocket, state: AppState, peer: SocketAddr) {
     let (mut sink, mut stream) = socket.split();
 
     let (machine, enrolled, info) = match authenticate_device(&state, &mut sink, &mut stream).await {
@@ -252,6 +259,16 @@ async fn handle_device(socket: WebSocket, state: AppState) {
         if !send_command(&mut sink, &enrolled).await {
             return;
         }
+        // The owner's doing, from the machine's address.
+        let client = Client { ip: Some(peer.ip().to_canonical().to_string()), user_agent: None };
+        let id = machine_id.clone();
+        let name = state.db.call(move |conn| db::machine_name(conn, &id)).await.ok().flatten();
+        state.audit.record(
+            audit::Event::new(Kind::MachineEnrolled)
+                .by(machine.owner_id)
+                .on(&machine_id, name, machine.owner_id)
+                .client(&client),
+        );
         // The new machine shows up on its owner's open dashboards.
         let owner_id = machine.owner_id;
         let lookup = machine_id.clone();
@@ -467,6 +484,7 @@ fn route_device_answer(
 pub async fn dashboard_socket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     current: CurrentUser,
     headers: HeaderMap,
 ) -> Response {
@@ -480,7 +498,9 @@ pub async fn dashboard_socket(
         Err(error) => return ApiError::from(error).into_response(),
     };
     let registry = state.registry;
-    ws.protocols([auth::SOCKET_PROTOCOL]).on_upgrade(move |socket| handle_dashboard(socket, registry, current, machines))
+    let client = Client::from(&api::session_origin(peer, &headers));
+    ws.protocols([auth::SOCKET_PROTOCOL])
+        .on_upgrade(move |socket| handle_dashboard(socket, registry, current, client, machines))
 }
 
 /// True when there's no Origin (not a browser) or it names the host the
@@ -496,6 +516,7 @@ async fn handle_dashboard(
     socket: WebSocket,
     registry: Arc<Registry>,
     current: CurrentUser,
+    client: Client,
     machines: Vec<db::MachineRow>,
 ) {
     let (mut sink, mut stream) = socket.split();
@@ -511,6 +532,7 @@ async fn handle_dashboard(
         session_id: current.session_id,
         email: current.user.email,
         step_up: StepUp { mfa: current.account.mfa, at: current.step_up_at },
+        client,
     };
     let dashboard_id = registry.add_dashboard(handle, machines);
 
@@ -845,6 +867,7 @@ mod tests {
                 session_id: 1,
                 email: "owner@example.com".to_owned(),
                 step_up: StepUp::default(),
+                client: crate::audit::Client::default(),
             };
             let row = MachineRow {
                 public_id: "m1".to_owned(),

@@ -201,6 +201,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [ ] GitHub Pages workflow for hosting the dashboard on its own
 - [x] Native dashboard app (Tauri): standalone dashboard, signed updates
 - [ ] Native dashboard app: full keyboard capture, identity key in the OS keychain
+- [x] Session audit log: sign-ins, views, shells, files, power and config actions, shares, per account, machine and relay
+- [ ] Audit log follow-ups: alerts (a sign-in from a new address), recordings kept on the machine
 - [x] `/docs` in the dashboard: setup and usage guide, public, Markdown rendered at build time
 - [ ] `/docs` follow-ups: prerendered HTML, search, generated reference tables, help links in context
 - [ ] `/about` page (late: once features and the name settle)
@@ -932,7 +934,17 @@ it.**
 Not committed to. Each of these is a real feature with an open question
 attached, which is why it isn't in the section above yet.
 
-### Session audit log
+### Session audit log (events built; recordings open)
+
+**Built:** the relay records events (sign-ins and failures, views with
+their length and traffic, the first shell/file/picture use per view, power,
+Ctrl+Alt+Del, config changes, shares, enrollments, account changes) with
+the account and the client address, in `audit_events`, kept
+`HAWK_AUDIT_RETENTION_DAYS` (90 by default). Owners see their machines'
+Activity, everyone their own account's, the admin everything. Because of
+end-to-end encryption the relay sees a shell or file *channel* in use, not
+individual shells or transfers, so those are one row per view. Still open:
+recordings and alerting, below.
 
 One page per machine answering "who did what on this, and when" — every
 view (start, stop, duration), control grab and release, shell session,

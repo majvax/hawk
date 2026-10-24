@@ -61,7 +61,9 @@ Configuration is by environment variable: `HOST` (default `127.0.0.1`),
 the dashboard at, used in links the relay logs and emails), `HAWK_SMTP_URL`
 and `HAWK_MAIL_FROM` (see "Email" below), `HAWK_ALLOWED_ORIGINS` (other
 origins that may sign in with bearer tokens: the desktop app and any
-separately hosted dashboard, comma separated), and `HAWK_SERVER_ROOT` (the
+separately hosted dashboard, comma separated), `HAWK_AUDIT_RETENTION_DAYS`
+(how many days the audit log keeps events, default 90, `0` for forever;
+pruned hourly), and `HAWK_SERVER_ROOT` (the
 directory the default paths are relative to; defaults to this directory).
 `RUST_LOG` controls log verbosity. `/healthz` answers 204 while the relay
 and its database are up, and `/api/version` gives the protocol version
@@ -364,6 +366,29 @@ Coming back online retries straight away. Before each attempt it checks the
 session is still valid, and returns to the login page if it isn't. An open
 live view stays open and resumes once the link is back. If the machine is
 offline at that point, it resumes when the machine reconnects.
+
+### Audit log
+
+`audit_events` records who did what, on which machine, from which address
+(the TCP peer: behind a reverse proxy, the proxy) and browser. Account
+events (sign-ins and failures, wrong codes, step-up, password and factor
+changes, invites, accounts disabled, the MFA policy), machine events
+(enrolled, renamed, removed, shared, unshared) and view events (started
+when the machine accepts, ended with its length and sealed shell/file
+bytes each way, refused, elevated mid-view; the first shell, file and
+picture-paste use per view; every power action, Ctrl+Alt+Del, config
+change and update install). The relay can't see content, so there is one
+row per view per channel rather than per shell or transfer; quality
+changes and plain input aren't recorded. No secret ever is: events are
+built from typed fields only.
+
+Recording never waits: events go through a bounded queue (4096) to one
+writer task that inserts them in batches; when it's full, events are
+dropped, counted and logged at warn. `GET /api/audit` (cursor-paginated,
+newest first: `machine`, `user`, `kind` comma separated, `since`, `until`,
+`before`, `limit` up to 200) shows a user what they did, what was done to
+their account, and everything on the machines they own;
+`GET /api/admin/audit` shows the admin everything.
 
 ## TLS
 

@@ -2,6 +2,7 @@
 //! relay routes capture commands down and video frames back up.
 
 mod api;
+mod audit;
 mod auth;
 mod db;
 mod error;
@@ -35,6 +36,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::audit::AuditLog;
 use crate::auth::{AccountLimiter, AllowedOrigins, LoginLimiter};
 use crate::db::Db;
 use crate::mail::Mailer;
@@ -68,6 +70,8 @@ pub struct AppState {
     pub mailer: Option<Arc<Mailer>>,
     /// Other origins that may use this relay with bearer tokens.
     pub allowed_origins: Arc<AllowedOrigins>,
+    /// Where security-relevant events are recorded (see crate::audit).
+    pub audit: Arc<AuditLog>,
 }
 
 struct Config {
@@ -83,6 +87,8 @@ struct Config {
     /// and sent in emails.
     public_url: Option<String>,
     allowed_origins: AllowedOrigins,
+    /// How many days audit events are kept; 0 for forever.
+    audit_retention_days: u32,
 }
 
 impl Config {
@@ -107,6 +113,7 @@ impl Config {
             db_path,
             public_url: std::env::var("PUBLIC_URL").ok().map(|url| url.trim_end_matches('/').to_owned()),
             allowed_origins: AllowedOrigins::parse(&std::env::var("HAWK_ALLOWED_ORIGINS").unwrap_or_default())?,
+            audit_retention_days: audit::retention_days(std::env::var("HAWK_AUDIT_RETENTION_DAYS").ok().as_deref())?,
         })
     }
 }
@@ -136,8 +143,9 @@ async fn bootstrap_admin(db: &Db, base_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Hourly: drop expired sessions and invites, and stale login throttles.
-fn spawn_cleanup(state: AppState) {
+/// Hourly: drop expired sessions and invites, audit events past their
+/// retention, and stale login throttles.
+fn spawn_cleanup(state: AppState, audit_retention_days: u32) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
         loop {
@@ -145,6 +153,9 @@ fn spawn_cleanup(state: AppState) {
             let now = auth::now();
             if let Err(error) = state.db.call(move |conn| db::purge_expired(conn, now)).await {
                 error!(%error, "purging expired sessions failed");
+            }
+            if let Err(error) = audit::prune(&state.db, audit_retention_days, now).await {
+                error!(%error, "pruning the audit log failed");
             }
             state.limiter.prune();
             state.mfa_limiter.prune();
@@ -258,8 +269,15 @@ async fn main() -> Result<(), String> {
     let host = base_url.split_once("://").map_or(base_url.as_str(), |(_, host)| host);
 
     let (view_ended, view_ended_rx) = mpsc::unbounded_channel();
+    let (audit, audit_rx) = AuditLog::new(audit::QUEUE_LEN);
+    let audit = Arc::new(audit);
+    audit::spawn_writer(&audit, db.clone(), audit_rx);
+    match config.audit_retention_days {
+        0 => info!("audit events are kept forever"),
+        days => info!("audit events are kept for {days} days"),
+    }
     let state = AppState {
-        registry: Arc::new(Registry::new(view_ended)),
+        registry: Arc::new(Registry::new(view_ended, audit.clone())),
         db,
         limiter: Arc::new(LoginLimiter::default()),
         secure_cookies: tls.is_some(),
@@ -271,8 +289,9 @@ async fn main() -> Result<(), String> {
         totp_issuer: format!("Hawk ({host})").into(),
         mailer: mailer.map(Arc::new),
         allowed_origins: Arc::new(config.allowed_origins.clone()),
+        audit,
     };
-    spawn_cleanup(state.clone());
+    spawn_cleanup(state.clone(), config.audit_retention_days);
     machines::spawn_share_clock(state.clone());
     machines::spawn_single_view_watch(state.clone(), view_ended_rx);
 
@@ -304,6 +323,8 @@ async fn main() -> Result<(), String> {
         .route("/api/sessions", get(api::list_sessions))
         .route("/api/sessions/revoke-others", post(api::revoke_other_sessions))
         .route("/api/sessions/{id}", delete(api::revoke_session))
+        .route("/api/audit", get(audit::list))
+        .route("/api/admin/audit", get(audit::admin_list))
         .route("/api/admin/users", get(api::list_users))
         .route("/api/admin/users/{id}/disabled", post(api::set_user_disabled))
         .route("/api/admin/users/{id}/reset-mfa", post(mfa::admin_reset))

@@ -183,6 +183,30 @@ const MIGRATIONS: &[&str] = &["
     -- Analytics: whether the owner let this share read the machine's
     -- health and processes. Part of the signed grant; the machine checks it.
     ALTER TABLE machine_shares ADD COLUMN analytics INTEGER NOT NULL DEFAULT 0;
+", "
+    -- The audit log: what was done, by whom, on which machine, from where.
+    -- Metadata only: the relay never sees what a view, a shell or a file
+    -- carried. No foreign keys, so a row outlives the machine it's about;
+    -- the machine's name is kept as it was. Pruned past the retention.
+    CREATE TABLE audit_events (
+        id           INTEGER PRIMARY KEY,
+        at           INTEGER NOT NULL,   -- unix seconds
+        kind         TEXT    NOT NULL,   -- audit::Kind
+        user_id      INTEGER,            -- who did it; NULL for an unknown account
+        subject_id   INTEGER,            -- the account it was done to, if another
+        machine_id   TEXT,               -- the machine's public id
+        machine_name TEXT,
+        owner_id     INTEGER,            -- the machine's owner, who sees every row about it
+        role         TEXT,               -- the role it was done with
+        ip           TEXT,
+        user_agent   TEXT,
+        details      TEXT                -- JSON object, audit::Details
+    );
+    CREATE INDEX audit_events_at ON audit_events (at);
+    CREATE INDEX audit_events_user ON audit_events (user_id, id) WHERE user_id IS NOT NULL;
+    CREATE INDEX audit_events_subject ON audit_events (subject_id, id) WHERE subject_id IS NOT NULL;
+    CREATE INDEX audit_events_owner ON audit_events (owner_id, id) WHERE owner_id IS NOT NULL;
+    CREATE INDEX audit_events_machine ON audit_events (machine_id, id) WHERE machine_id IS NOT NULL;
 "];
 
 #[derive(Clone)]
@@ -201,6 +225,14 @@ impl Db {
         check_not_newer(&conn).map_err(|error| format!("{}: {error}", path.display()))?;
         migrate(&conn).map_err(|error| format!("migrating {}: {error}", path.display()))?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+    }
+
+    /// A fresh, migrated database that lives as long as this handle.
+    #[cfg(test)]
+    pub fn open_in_memory() -> Self {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        migrate(&conn).expect("migrating");
+        Self { conn: Arc::new(Mutex::new(conn)) }
     }
 
     /// Runs `f` against the connection on the blocking pool, so queries never
@@ -428,6 +460,7 @@ pub fn set_user_disabled(conn: &Connection, user_id: i64, disabled: bool) -> rus
 }
 
 /// Where a session was signed in from.
+#[derive(Debug, Clone)]
 pub struct SessionOrigin {
     pub user_agent: Option<String>,
     pub ip: String,
@@ -890,6 +923,16 @@ impl Role {
         }
     }
 
+    /// As the audit log and the API spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Control => "control",
+            Self::Dev => "dev",
+            Self::Owner => "owner",
+        }
+    }
+
     /// The value stored in machine_shares.role (never "owner").
     fn share_str(self) -> &'static str {
         match self {
@@ -1230,10 +1273,20 @@ pub fn rename_machine(
     shared_user_ids(conn, machine_id).map(Some)
 }
 
-/// Deletes an owned machine (its shares go by cascade). Returns false if
-/// `owner_id` doesn't own it.
-pub fn delete_machine(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlite::Result<bool> {
-    Ok(conn.execute("DELETE FROM machines WHERE public_id = ?1 AND owner_id = ?2", params![public_id, owner_id])? > 0)
+/// Deletes an owned machine (its shares go by cascade) and returns its
+/// name. None if `owner_id` doesn't own it.
+pub fn delete_machine(conn: &Connection, public_id: &str, owner_id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "DELETE FROM machines WHERE public_id = ?1 AND owner_id = ?2 RETURNING name",
+        params![public_id, owner_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// What the owner named the machine.
+pub fn machine_name(conn: &Connection, public_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT name FROM machines WHERE public_id = ?1", [public_id], |row| row.get(0)).optional()
 }
 
 /// Who an owned machine is shared with; None if `owner_id` doesn't own it.
@@ -1412,6 +1465,145 @@ pub fn share_for(conn: &Connection, public_id: &str, owner_id: i64, user_id: i64
     Ok(list_shares(conn, public_id, owner_id)?.and_then(|shares| shares.into_iter().find(|s| s.user_id == user_id)))
 }
 
+// ---- audit log ------------------------------------------------------------
+
+/// Writes a batch of events in one transaction.
+pub fn insert_audit_events(conn: &Connection, events: &[crate::audit::Event]) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO audit_events
+                 (at, kind, user_id, subject_id, machine_id, machine_name, owner_id, role, ip, user_agent, details)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+        for event in events {
+            insert.execute(params![
+                event.at,
+                event.kind.as_str(),
+                event.user_id,
+                event.subject_id,
+                event.machine_id,
+                event.machine_name,
+                event.owner_id,
+                event.role.map(Role::as_str),
+                event.client.ip,
+                event.client.user_agent,
+                event.details.to_json()
+            ])?;
+        }
+    }
+    tx.commit()
+}
+
+/// An audit event as read back, with the accounts' current emails.
+#[derive(Debug)]
+pub struct AuditRow {
+    pub id: i64,
+    pub at: i64,
+    pub kind: String,
+    pub user_id: Option<i64>,
+    pub user_email: Option<String>,
+    pub subject_id: Option<i64>,
+    pub subject_email: Option<String>,
+    pub machine_id: Option<String>,
+    pub machine_name: Option<String>,
+    /// The machine's owner when it happened.
+    pub owner_id: Option<i64>,
+    pub role: Option<String>,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub details: Option<String>,
+}
+
+/// Which events a query may see, and which of those it asks for.
+#[derive(Debug, Default)]
+pub struct AuditFilter {
+    /// Only what this account may see: what it did, what was done to it,
+    /// and everything on the machines it owns. None: everything.
+    pub visible_to: Option<i64>,
+    pub machine_id: Option<String>,
+    /// Events this account did or had done to it.
+    pub user_id: Option<i64>,
+    /// Any of these kinds; empty: every kind.
+    pub kinds: Vec<&'static str>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    /// The cursor: only events older than this one.
+    pub before: Option<i64>,
+    pub limit: i64,
+}
+
+/// Matching events, newest first.
+pub fn audit_events(conn: &Connection, filter: &AuditFilter) -> rusqlite::Result<Vec<AuditRow>> {
+    use rusqlite::types::Value;
+
+    let mut sql = String::from(
+        "SELECT a.id, a.at, a.kind, a.user_id, u.email, a.subject_id, s.email, a.machine_id, a.machine_name,
+                a.owner_id, a.role, a.ip, a.user_agent, a.details
+           FROM audit_events a
+           LEFT JOIN users u ON u.id = a.user_id
+           LEFT JOIN users s ON s.id = a.subject_id
+          WHERE 1 = 1",
+    );
+    let mut values: Vec<Value> = Vec::new();
+    if let Some(viewer) = filter.visible_to {
+        sql.push_str(" AND (a.user_id = ? OR a.subject_id = ? OR a.owner_id = ?)");
+        values.extend([Value::Integer(viewer), Value::Integer(viewer), Value::Integer(viewer)]);
+    }
+    if let Some(machine_id) = &filter.machine_id {
+        sql.push_str(" AND a.machine_id = ?");
+        values.push(Value::Text(machine_id.clone()));
+    }
+    if let Some(user_id) = filter.user_id {
+        sql.push_str(" AND (a.user_id = ? OR a.subject_id = ?)");
+        values.extend([Value::Integer(user_id), Value::Integer(user_id)]);
+    }
+    if !filter.kinds.is_empty() {
+        sql.push_str(&format!(" AND a.kind IN ({})", vec!["?"; filter.kinds.len()].join(", ")));
+        values.extend(filter.kinds.iter().map(|kind| Value::Text((*kind).to_owned())));
+    }
+    for (clause, bound) in [(" AND a.at >= ?", filter.since), (" AND a.at <= ?", filter.until), (" AND a.id < ?", filter.before)] {
+        if let Some(bound) = bound {
+            sql.push_str(clause);
+            values.push(Value::Integer(bound));
+        }
+    }
+    sql.push_str(" ORDER BY a.id DESC LIMIT ?");
+    values.push(Value::Integer(filter.limit));
+
+    let mut statement = conn.prepare(&sql)?;
+    statement
+        .query_map(rusqlite::params_from_iter(values), |row| {
+            Ok(AuditRow {
+                id: row.get(0)?,
+                at: row.get(1)?,
+                kind: row.get(2)?,
+                user_id: row.get(3)?,
+                user_email: row.get(4)?,
+                subject_id: row.get(5)?,
+                subject_email: row.get(6)?,
+                machine_id: row.get(7)?,
+                machine_name: row.get(8)?,
+                owner_id: row.get(9)?,
+                role: row.get(10)?,
+                ip: row.get(11)?,
+                user_agent: row.get(12)?,
+                details: row.get(13)?,
+            })
+        })?
+        .collect()
+}
+
+/// Deletes up to `limit` events older than `before`, oldest first (by the
+/// `at` index); returns how many. Called in chunks, so a large backlog
+/// never holds the connection for long.
+pub fn prune_audit_events(conn: &Connection, before: i64, limit: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events WHERE at < ?1 ORDER BY at LIMIT ?2)",
+        params![before, limit],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1432,7 +1624,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         // Only the shares table is under test: no users or machines to point at.
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        let before_dev = MIGRATIONS.len() - 1;
+        let before_dev = MIGRATIONS.iter().position(|migration| migration.contains("machine_shares_new")).unwrap();
         for migration in &MIGRATIONS[..before_dev] {
             conn.execute_batch(migration).unwrap();
         }
@@ -1460,6 +1652,50 @@ mod tests {
                 .is_err()
         );
         assert_eq!(Role::from_sql("dev"), Role::Dev);
+    }
+
+    /// The audit log's migration on a database the previous relay made, with
+    /// data in it and foreign keys on as in production; and pruning walks
+    /// the `at` index rather than the whole table.
+    #[test]
+    fn audit_migration_applies_to_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let before_audit = MIGRATIONS.iter().position(|migration| migration.contains("CREATE TABLE audit_events")).unwrap();
+        for (version, migration) in (1_i64..).zip(&MIGRATIONS[..before_audit]) {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        conn.execute("INSERT INTO users (id, email, password_hash, created_at) VALUES (1, 'a@example.com', 'x', 0)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO machines (public_id, owner_id, name, hostname, key_fingerprint, created_at)
+             VALUES ('m1', 1, 'desk', 'desk', x'01', 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, i64::try_from(MIGRATIONS.len()).unwrap());
+        assert_eq!(machine_name(&conn, "m1").unwrap().as_deref(), Some("desk"));
+        let event = crate::audit::Event::new(crate::audit::Kind::SignIn).by(1);
+        insert_audit_events(&conn, &[event]).unwrap();
+        // Again is a no-op.
+        migrate(&conn).unwrap();
+        let rows = audit_events(&conn, &AuditFilter { visible_to: Some(1), limit: 10, ..AuditFilter::default() }).unwrap();
+        assert_eq!((rows.len(), rows[0].user_email.as_deref()), (1, Some("a@example.com")));
+
+        let plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM audit_events WHERE at < ?1 ORDER BY at LIMIT ?2")
+            .unwrap()
+            .query_map(params![0, 10], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(plan.iter().any(|step| step.contains("USING COVERING INDEX audit_events_at")), "{plan:?}");
+        assert_eq!(prune_audit_events(&conn, 0, 10).unwrap(), 0);
+        assert_eq!(prune_audit_events(&conn, i64::MAX, 10).unwrap(), 1);
     }
 
     /// Accounts from before email verification stay verified, and a code

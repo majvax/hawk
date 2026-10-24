@@ -16,6 +16,7 @@ import {
   setPolicy,
   setUserDisabled,
 } from "../api.js";
+import { ActivityTable } from "./Activity.js";
 import { Alert, CodeBlock, ConfirmButton, Dot, Metric, Tag, errorMessage } from "../ui.js";
 
 export function AdminPage({ me }: { me: User }): JSX.Element {
@@ -232,6 +233,19 @@ export function AdminPage({ me }: { me: User }): JSX.Element {
               </tbody>
             </table>
           </div>
+        </div>
+      </section>
+
+      <section className="section">
+        <div className="section-aside">
+          <h2>Activity</h2>
+          <p>
+            Every account's sign-ins, views and actions on this relay, including failed sign-ins for addresses with
+            no account. Content is never recorded: the relay can't read it.
+          </p>
+        </div>
+        <div className="section-main">
+          <ActivityTable all />
         </div>
       </section>
     </div>

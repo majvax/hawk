@@ -19,7 +19,9 @@ have to trust with your screen.
 ## What the relay can do
 
 - **See who watches what, and when.** It routes the traffic, so it knows
-  who's connected.
+  who's connected. It keeps that as the activity log: who signed in,
+  watched, used a shell or files, from which address, and how many
+  encrypted bytes went through, but never what they said.
 - **Refuse service:** drop connections, or not pass messages on. It can
   delay a revocation, but not past the share's end time.
 - **Serve a modified dashboard.** The dashboard you load comes from the

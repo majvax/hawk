@@ -23,6 +23,7 @@ import {
 import { type Identity, changePassword } from "../keys.js";
 import { ACCENT_PRESETS, DEFAULT_ACCENT, applyAccent, isAccent, loadAccent, saveAccent } from "../theme.js";
 import { Alert, ConfirmButton, Dot, Segmented, Tag, errorMessage } from "../ui.js";
+import { ActivityTable } from "./Activity.js";
 import { TwoFactorSection } from "./TwoFactor.js";
 
 const MIN_PASSWORD_LENGTH = 10; // mirrors auth::MIN_PASSWORD_LEN
@@ -62,6 +63,18 @@ export function SettingsPage({
       />
       <SessionsSection sessions={sessions} refresh={refreshSessions} />
       <PasswordSection user={user} onChanged={refreshSessions} />
+      <section className="section">
+        <div className="section-aside">
+          <h2>Activity</h2>
+          <p>
+            Sign-ins and changes to this account, what you did on any machine, and everything anyone did on the
+            machines you own. Hover a time for the exact one, an address for the browser.
+          </p>
+        </div>
+        <div className="section-main">
+          <ActivityTable />
+        </div>
+      </section>
     </div>
   );
 }
