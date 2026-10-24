@@ -181,7 +181,7 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [x] Audio (WASAPI loopback, Opus) alongside the video stream
 - [x] Audio on the MSE fallback (Firefox for Android): Opus muxed into fragmented MP4
 - [x] A/V sync: video slewed to the audio clock, a prefer latency / prefer sync toggle
-- [ ] Audio follow-up: an output device picker
+- [x] Output device picker: listed for anyone watching, chosen by control for the stream
 - [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
 - [x] File transfer into and out of one drop folder, resumable and hash-checked, off unless the machine's config turns it on
 - [x] Remote power actions (lock, sign out, restart, shut down), reboot-and-reconnect, remote sign-in at the sign-in screen
@@ -459,7 +459,7 @@ let the viewer choose, or see them all.
 * `displays.shareable` in the config keeps a screen private — a second
   monitor that never leaves the room even when the machine is shared.
 
-### Audio (built, except a device picker)
+### Audio (built)
 
 Built: hawk-capture captures the default render endpoint with WASAPI
 loopback on a thread of its own. It asks Windows to convert to 48 kHz
@@ -483,8 +483,12 @@ read. **Sync to sound** in the live view trades latency for sync: a 150 ms
 cushion, and each picture held (300 ms at most) until the sound of the
 same instant is heard; on MSE the `<video>`'s rate is steered toward the
 sound's clock instead. With no sound heard (quiet, muted) the picture runs
-free. `?debug` shows the gap as `a/v`. Not yet: a device picker. The
-original plan:
+free. `?debug` shows the gap as `a/v`. **Sound ▾** lists the machine's
+active render endpoints (the service enumerates them itself, over a sealed
+`audio` channel with its own session key); control or the owner, elevated,
+can pick one, which restarts hawk-capture with `--audio-device`. The
+choice lasts for the stream and is never saved; a chosen device that goes
+away falls back to the default until it's back. The original plan:
 
 * **Capture:** WASAPI loopback (`IAudioClient` with
   `AUDCLNT_STREAMFLAGS_LOOPBACK`) on the default render endpoint, encoded as

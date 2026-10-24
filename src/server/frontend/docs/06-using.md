@@ -46,9 +46,15 @@ back until you click the page. A quiet machine sends no sound at all.
 
 Picture and sound each play as soon as they arrive, which is what
 controlling the machine wants, so they can be a little apart. For
-watching something, turn on **Sync to sound**: the sound gets a slightly
-deeper buffer and the picture waits for it, at the cost of a little delay.
-It's remembered in this browser.
+watching something, turn on **Sync to sound** under **Sound ▾**: the
+sound gets a slightly deeper buffer and the picture waits for it, at the
+cost of a little delay. It's remembered in this browser.
+
+**Sound ▾** also lists the machine's output devices. With control (or as
+the owner) you can choose which one you hear, after confirming it's you;
+the picture pauses for a moment while the machine switches. It changes
+what everyone watching hears, and goes back to the default when the
+stream stops.
 
 Sound needs a browser that can decode it (Chrome, Edge, Firefox, on a
 phone too, recent Safari). Where it can't, the button doesn't show, and the

@@ -11,6 +11,7 @@ enable_language(RC)
 
 add_executable(hawk-service
     service/main.cpp
+    service/audio_devices.cpp
     service/capture_host.cpp
     service/config.cpp
     service/crypto.cpp

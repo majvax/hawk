@@ -139,7 +139,8 @@ private:
 
 // hawk-service launches us with `--pipe <name> --input-pipe <name>`,
 // `--clipboard-pipe <name>` (plus `--clipboard-listen`) when its config
-// allows the clipboard, and `--audio` when the machine's sound goes too.
+// allows the clipboard, and `--audio` when the machine's sound goes too
+// (plus `--audio-device <endpoint id>` when a viewer chose the device).
 [[nodiscard]] std::optional<std::string> option_value(std::span<char* const> args, std::string_view option) {
     for (std::size_t i = 1; i + 1 < args.size(); ++i) {
         if (std::string_view(args[i]) == option) {
@@ -252,6 +253,9 @@ int main(int argc, char* argv[]) {
     // Run on its own, it only counts the packets.
     capture::AudioCapture audio;
     if (has_flag(args, "--audio")) {
+        // Endpoint ids are ASCII; hawk-service checked it.
+        const auto   chosen = option_value(args, "--audio-device").value_or("");
+        std::wstring device_id(chosen.begin(), chosen.end());
         audio.start(stream_start, [&pipe, count = std::uint64_t{0}](const capture::EncodedPacket& packet) mutable {
             if (pipe.is_open()) {
                 return pipe.write(packet, true);
@@ -261,7 +265,7 @@ int main(int argc, char* argv[]) {
                              packet.timestamp.count() / 1000);
             }
             return true;
-        });
+        }, std::move(device_id));
     }
 
     // Encode on a fixed frame clock at the encoder's frame rate. Desktop

@@ -223,7 +223,7 @@ struct AudioCapture::Impl {
     enum class Ended : std::uint8_t { stopped, sink_closed, device_lost, failed };
 
     static void run(const std::stop_token& stop, std::chrono::steady_clock::time_point stream_start,
-                    const PacketSink& sink) {
+                    const PacketSink& sink, const std::wstring& wanted_id) {
         const ComScope com;
         if (!com.ok()) {
             spdlog::error("audio: CoInitializeEx failed; no sound");
@@ -237,7 +237,7 @@ struct AudioCapture::Impl {
         }
         bool warned = false;
         while (!stop.stop_requested()) {
-            const auto ended = capture(stop, *enumerator.Get(), stream_start, sink, warned);
+            const auto ended = capture(stop, *enumerator.Get(), stream_start, sink, wanted_id, warned);
             if (ended == Ended::stopped || ended == Ended::sink_closed) {
                 return;
             }
@@ -250,19 +250,39 @@ struct AudioCapture::Impl {
         }
     }
 
-    // Captures from the current default device until it goes away or
-    // changes, or until stopped.
-    static Ended capture(const std::stop_token& stop, IMMDeviceEnumerator& enumerator,
-                         std::chrono::steady_clock::time_point stream_start, const PacketSink& sink, bool& warned) {
+    // Whether the endpoint `id` is there and active.
+    [[nodiscard]] static ComPtr<IMMDevice> active_device(IMMDeviceEnumerator& enumerator, const std::wstring& id) {
         ComPtr<IMMDevice> device;
-        if (FAILED(enumerator.GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
+        DWORD             state = 0;
+        if (FAILED(enumerator.GetDevice(id.c_str(), &device)) || FAILED(device->GetState(&state)) ||
+            state != DEVICE_STATE_ACTIVE) {
+            return nullptr;
+        }
+        return device;
+    }
+
+    // Captures from the wanted device, or while it's missing (or none was
+    // asked for) the current default one, until it goes away or changes,
+    // or until stopped.
+    static Ended capture(const std::stop_token& stop, IMMDeviceEnumerator& enumerator,
+                         std::chrono::steady_clock::time_point stream_start, const PacketSink& sink,
+                         const std::wstring& wanted_id, bool& warned) {
+        ComPtr<IMMDevice> device;
+        if (!wanted_id.empty()) {
+            device = active_device(enumerator, wanted_id);
+            if (device == nullptr) {
+                spdlog::info("audio: the chosen output device isn't there; using the default until it is");
+            }
+        }
+        const bool chosen = device != nullptr;
+        if (!chosen && FAILED(enumerator.GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
             if (!warned) {
                 spdlog::info("audio: no output device; no sound until there is one");
                 warned = true;
             }
             return Ended::failed;
         }
-        const std::wstring device_id = default_device_id(enumerator);
+        const std::wstring device_id = chosen ? wanted_id : default_device_id(enumerator);
 
         ComPtr<IAudioClient> client;
         if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
@@ -428,7 +448,12 @@ struct AudioCapture::Impl {
 
             if (now >= next_device_check) {
                 next_device_check = now + kDeviceCheckInterval;
-                if (default_device_id(enumerator) != device_id) {
+                if (!wanted_id.empty() && !chosen && active_device(enumerator, wanted_id) != nullptr) {
+                    spdlog::info("audio: the chosen output device is back; switching to it");
+                    ended = Ended::device_lost;
+                    break;
+                }
+                if (!chosen && default_device_id(enumerator) != device_id) {
                     spdlog::info("audio: the default output device changed; following it");
                     ended = Ended::device_lost;
                     break;
@@ -446,11 +471,13 @@ AudioCapture::~AudioCapture() {
     stop();
 }
 
-void AudioCapture::start(std::chrono::steady_clock::time_point stream_start, PacketSink sink) {
+void AudioCapture::start(std::chrono::steady_clock::time_point stream_start, PacketSink sink,
+                         std::wstring device_id) {
     stop();
-    impl_->thread = std::jthread([stream_start, sink = std::move(sink)](const std::stop_token& stop) {
-        Impl::run(stop, stream_start, sink);
-    });
+    impl_->thread = std::jthread(
+        [stream_start, sink = std::move(sink), device_id = std::move(device_id)](const std::stop_token& stop) {
+            Impl::run(stop, stream_start, sink, device_id);
+        });
 }
 
 void AudioCapture::stop() noexcept {

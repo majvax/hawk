@@ -5,6 +5,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace hawk::capture {
 
@@ -16,7 +17,9 @@ namespace hawk::capture {
 // audio belongs to the session, so it keeps playing on the lock screen and
 // under a UAC prompt. Silence isn't sent at all, so a quiet machine costs
 // nothing. With no output device (or none yet) it waits and tries again;
-// a switch of the default device (headphones plugged in) is followed.
+// a switch of the default device (headphones plugged in) is followed,
+// unless a viewer chose a device of its own, which is kept while it's
+// there (and the default used while it isn't).
 //
 // Requires nothing of the caller's COM state: the thread sets up its own.
 class AudioCapture {
@@ -35,7 +38,8 @@ public:
     AudioCapture& operator=(AudioCapture&&) = delete;
 
     // `stream_start` is the instant the video timestamps count from.
-    void start(std::chrono::steady_clock::time_point stream_start, PacketSink sink);
+    // `device_id` is an endpoint id to capture instead of the default.
+    void start(std::chrono::steady_clock::time_point stream_start, PacketSink sink, std::wstring device_id = {});
 
     // Stops the thread. Safe to call when it never started.
     void stop() noexcept;

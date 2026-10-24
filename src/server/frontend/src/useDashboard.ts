@@ -239,6 +239,16 @@ export interface Dashboard {
   elevate: () => void;
   // Owner only: tells the machine to install the update it's holding.
   installUpdate: (deviceId: string) => void;
+  // The machine's output devices, once asked for (requestAudioDevices),
+  // null before that.
+  audioDevices: AudioDevicesState | null;
+  // Asks the machine for them; anyone watching. False when there's no
+  // secured view to ask.
+  requestAudioDevices: () => boolean;
+  // Has the machine capture another device ("" for its default). The
+  // relay drops it unless this view has control and is elevated, and the
+  // machine checks the role again. The answer is a fresh list.
+  selectAudioDevice: (id: string) => boolean;
   // Asks the machine being watched to lock, sign out, restart or shut
   // down. The relay drops it unless this view has control and is elevated,
   // and the machine checks the role again. Returns false when there's no
@@ -265,6 +275,37 @@ export interface Dashboard {
   // Prefer sync over latency: the picture waits for the sound (soundMode.ts).
   sync: boolean;
   setSync: (sync: boolean) => void;
+}
+
+export interface AudioDevice {
+  id: string;
+  name: string;
+  default: boolean;
+}
+
+export interface AudioDevicesState {
+  devices: AudioDevice[];
+  // The endpoint id captured, "" for the default.
+  selected: string;
+  // Whether the stream carries sound at all.
+  sound: boolean;
+  error: string;
+}
+
+function parseAudioDevices(header: unknown): AudioDevicesState | null {
+  if (typeof header !== "object" || header === null) return null;
+  const { devices, selected, sound, error } = header as Record<string, unknown>;
+  if (!Array.isArray(devices)) return null;
+  return {
+    devices: devices.flatMap((device: unknown): AudioDevice[] => {
+      if (typeof device !== "object" || device === null) return [];
+      const { id, name, default: isDefault } = device as Record<string, unknown>;
+      return typeof id === "string" && typeof name === "string" ? [{ id, name, default: isDefault === true }] : [];
+    }),
+    selected: typeof selected === "string" ? selected : "",
+    sound: sound === true,
+    error: typeof error === "string" ? error : "",
+  };
 }
 
 const MUTED_KEY = "hawk.sound.muted";
@@ -321,6 +362,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const [metrics, setMetrics] = useState<MetricsState>(EMPTY_METRICS);
   const metricsManagerRef = useRef<MetricsManager | null>(null);
   const metricsChainRef = useRef<Promise<void>>(Promise.resolve());
+  const audioChainRef = useRef<Promise<void>>(Promise.resolve());
+  const [audioDevices, setAudioDevices] = useState<AudioDevicesState | null>(null);
   const publishShells = useRef((): void => {
     const manager = shellManagerRef.current;
     setShells(manager === null ? NO_SHELLS : { enabled: shellsEnabledRef.current, shells: manager.snapshot() });
@@ -725,6 +768,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       metricsManagerRef.current?.close();
       metricsManagerRef.current = deviceId === null ? null : new MetricsManager(setMetrics);
       setMetrics(EMPTY_METRICS);
+      setAudioDevices(null);
     },
     [publishFiles, publishShells],
   );
@@ -925,6 +969,19 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
               metricsManagerRef.current?.handle(opened.op, opened.header, opened.data);
             })
             .catch((error: unknown) => console.error("metrics message:", error));
+          break;
+        }
+        case "audio": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          audioChainRef.current = audioChainRef.current
+            .then(() => session.openAudio(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              const state = parseAudioDevices(opened.header);
+              if (state !== null) setAudioDevices(state);
+            })
+            .catch((error: unknown) => console.error("audio devices:", error));
           break;
         }
         case "elevation":
@@ -1254,6 +1311,38 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [send],
   );
 
+  // Seals an audio request with `seal` and sends it as `type`, through the
+  // input chain: it's numbered from the same counter.
+  const sendAudio = useCallback(
+    (type: "audio_devices" | "audio_select", seal: (session: ViewSession) => Promise<string> | null): boolean => {
+      const deviceId = streamingRef.current;
+      const session = sessionRef.current;
+      if (deviceId === null || session === null) return false;
+      const sealed = seal(session);
+      if (sealed === null) return false;
+      inputChainRef.current = inputChainRef.current
+        .then(() => sealed)
+        .then((payload) => {
+          if (sessionRef.current === session) send({ type, deviceId, sealed: payload });
+        })
+        .catch((error: unknown) => console.error("sealing audio request:", error));
+      return true;
+    },
+    [send],
+  );
+  const requestAudioDevices = useCallback(
+    (): boolean => sendAudio("audio_devices", (session) => session.sealAudioList()),
+    [sendAudio],
+  );
+  const selectAudioDevice = useCallback(
+    (id: string): boolean => {
+      const role = sessionRef.current?.role;
+      if (role !== "owner" && role !== "control") return false;
+      return sendAudio("audio_select", (session) => session.sealAudioSelect(id));
+    },
+    [sendAudio],
+  );
+
   return {
     machines,
     status,
@@ -1276,6 +1365,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     elevate,
     installUpdate,
     sendPower,
+    audioDevices,
+    requestAudioDevices,
+    selectAudioDevice,
     startView,
     stopView,
     sendInput,

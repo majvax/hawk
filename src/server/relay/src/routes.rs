@@ -23,7 +23,7 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
+    MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
 use crate::registry::{Answer, DashboardHandle, DeviceInfo, DeviceOutbound, Outbound, RESTART_GRACE, Registry, StepUp};
@@ -391,6 +391,13 @@ fn route_device_answer(
             }
             return;
         }
+        Ok(DeviceMessage::Audio { viewer, sealed }) if sealed.len() <= MAX_SEALED_AUDIO_LEN => {
+            let event = DashboardEvent::Audio { device_id: machine_id.to_owned(), sealed };
+            if !registry.forward_bulk(machine_id, viewer, event) {
+                debug!(%machine_id, viewer, "relay: dropping the device list for a viewer that isn't keeping up");
+            }
+            return;
+        }
         _ => {
             debug!(%machine_id, "relay: ignoring an unexpected message from a machine");
             return;
@@ -492,6 +499,7 @@ async fn handle_dashboard(
     let mut file_budget = Budget::file_bytes();
     let mut shell_budget = Budget::shell_bytes();
     let mut metrics_budget = Budget::metrics();
+    let mut audio_budget = Budget::audio();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -552,6 +560,19 @@ async fn handle_dashboard(
                     registry.metrics(dashboard_id, &device_id, sealed);
                 }
             }
+            Ok(DashboardCommand::AudioDevices { device_id, sealed }) => {
+                // Opening the sound menu, by hand. Each one has the machine
+                // enumerate its devices.
+                if sealed.len() <= MAX_SEALED_AUDIO_REQUEST_LEN && audio_budget.take() {
+                    registry.audio_devices(dashboard_id, &device_id, sealed);
+                }
+            }
+            Ok(DashboardCommand::AudioSelect { device_id, sealed }) => {
+                // Each one restarts the machine's capture.
+                if sealed.len() <= MAX_SEALED_AUDIO_REQUEST_LEN && audio_budget.take() {
+                    registry.audio_select(dashboard_id, &device_id, sealed);
+                }
+            }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
                 warn!(%error, "dashboard: received invalid command (further ones are logged at debug)")
             }
@@ -589,6 +610,12 @@ impl Budget {
     /// the process list, never anywhere near this.
     fn metrics() -> Self {
         Self::new(5.0, 20.0)
+    }
+
+    /// Asking for the output devices and choosing one, by hand: a few a
+    /// minute, and each has the machine do work (a choice restarts capture).
+    fn audio() -> Self {
+        Self::new(1.0, 5.0)
     }
 
     /// Bytes of sealed file messages from one dashboard: far more than a

@@ -11,10 +11,14 @@ use crate::db::{Role, Signed};
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The first protocol whose machines take power actions.
 pub const POWER_PROTOCOL: u32 = 3;
+
+/// The first protocol whose machines list their output devices and let a
+/// viewer choose one.
+pub const AUDIO_DEVICES_PROTOCOL: u32 = 5;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -109,6 +113,9 @@ pub enum DeviceMessage {
     /// A metrics-channel message sealed for one viewer: a sample, a range of
     /// history, the process list. Queued with file data.
     Metrics { viewer: u64, sealed: String },
+    /// The machine's output devices, sealed for one viewer: the answer to
+    /// its asking for them, or to its choosing one.
+    Audio { viewer: u64, sealed: String },
     /// The machine is about to restart (or shut down): Windows has accepted
     /// it, and the connection drops shortly. Only ever about the machine
     /// itself, so nothing a viewer could be misled by.
@@ -167,6 +174,12 @@ pub enum DeviceCommand {
     /// viewer. Only passed on for control, elevated; the machine checks the
     /// role again before acting on it.
     Power { viewer: u64, sealed: String },
+    /// A request for the output devices, sealed by the viewer. Passed on
+    /// for anyone watching; the machine checks the role.
+    AudioDevices { viewer: u64, sealed: String },
+    /// A choice of output device, sealed by the viewer. Only passed on for
+    /// control, elevated; the machine checks the role again.
+    AudioSelect { viewer: u64, sealed: String },
     /// Every revocation the owner has signed for this machine.
     Revocations { revocations: Vec<SignedView> },
     /// The owner asks the machine to install the update it's holding now.
@@ -224,6 +237,12 @@ pub const MAX_SEALED_SHELL_LEN: usize = (8 + 3 + 1024 + 16 * 1024 + 16_usize).di
 pub const MAX_SEALED_METRICS_LEN: usize = (8 + 3 + 1024 + 512 * 1024 + 16_usize).div_ceil(3) * 4;
 /// A viewer's metrics request: only a small header.
 pub const MAX_SEALED_METRICS_REQUEST_LEN: usize = (8 + 3 + 1024 + 16_usize).div_ceil(3) * 4;
+/// A viewer's audio request: counter, an endpoint id (or nothing), and the
+/// tag, in base64.
+pub const MAX_SEALED_AUDIO_REQUEST_LEN: usize = (8 + 256 + 16_usize).div_ceil(3) * 4;
+/// The machine's device list: counter, op, header length, a JSON header
+/// of up to 64 KB, and the tag, in base64.
+pub const MAX_SEALED_AUDIO_LEN: usize = (8 + 3 + 65_535 + 16_usize).div_ceil(3) * 4;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
 const MAX_ANSWER_LEN: usize = 2048;
 
@@ -279,6 +298,12 @@ pub enum DashboardCommand {
     /// A sealed power action. Only passed on while viewing the machine
     /// with a control (or owner) role, elevated.
     Power { device_id: String, sealed: String },
+    /// A sealed request for the output devices. Only passed on while
+    /// viewing the machine.
+    AudioDevices { device_id: String, sealed: String },
+    /// A sealed choice of output device. Only passed on while viewing the
+    /// machine with a control (or owner) role, elevated.
+    AudioSelect { device_id: String, sealed: String },
     /// The owner asks the machine to install the update it's holding.
     InstallUpdate { device_id: String },
 }
@@ -334,6 +359,9 @@ pub struct MachineView {
     /// While online: the machine takes power actions, and this user's role
     /// may ask for them.
     pub power: bool,
+    /// While online: the machine lists its output devices, and lets
+    /// control choose one.
+    pub audio_devices: bool,
 }
 
 /// Messages pushed to connected dashboards.
@@ -380,6 +408,8 @@ pub enum DashboardEvent {
     Shell { device_id: String, sealed: String },
     /// A metrics-channel message the machine sealed for this viewer.
     Metrics { device_id: String, sealed: String },
+    /// The machine's output devices, sealed for this viewer.
+    Audio { device_id: String, sealed: String },
 }
 
 /// Binary video frame produced by hawk-service (BuildVideoFrame):

@@ -139,6 +139,19 @@ public:
     // new, and from a viewer with control (or the owner).
     [[nodiscard]] std::optional<PowerAction> power(std::uint64_t viewer, std::string_view sealed);
 
+    // Opens a sealed request for the list of output devices: true if it's
+    // genuine, new, and from a viewer that watches the screen.
+    [[nodiscard]] bool audio_devices(std::uint64_t viewer, std::string_view sealed);
+
+    // Opens a sealed choice of output device; returns its endpoint id
+    // (empty for the default) if it's genuine, new, and from a viewer with
+    // control (or the owner). Not checked against the devices there are.
+    [[nodiscard]] std::optional<std::string> audio_select(std::uint64_t viewer, std::string_view sealed);
+
+    // Seals an audio-channel message (the device list) for one viewer and
+    // sends it. False when that viewer is gone or refused.
+    bool send_audio(std::uint64_t viewer, const ChannelMessage& message);
+
     // "AB12 CD34 ..." for the viewer's identity key, for the log; empty
     // for a viewer that isn't here.
     [[nodiscard]] std::string fingerprint_of(std::uint64_t viewer);

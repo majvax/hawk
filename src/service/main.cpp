@@ -7,6 +7,7 @@
 #include "machine_identity.hpp"
 #include "machine_key.hpp"
 #include "metrics.hpp"
+#include "audio_devices.hpp"
 #include "power.hpp"
 #include "updater.hpp"
 #include "websocket/websocket.hpp"
@@ -54,7 +55,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 4;
+constexpr std::uint32_t kProtocolVersion = 5;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -98,6 +99,22 @@ struct GoingDownMessage {
     bool        restart = false;
 };
 
+// The header of the audio channel's one message: the machine's output
+// devices, and which one the stream captures (empty for the default).
+struct AudioDeviceEntry {
+    std::string id;
+    std::string name;
+    bool        is_default = false;
+};
+
+struct AudioDevicesReply {
+    std::vector<AudioDeviceEntry> devices;
+    std::string                   selected;
+    // Whether sound goes with the stream at all ([[audio]] and the relay).
+    bool                          sound = false;
+    std::string                   error;
+};
+
 // Answers the relay's challenge.
 struct ProofMessage {
     std::string type = "proof";
@@ -115,11 +132,11 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power
+    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power, audio_*
     std::vector<svc::SignedStatement>            revocations;    // revocations
     bool                                         audio = false;  // start_capture: the relay passes sound on
 };
@@ -139,6 +156,19 @@ template <>
 struct glz::meta<hawk::service::SignedStatement> {
     using T                     = hawk::service::SignedStatement;
     static constexpr auto value = object("statement", &T::statement, "signature", &T::signature);
+};
+
+template <>
+struct glz::meta<AudioDeviceEntry> {
+    using T                     = AudioDeviceEntry;
+    static constexpr auto value = object("id", &T::id, "name", &T::name, "default", &T::is_default);
+};
+
+template <>
+struct glz::meta<AudioDevicesReply> {
+    using T                     = AudioDevicesReply;
+    static constexpr auto value =
+        object("devices", &T::devices, "selected", &T::selected, "sound", &T::sound, "error", &T::error);
 };
 
 template <>
@@ -361,7 +391,7 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
 // the clipboard allowed, what hawk-capture reads off it goes to the viewers
 // that asked (or, in sync mode, everyone who may read it).
 void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::ViewerHub& hub,
-                  const svc::ClipboardConfig& clipboard, bool audio) {
+                  const svc::ClipboardConfig& clipboard, bool audio, const std::string& audio_device) {
     if (capture.is_running()) {
         spdlog::info("relay: start_capture ignored, capture already running");
         return;
@@ -369,7 +399,9 @@ void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::
 
     const svc::CaptureOptions options{.clipboard = clipboard.mode != svc::ClipboardMode::off,
                                       .clipboard_listen = clipboard.mode == svc::ClipboardMode::sync,
-                                      .audio = audio};
+                                      .audio = audio,
+                                      // plausible_device_id() let only ASCII through.
+                                      .audio_device = std::wstring(audio_device.begin(), audio_device.end())};
     auto on_clipboard = [&hub](ipc::ClipboardKind kind, std::string_view text) {
         hub.deliver_clipboard(text, kind == ipc::ClipboardKind::changed);
     };
@@ -459,7 +491,53 @@ struct Connection {
     // And the machine's sound with it: the relay passes it on, and the
     // config allows it.
     bool capture_audio = false;
+    // The output device a viewer chose for this stream (an endpoint id),
+    // empty for the default. Forgotten when the stream stops.
+    std::string audio_device;
 };
+
+// Sends one viewer the machine's output devices, and which one is captured.
+void SendAudioDevices(svc::ViewerHub& hub, std::uint64_t viewer, const Connection& connection) {
+    AudioDevicesReply reply;
+    reply.selected = connection.audio_device;
+    reply.sound = connection.capture_audio;
+    if (auto devices = svc::list_audio_devices(); devices.has_value()) {
+        for (auto& device : *devices) {
+            reply.devices.push_back({.id = std::move(device.id), .name = std::move(device.name), .is_default = device.is_default});
+        }
+    } else {
+        spdlog::warn("audio: couldn't list the output devices: {}", devices.error());
+        reply.error = devices.error();
+    }
+    auto header = glz::write_json(reply);
+    if (!header.has_value() || !hub.send_audio(viewer, {.op = 0, .header = std::move(*header), .data = {}})) {
+        spdlog::info("audio: couldn't send viewer {} the output devices", viewer);
+    }
+}
+
+// Captures from the output device a viewer chose ("" for the default), by
+// starting hawk-capture over with it: the picture pauses for a moment.
+// A device that isn't there is refused.
+void SelectAudioDevice(Connection& connection, const std::string& id) {
+    if (!id.empty()) {
+        const auto devices = svc::list_audio_devices();
+        const bool present = svc::plausible_device_id(id) && devices.has_value() &&
+                             std::ranges::any_of(*devices, [&id](const svc::AudioDevice& device) { return device.id == id; });
+        if (!present) {
+            spdlog::warn("audio: no output device {}; keeping the current one", id);
+            return;
+        }
+    }
+    if (id == connection.audio_device) {
+        return;
+    }
+    connection.audio_device = id;
+    if (connection.capture_audio && connection.capture.is_running()) {
+        connection.capture.stop();
+        StartCapture(connection.client, connection.capture, *connection.hub, connection.config.clipboard,
+                     connection.capture_audio, connection.audio_device);
+    }
+}
 
 // Carries out a power action a viewer asked for, and for a restart or shut
 // down tells the relay before the connection drops.
@@ -517,7 +595,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         return;
     }
     auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater, capture_wanted,
-           capture_audio] = connection;
+           capture_audio, audio_device] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -541,9 +619,10 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         capture_wanted = true;
         // A relay too old to pass sound on doesn't ask for it.
         capture_audio = command.audio && config.audio.enabled;
-        StartCapture(client, capture, *hub, config.clipboard, capture_audio);
+        StartCapture(client, capture, *hub, config.clipboard, capture_audio, audio_device);
     } else if (command.type == "stop_capture") {
         capture_wanted = false;
+        audio_device.clear();
         capture.stop();
     } else if (command.type == "viewer_join") {
         hub->join(command.viewer, {.statement = command.statement, .signature = command.signature}, command.grant);
@@ -589,6 +668,15 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
     } else if (command.type == "power") {
         if (const auto action = hub->power(command.viewer, command.sealed); action.has_value()) {
             RunPowerAction(client, *action);
+        }
+    } else if (command.type == "audio_devices") {
+        if (hub->audio_devices(command.viewer, command.sealed)) {
+            SendAudioDevices(*hub, command.viewer, connection);
+        }
+    } else if (command.type == "audio_select") {
+        if (const auto id = hub->audio_select(command.viewer, command.sealed); id.has_value()) {
+            SelectAudioDevice(connection, *id);
+            SendAudioDevices(*hub, command.viewer, connection);
         }
     } else if (command.type == "revocations") {
         hub->apply_revocations(command.revocations);
@@ -660,7 +748,7 @@ void CaptureSupervisor(const std::stop_token& stop_token, std::mutex& lock, Conn
         }
         capture.stop();
         StartCapture(connection.client, capture, *connection.hub, connection.config.clipboard,
-                     connection.capture_audio);
+                     connection.capture_audio, connection.audio_device);
         started_at = now;
         next_attempt = now + retry_delay;
         retry_delay = std::min(retry_delay * 2, kCaptureRetryMax);

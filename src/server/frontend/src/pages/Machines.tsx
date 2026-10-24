@@ -654,6 +654,9 @@ function Viewer({
     unlockSound,
     sync,
     setSync,
+    audioDevices,
+    requestAudioDevices,
+    selectAudioDevice,
   } = dashboard;
   const requestStepUp = useStepUp();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -665,6 +668,7 @@ function Viewer({
   const [dropNote, setDropNote] = useState<string | null>(null);
   const [clipMenu, setClipMenu] = useState(false);
   const [powerMenu, setPowerMenu] = useState(false);
+  const [soundMenu, setSoundMenu] = useState(false);
   // The power action waiting for its second click.
   const [armed, setArmed] = useState<PowerAction | null>(null);
   const [powerNote, setPowerNote] = useState<string | null>(null);
@@ -697,6 +701,14 @@ function Viewer({
   // Lock, sign out, restart, shut down: control, elevated, on a machine new
   // enough to take them. The machine checks the role again.
   const canPower = secured && viewing.power === true && roleCanControl(security.role) && elevated;
+  // The machine's output devices: anyone watching sees them; control (or
+  // the owner) can choose, elevated, which restarts the stream for a moment.
+  const listsDevices = secured && viewing.audioDevices === true;
+  const mayChooseDevice = listsDevices && roleCanControl(security.role);
+  const canChooseDevice = mayChooseDevice && elevated;
+  const chooseHint = mayChooseDevice ? "Confirm it's you first" : "Choosing the device needs control";
+  const defaultName = audioDevices?.devices.find((device) => device.default)?.name;
+  const soundMenuShown = onScreen && (sound.supported || listsDevices);
 
   const canSendFiles = secured && files.enabled && elevated;
   // Dropping files on the screen sends them; the Files tab follows them.
@@ -730,6 +742,7 @@ function Viewer({
 
   useEffect(() => {
     setPowerMenu(false);
+    setSoundMenu(false);
     setArmed(null);
     setPowerNote(null);
   }, [viewing?.id]);
@@ -836,6 +849,15 @@ function Viewer({
     document.addEventListener("pointerdown", onPointer);
     return () => document.removeEventListener("pointerdown", onPointer);
   }, [clipMenu]);
+  useEffect(() => {
+    if (!soundMenu) return;
+    const onPointer = (event: PointerEvent): void => {
+      const target = event.target as Element | null;
+      if (target?.closest(".stage-menu, [data-sound-menu]") == null) setSoundMenu(false);
+    };
+    document.addEventListener("pointerdown", onPointer);
+    return () => document.removeEventListener("pointerdown", onPointer);
+  }, [soundMenu]);
   useEffect(() => {
     if (!powerMenu) return;
     const onPointer = (event: PointerEvent): void => {
@@ -945,6 +967,7 @@ function Viewer({
               aria-expanded={clipMenu}
               onClick={() => {
                 setPowerMenu(false);
+                setSoundMenu(false);
                 setClipMenu(!clipMenu);
               }}
             >
@@ -958,6 +981,7 @@ function Viewer({
               aria-expanded={powerMenu}
               onClick={() => {
                 setClipMenu(false);
+                setSoundMenu(false);
                 setArmed(null);
                 setPowerMenu(!powerMenu);
               }}
@@ -975,14 +999,21 @@ function Viewer({
               {sound.blocked ? "Click for sound" : sound.muted ? "Sound off" : "Sound on"}
             </button>
           )}
-          {onScreen && sound.supported && !sound.muted && (
+          {soundMenuShown && (
             <button
               type="button"
-              aria-pressed={sync}
-              title={sync ? "The picture waits for the sound" : "Picture and sound each as soon as they arrive"}
-              onClick={() => setSync(!sync)}
+              data-sound-menu
+              aria-expanded={soundMenu}
+              onClick={() => {
+                setClipMenu(false);
+                setPowerMenu(false);
+                setArmed(null);
+                // Fresh each time: devices come and go.
+                if (!soundMenu && listsDevices) requestAudioDevices();
+                setSoundMenu(!soundMenu);
+              }}
             >
-              Sync to sound
+              Sound ▾
             </button>
           )}
           {onScreen && (
@@ -1017,6 +1048,61 @@ function Viewer({
               >
                 Copy the machine's clipboard to mine
               </button>
+            )}
+          </div>
+        )}
+        {soundMenuShown && soundMenu && (
+          <div className="stage-menu" role="menu">
+            {sound.supported && (
+              <button
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={sync}
+                title={sync ? "The picture waits for the sound" : "Picture and sound each as soon as they arrive"}
+                onClick={() => setSync(!sync)}
+              >
+                {sync ? "✓ " : ""}Sync to sound
+              </button>
+            )}
+            {listsDevices && (
+              <>
+                <div className="stage-menu-label">Output device on {viewing.name}</div>
+                {audioDevices === null ? (
+                  <button type="button" disabled>
+                    Asking…
+                  </button>
+                ) : !audioDevices.sound ? (
+                  <button type="button" disabled>
+                    This machine doesn't send its sound
+                  </button>
+                ) : (
+                  [{ id: "", name: `Default (${defaultName ?? "none"})` }, ...audioDevices.devices].map((device) => (
+                    <button
+                      key={device.id === "" ? "default" : device.id}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={audioDevices.selected === device.id}
+                      disabled={!canChooseDevice}
+                      title={canChooseDevice ? undefined : chooseHint}
+                      onClick={() => {
+                        setSoundMenu(false);
+                        if (audioDevices.selected !== device.id) selectAudioDevice(device.id);
+                      }}
+                    >
+                      {audioDevices.selected === device.id ? "✓ " : ""}
+                      {device.name}
+                    </button>
+                  ))
+                )}
+                {audioDevices?.sound === true && mayChooseDevice && !elevated && (
+                  <button
+                    type="button"
+                    onClick={() => void requestStepUp().then((ok) => ok && dashboard.elevate())}
+                  >
+                    Confirm it's you to choose…
+                  </button>
+                )}
+              </>
             )}
           </div>
         )}

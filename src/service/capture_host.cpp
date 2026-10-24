@@ -194,7 +194,8 @@ private:
                                                                             const std::wstring& input_pipe_name,
                                                                             const std::wstring& clipboard_pipe_name,
                                                                             bool                clipboard_listen,
-                                                                            bool                audio) {
+                                                                            bool                audio,
+                                                                            const std::wstring& audio_device) {
     auto directory = service_directory();
     if (!directory.has_value()) {
         return std::unexpected(directory.error());
@@ -210,6 +211,9 @@ private:
     }
     if (audio) {
         command_line += L" --audio";
+        if (!audio_device.empty()) {
+            command_line += std::format(L" --audio-device {}", audio_device);
+        }
     }
     std::wstring desktop = L"winsta0\\default";
 
@@ -657,7 +661,7 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
 
     auto process =
         launch_capture(session, pipe_name, input_pipe_name, clipboard_pipe_name, options.clipboard_listen,
-                       options.audio);
+                       options.audio, options.audio_device);
     if (!process.has_value()) {
         return std::unexpected(process.error());
     }

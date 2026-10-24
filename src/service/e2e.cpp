@@ -42,6 +42,11 @@ constexpr std::string_view kFileAad = "hawk-file-v1";
 constexpr std::string_view kShellAad = "hawk-shell-v1";
 constexpr std::string_view kMetricsAad = "hawk-metrics-v1";
 constexpr std::string_view kPowerAad = "hawk-power-v1";
+// Asking for the device list and choosing a device are sealed apart, so
+// the relay can't pass one off as the other.
+constexpr std::string_view kAudioListAad = "hawk-audio-list-v1";
+constexpr std::string_view kAudioSelectAad = "hawk-audio-select-v1";
+constexpr std::string_view kAudioAad = "hawk-audio-v1";
 // A file- or shell-channel plaintext: op, header length (u16, big-endian),
 // the JSON header, then bytes.
 constexpr std::size_t kChannelPreamble = 3;
@@ -533,6 +538,9 @@ struct Viewer {
     // And metrics, likewise.
     crypto::AesGcm               metrics_key;
     std::uint64_t                metrics_counter = 0;
+    // And the output device list, likewise.
+    crypto::AesGcm               audio_key;
+    std::uint64_t                audio_counter = 0;
     // Whether the owner's grant allows analytics (always, for the owner).
     bool                         analytics = false;
     // Shared by input and clipboard requests, which the dashboard numbers
@@ -933,19 +941,20 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     const auto join_hash = crypto::sha256(crypto::as_bytes(request.statement));
     // HKDF output is a prefix of any longer output: the first 64 bytes are
     // the input and wrap keys whatever length is asked for.
-    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 192);
+    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 224);
     auto input_key = crypto::AesGcm::create(std::span(keys).first(32));
     auto wrap_key = crypto::AesGcm::create(std::span(keys).subspan(32, 32));
     auto reply_key = crypto::AesGcm::create(std::span(keys).subspan(64, 32));
     auto file_key = crypto::AesGcm::create(std::span(keys).subspan(96, 32));
     auto shell_key = crypto::AesGcm::create(std::span(keys).subspan(128, 32));
     auto metrics_key = crypto::AesGcm::create(std::span(keys).subspan(160, 32));
+    auto audio_key = crypto::AesGcm::create(std::span(keys).subspan(192, 32));
     const auto accept = std::format("{}\nmachine={}\njoin={}\nephemeral={}\nrole={}", kAcceptContext, impl.machine_id,
                                     crypto::base64_encode(join_hash), crypto::base64_encode(exchange->public_key()),
                                     admission->role);
     const auto signature = impl.machine_key.sign(crypto::as_bytes(accept));
     if (!input_key.has_value() || !wrap_key.has_value() || !reply_key.has_value() || !file_key.has_value() ||
-        !shell_key.has_value() || !metrics_key.has_value() || !signature.has_value()) {
+        !shell_key.has_value() || !metrics_key.has_value() || !audio_key.has_value() || !signature.has_value()) {
         impl.reject(viewer, "the machine couldn't sign its answer");
         return;
     }
@@ -961,6 +970,7 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
         .file_key = std::move(*file_key),
         .shell_key = std::move(*shell_key),
         .metrics_key = std::move(*metrics_key),
+        .audio_key = std::move(*audio_key),
         .analytics = admission->analytics,
         .grant_issued = admission->grant_issued,
         .not_after = admission->not_after,
@@ -1309,6 +1319,53 @@ std::optional<PowerAction> ViewerHub::power(std::uint64_t viewer, std::string_vi
         spdlog::info("power: viewer {} ({}) asked to {}", viewer, found->second.fingerprint, to_string(*action));
     }
     return action;
+}
+
+bool ViewerHub::audio_devices(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused || !Impl::can_view(found->second)) {
+        return false;
+    }
+    return Impl::open_request(found->second, sealed, kAudioListAad).has_value();
+}
+
+std::optional<std::string> ViewerHub::audio_select(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused || !Impl::can_control(found->second)) {
+        spdlog::warn("audio: viewer {} asked to choose the output device, which its role doesn't allow; ignored",
+                     viewer);
+        return std::nullopt;
+    }
+    const auto plain = Impl::open_request(found->second, sealed, kAudioSelectAad);
+    if (!plain.has_value()) {
+        return std::nullopt;
+    }
+    std::string id(reinterpret_cast<const char*>(plain->data()), plain->size());
+    spdlog::info("audio: viewer {} ({}) chose the output device {}", viewer, found->second.fingerprint,
+                 id.empty() ? "(default)" : id);
+    return id;
+}
+
+bool ViewerHub::send_audio(std::uint64_t viewer, const ChannelMessage& message) {
+    if (message.header.size() > 0xFFFFU) {
+        return false;
+    }
+    auto&            impl = *impl_;
+    std::unique_lock lock(impl.mutex);
+    const auto       found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused || !Impl::can_view(found->second)) {
+        return false;
+    }
+    Viewer&    session = found->second;
+    const auto json = Impl::seal_channel(viewer, "audio", session.audio_key, session.audio_counter, kAudioAad, message);
+    // Outside the lock, as with metrics: only the relay thread sends these.
+    lock.unlock();
+    impl.send(json);
+    return true;
 }
 
 }  // namespace hawk::service

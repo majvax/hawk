@@ -50,8 +50,9 @@ history_days = 7         # how long the machine keeps its history, 1 to 90
 
 ## Audio
 
-What the machine plays (its default output device) goes to everyone
-watching, with the picture. Anyone who may watch hears it, view-only shares
+What the machine plays (its default output device, or the one a viewer
+with control chose for the stream) goes to everyone watching, with the
+picture. Anyone who may watch hears it, view-only shares
 included. `enabled = false` keeps the room's sound in the room. A config
 that doesn't parse turns sound off too.
 

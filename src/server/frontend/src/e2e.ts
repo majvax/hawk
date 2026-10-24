@@ -229,6 +229,11 @@ const FILE_AAD = utf8("hawk-file-v1");
 const SHELL_AAD = utf8("hawk-shell-v1");
 const METRICS_AAD = utf8("hawk-metrics-v1");
 const POWER_AAD = utf8("hawk-power-v1");
+// Asking for the device list and choosing a device are sealed apart, so
+// the relay can't pass one off as the other.
+const AUDIO_LIST_AAD = utf8("hawk-audio-list-v1");
+const AUDIO_SELECT_AAD = utf8("hawk-audio-select-v1");
+const AUDIO_AAD = utf8("hawk-audio-v1");
 // The byte a sealed power request carries; must match PowerAction in
 // src/service/power.hpp.
 const POWER_ACTIONS: Record<PowerAction, number> = { lock: 1, sign_out: 2, restart: 3, shut_down: 4 };
@@ -293,6 +298,9 @@ export class ViewSession {
   // And the machine's analytics, likewise.
   private metricsKey: CryptoKey | null = null;
   private metricsCounter = 0n;
+  // And the machine's output devices, likewise.
+  private audioKey: CryptoKey | null = null;
+  private audioCounter = 0n;
   private readonly streamKeys = new Map<number, CryptoKey>();
   // Numbers input events and clipboard requests alike: the machine keeps
   // one counter for both.
@@ -344,13 +352,14 @@ export class ViewSession {
       throw new Error("the machine's answer doesn't match this request");
     }
     const shared = await exchange(this.exchangeKey.privateKey, fromBase64(ephemeral));
-    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 192);
+    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 224);
     this.inputKey = await aesKey(keys.slice(0, 32), ["encrypt"]);
     this.wrapKey = await aesKey(keys.slice(32, 64), ["decrypt"]);
     this.replyKey = await aesKey(keys.slice(64, 96), ["decrypt"]);
     this.fileKey = await aesKey(keys.slice(96, 128), ["decrypt"]);
     this.shellKey = await aesKey(keys.slice(128, 160), ["decrypt"]);
     this.metricsKey = await aesKey(keys.slice(160, 192), ["decrypt"]);
+    this.audioKey = await aesKey(keys.slice(192, 224), ["decrypt"]);
     this.role = role;
     // A dev viewer doesn't watch the screen, and is never given its key.
     if (answer.wrappedKey !== "") await this.addStreamKey(answer.wrappedKey);
@@ -462,6 +471,16 @@ export class ViewSession {
     return this.sealRequest(new Uint8Array([POWER_ACTIONS[action]]), POWER_AAD);
   }
 
+  // Asks for the machine's output devices: nothing but the counter.
+  sealAudioList(): Promise<string> | null {
+    return this.sealRequest(new Uint8Array(0), AUDIO_LIST_AAD);
+  }
+
+  // Chooses the device to capture by its endpoint id; "" for the default.
+  sealAudioSelect(id: string): Promise<string> | null {
+    return this.sealRequest(utf8(id), AUDIO_SELECT_AAD);
+  }
+
   // A file-channel message from the machine; null for anything that
   // doesn't open or was seen before. Must be called in the order the
   // messages arrived.
@@ -491,6 +510,16 @@ export class ViewSession {
     const opened = await openChannel(key, sealed, METRICS_AAD, this.metricsCounter);
     if (opened === null || opened.counter <= this.metricsCounter) return null;
     this.metricsCounter = opened.counter;
+    return opened.message;
+  }
+
+  // The same for the machine's output devices.
+  async openAudio(sealed: string): Promise<ChannelMessage | null> {
+    const key = this.audioKey;
+    if (key === null) return null;
+    const opened = await openChannel(key, sealed, AUDIO_AAD, this.audioCounter);
+    if (opened === null || opened.counter <= this.audioCounter) return null;
+    this.audioCounter = opened.counter;
     return opened.message;
   }
 

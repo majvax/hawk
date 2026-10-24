@@ -48,6 +48,8 @@ struct CaptureOptions {
     bool clipboard_listen = false;
     // Capture what the machine plays, too.
     bool audio = false;
+    // From this output device (an endpoint id) rather than the default.
+    std::wstring audio_device;
 };
 
 // Runs hawk-capture.exe inside the active console session and receives its

@@ -25,7 +25,10 @@ Each release's section becomes its release notes (see
 - **Sync to sound** in the live view: the picture waits for the sound of
   the same instant, for watching rather than controlling. Off by default,
   remembered in the browser.
-- Protocol version 4.
+- **Sound ▾** lists the machine's output devices; control and the owner
+  can choose which one the stream carries (after a fresh code, as with
+  power). The choice lasts until the stream stops.
+- Protocol version 5.
 
 ## 1.0.0
 

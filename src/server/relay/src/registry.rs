@@ -17,7 +17,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
-use crate::protocol::{DashboardEvent, DeviceCommand, MachineView, POWER_PROTOCOL, SignedView, is_audio, is_keyframe};
+use crate::protocol::{
+    AUDIO_DEVICES_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, POWER_PROTOCOL, SignedView, is_audio, is_keyframe,
+};
 
 pub type DashboardId = u64;
 
@@ -205,6 +207,7 @@ impl Inner {
                 .and_then(|device| device.update_available.clone()),
             restarting: self.restarting.get(&row.public_id).is_some_and(|until| *until > auth::now()),
             power: row.role.can_control() && device.is_some_and(|device| device.protocol >= POWER_PROTOCOL),
+            audio_devices: device.is_some_and(|device| device.protocol >= AUDIO_DEVICES_PROTOCOL),
         }
     }
 
@@ -678,6 +681,33 @@ impl Registry {
         self.pass_on(dashboard_id, machine_id, Role::can_control, DeviceCommand::Power { viewer: dashboard_id, sealed })
     }
 
+    /// Passes a sealed request for the output devices on to the machine if
+    /// this dashboard is watching it, whatever its role: the machine only
+    /// answers roles that watch the screen.
+    pub fn audio_devices(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
+        let has_access =
+            inner.dashboards.get(&dashboard_id).is_some_and(|dashboard| dashboard.access.contains_key(machine_id));
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !has_access || !device.viewers.contains_key(&dashboard_id) {
+            return false;
+        }
+        device.send(DeviceCommand::AudioDevices { viewer: dashboard_id, sealed });
+        true
+    }
+
+    /// Passes a sealed choice of output device on to the machine if this
+    /// dashboard may control it and is watching it, elevated: it changes
+    /// what everyone watching hears.
+    pub fn audio_select(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        self.pass_on(
+            dashboard_id,
+            machine_id,
+            Role::can_control,
+            DeviceCommand::AudioSelect { viewer: dashboard_id, sealed },
+        )
+    }
+
     /// Passes the owner's go-ahead for an update on. Anyone else is ignored.
     pub fn install_update(&self, dashboard_id: DashboardId, machine_id: &str) {
         let inner = self.lock();
@@ -935,6 +965,37 @@ mod tests {
         while next(&mut device_rx).is_some() {}
         assert!(!registry.power(dashboard, MACHINE, "sealed".to_owned()));
         assert!(next(&mut device_rx).is_none());
+    }
+
+    /// Anyone watching may see the output devices; only control may choose.
+    #[test]
+    fn choosing_the_output_device_needs_control() {
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::View);
+        assert!(registry.audio_devices(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::AudioDevices { viewer, .. }) if viewer == dashboard));
+        assert!(!registry.audio_select(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
+        assert!(registry.audio_select(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::AudioSelect { viewer, .. }) if viewer == dashboard));
+    }
+
+    /// Only machines new enough to list their devices offer the picker.
+    #[test]
+    fn audio_devices_follow_the_protocol() {
+        let registry = Registry::default();
+        let (handle, mut events) = handle(1);
+        registry.add_dashboard(handle, vec![row(Role::View)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        let info = DeviceInfo { version: None, protocol: POWER_PROTOCOL };
+        let connection = registry.add_device(MACHINE, 1, info, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| !view.audio_devices));
+        registry.remove_device(MACHINE, connection, auth::now());
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        let info = DeviceInfo { version: None, protocol: AUDIO_DEVICES_PROTOCOL };
+        registry.add_device(MACHINE, 1, info, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| view.audio_devices));
     }
 
     /// The last machine view `events` carries.
