@@ -1,5 +1,6 @@
 #include "capture_host.hpp"
 #include "config.hpp"
+#include "config_sync.hpp"
 #include "crypto.hpp"
 #include "e2e.hpp"
 #include "files.hpp"
@@ -55,7 +56,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 5;
+constexpr std::uint32_t kProtocolVersion = 6;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -140,11 +141,11 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*, ping
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*, config_*, ping
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power, audio_*
+    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power, audio_*, config_*
     std::vector<svc::SignedStatement>            revocations;    // revocations
     bool                                         audio = false;  // start_capture: the relay passes sound on
 };
@@ -497,7 +498,9 @@ struct Connection {
     std::unique_ptr<svc::ShellSessions>& shells;
     std::unique_ptr<svc::MetricsChannel>& metrics;
     svc::MetricsRecorder*                recorder;  // null with [[metrics]] off
-    const svc::MachineConfig&            config;
+    // Changed by the owner from the dashboard: what applies live is
+    // updated here (ApplyConfig), the rest waits for the next start.
+    svc::MachineConfig&                  config;
     svc::Updater&                        updater;
     // A viewer asked for the stream (start_capture) and hasn't stopped it:
     // CaptureSupervisor keeps hawk-capture running until then.
@@ -505,6 +508,9 @@ struct Connection {
     // And the machine's sound with it: the relay passes it on, and the
     // config allows it.
     bool capture_audio = false;
+    // Whether the relay passes sound on, as it said at start_capture: sound
+    // turned on in the config mid-stream goes out only if it does.
+    bool relay_audio = false;
     // The output device a viewer chose for this stream (an endpoint id),
     // empty for the default. Forgotten when the stream stops.
     std::string audio_device;
@@ -551,6 +557,80 @@ void SelectAudioDevice(Connection& connection, const std::string& id) {
         StartCapture(connection.client, connection.capture, *connection.hub, connection.config.clipboard,
                      connection.capture_audio, connection.audio_device);
     }
+}
+
+// Sends one viewer the machine's config, its schema, and whether it may
+// change it; `error` says why a change it asked for wasn't made.
+void SendConfig(svc::ViewerHub& hub, std::uint64_t viewer, bool saved = false, std::string_view error = {}) {
+    const auto snapshot = svc::read_config_snapshot();
+    if (error.empty() && !snapshot.has_value()) {
+        error = snapshot.error();
+    }
+    auto header = svc::config_reply(snapshot.has_value() ? &*snapshot : nullptr, hub.may_change_config(viewer), saved,
+                                    error);
+    if (!hub.send_config(viewer, {.op = 0, .header = std::move(header), .data = {}})) {
+        spdlog::info("config: couldn't send viewer {} the config", viewer);
+    }
+}
+
+// Takes what a change to the config makes live at once: the clipboard rules,
+// and whether sound goes with the stream. Both are hawk-capture's options,
+// so a stream that's running starts over with them. The rest waits for the
+// service to start again.
+void ApplyConfig(Connection& connection, const svc::MachineConfig& saved) {
+    auto&      config = connection.config;
+    const bool restart_capture =
+        saved.clipboard.mode != config.clipboard.mode || saved.audio.enabled != config.audio.enabled;
+    config.clipboard = saved.clipboard;
+    config.audio = saved.audio;
+    connection.hub->set_clipboard(config.clipboard);
+    connection.capture_audio = connection.relay_audio && config.audio.enabled;
+    if (restart_capture && connection.capture.is_running()) {
+        connection.capture.stop();
+        StartCapture(connection.client, connection.capture, *connection.hub, config.clipboard,
+                     connection.capture_audio, connection.audio_device);
+    }
+}
+
+// Makes the change the owner asked for, if it's still against the file as
+// it is and the file's rules allow it, and answers with the config as it
+// now stands (or why not).
+void ChangeConfig(Connection& connection, std::uint64_t viewer, std::string_view json) {
+    auto&      hub = *connection.hub;
+    const auto change = svc::parse_config_change(json);
+    if (!change.has_value()) {
+        SendConfig(hub, viewer, false, "the change couldn't be read");
+        return;
+    }
+    const auto snapshot = svc::read_config_snapshot();
+    if (!snapshot.has_value()) {
+        SendConfig(hub, viewer);
+        return;
+    }
+    if (change->version != snapshot->version) {
+        SendConfig(hub, viewer, false, "the config changed on the machine since you loaded it; here it is as it is now");
+        return;
+    }
+    const auto edited = svc::edit_config_text(snapshot->text, change->changes);
+    if (!edited.has_value()) {
+        spdlog::info("config: refused viewer {}'s change: {}", viewer, edited.error());
+        SendConfig(hub, viewer, false, edited.error());
+        return;
+    }
+    if (const auto saved = svc::save_config_text(*edited); !saved.has_value()) {
+        spdlog::error("config: {}", saved.error());
+        SendConfig(hub, viewer, false, saved.error());
+        return;
+    }
+    std::string keys;
+    for (const auto& [key, value] : change->changes) {
+        keys += keys.empty() ? key : ", " + key;
+    }
+    spdlog::info("config: viewer {} ({}) changed {}", viewer, hub.fingerprint_of(viewer), keys);
+    if (const auto written = svc::read_config_snapshot(); written.has_value()) {
+        ApplyConfig(connection, written->config);
+    }
+    SendConfig(hub, viewer, true);
 }
 
 // Carries out a power action a viewer asked for, and for a restart or shut
@@ -625,7 +705,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         return;
     }
     auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater, capture_wanted,
-           capture_audio, audio_device] = connection;
+           capture_audio, relay_audio, audio_device] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -648,7 +728,8 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
     } else if (command.type == "start_capture") {
         capture_wanted = true;
         // A relay too old to pass sound on doesn't ask for it.
-        capture_audio = command.audio && config.audio.enabled;
+        relay_audio = command.audio;
+        capture_audio = relay_audio && config.audio.enabled;
         StartCapture(client, capture, *hub, config.clipboard, capture_audio, audio_device);
     } else if (command.type == "stop_capture") {
         capture_wanted = false;
@@ -707,6 +788,14 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         if (const auto id = hub->audio_select(command.viewer, command.sealed); id.has_value()) {
             SelectAudioDevice(connection, *id);
             SendAudioDevices(*hub, command.viewer, connection);
+        }
+    } else if (command.type == "config_get") {
+        if (hub->config_get(command.viewer, command.sealed)) {
+            SendConfig(*hub, command.viewer);
+        }
+    } else if (command.type == "config_set") {
+        if (const auto json = hub->config_set(command.viewer, command.sealed); json.has_value()) {
+            ChangeConfig(connection, command.viewer, *json);
         }
     } else if (command.type == "ping") {
         SendPong(client, command.viewer, command.nonce);
@@ -802,7 +891,7 @@ void SendUpdateStatus(net::WebSocketClient& client, const std::optional<std::str
 }
 
 void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClient*>& active_client,
-               const svc::MachineConfig& config, svc::Updater& updater) {
+               svc::MachineConfig& config, svc::Updater& updater) {
     net::WebSocketClient client;
     // Declared after `client` so it's destroyed (stopped) first: its reader
     // thread sends through `client`.
@@ -984,7 +1073,7 @@ DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, [[maybe_unused]] DWORD event_type,
 void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* argv) {
     InitLogging();
     spdlog::info("service: hawk-service {} starting", internal::version::full_version);
-    const svc::MachineConfig config = svc::load_machine_config();
+    svc::MachineConfig config = svc::load_machine_config();
     spdlog::info("config: clipboard {}{}", to_string(config.clipboard.mode),
                  config.clipboard.view_pull ? ", view shares may read it" : "");
     spdlog::info("config: file transfer {}", config.files.enabled ? "on" : "off");

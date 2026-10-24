@@ -20,6 +20,7 @@ import {
   type Transfer,
 } from "./fileTransfers.js";
 import { type OutputSink, type ShellInfo, ShellManager, type ShellSender } from "./shellSessions.js";
+import { type ConfigState, type SettingValue, parseConfig } from "./machineConfig.js";
 import { EMPTY_METRICS, MetricsManager, type MetricsRange, type MetricsSender, type MetricsState } from "./metrics.js";
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
@@ -247,6 +248,17 @@ export interface Dashboard {
   // relay drops it unless this view has control and is elevated, and the
   // machine checks the role again. The answer is a fresh list.
   selectAudioDevice: (id: string) => boolean;
+  // The machine's config and its schema, once asked for (requestConfig),
+  // null before that.
+  config: ConfigState | null;
+  // Asks the machine for it; control and owner. False when there's no
+  // secured view to ask.
+  requestConfig: () => boolean;
+  // Changes settings, against the version last received. The relay drops
+  // it unless this view is the owner's and elevated, and the machine
+  // checks the role and every value again. The answer is the config as it
+  // now stands, with `saved` or the reason it wasn't.
+  saveConfig: (changes: Record<string, SettingValue>) => boolean;
   // Asks the machine being watched to lock, sign out, restart or shut
   // down. The relay drops it unless this view has control and is elevated,
   // and the machine checks the role again. Returns false when there's no
@@ -378,6 +390,10 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const metricsChainRef = useRef<Promise<void>>(Promise.resolve());
   const audioChainRef = useRef<Promise<void>>(Promise.resolve());
   const [audioDevices, setAudioDevices] = useState<AudioDevicesState | null>(null);
+  const configChainRef = useRef<Promise<void>>(Promise.resolve());
+  const [config, setConfig] = useState<ConfigState | null>(null);
+  const configRef = useRef<ConfigState | null>(null);
+  configRef.current = config;
   const publishShells = useRef((): void => {
     const manager = shellManagerRef.current;
     setShells(manager === null ? NO_SHELLS : { enabled: shellsEnabledRef.current, shells: manager.snapshot() });
@@ -800,6 +816,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       metricsManagerRef.current = deviceId === null ? null : new MetricsManager(setMetrics);
       setMetrics(EMPTY_METRICS);
       setAudioDevices(null);
+      setConfig(null);
     },
     [publishFiles, publishShells],
   );
@@ -1013,6 +1030,19 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
               if (state !== null) setAudioDevices(state);
             })
             .catch((error: unknown) => console.error("audio devices:", error));
+          break;
+        }
+        case "config": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          configChainRef.current = configChainRef.current
+            .then(() => session.openConfig(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              const state = parseConfig(opened.header);
+              if (state !== null) setConfig(state);
+            })
+            .catch((error: unknown) => console.error("config:", error));
           break;
         }
         case "pong":
@@ -1387,10 +1417,13 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [send],
   );
 
-  // Seals an audio request with `seal` and sends it as `type`, through the
-  // input chain: it's numbered from the same counter.
-  const sendAudio = useCallback(
-    (type: "audio_devices" | "audio_select", seal: (session: ViewSession) => Promise<string> | null): boolean => {
+  // Seals a request with `seal` and sends it as `type`, through the input
+  // chain: it's numbered from the same counter.
+  const sendSealed = useCallback(
+    (
+      type: "audio_devices" | "audio_select" | "config_get" | "config_set",
+      seal: (session: ViewSession) => Promise<string> | null,
+    ): boolean => {
       const deviceId = streamingRef.current;
       const session = sessionRef.current;
       if (deviceId === null || session === null) return false;
@@ -1401,22 +1434,34 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
         .then((payload) => {
           if (sessionRef.current === session) send({ type, deviceId, sealed: payload });
         })
-        .catch((error: unknown) => console.error("sealing audio request:", error));
+        .catch((error: unknown) => console.error(`sealing ${type}:`, error));
       return true;
     },
     [send],
   );
   const requestAudioDevices = useCallback(
-    (): boolean => sendAudio("audio_devices", (session) => session.sealAudioList()),
-    [sendAudio],
+    (): boolean => sendSealed("audio_devices", (session) => session.sealAudioList()),
+    [sendSealed],
   );
   const selectAudioDevice = useCallback(
     (id: string): boolean => {
       const role = sessionRef.current?.role;
       if (role !== "owner" && role !== "control") return false;
-      return sendAudio("audio_select", (session) => session.sealAudioSelect(id));
+      return sendSealed("audio_select", (session) => session.sealAudioSelect(id));
     },
-    [sendAudio],
+    [sendSealed],
+  );
+  const requestConfig = useCallback(
+    (): boolean => sendSealed("config_get", (session) => session.sealConfigGet()),
+    [sendSealed],
+  );
+  const saveConfig = useCallback(
+    (changes: Record<string, SettingValue>): boolean => {
+      const version = configRef.current?.version;
+      if (sessionRef.current?.role !== "owner" || version === undefined) return false;
+      return sendSealed("config_set", (session) => session.sealConfigSet({ version, changes }));
+    },
+    [sendSealed],
   );
 
   return {
@@ -1444,6 +1489,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     audioDevices,
     requestAudioDevices,
     selectAudioDevice,
+    config,
+    requestConfig,
+    saveConfig,
     startView,
     stopView,
     sendInput,

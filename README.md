@@ -176,7 +176,7 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [x] `dev` role: a shell instead of a video stream, for low bandwidth (ConPTY as the logged-on user)
 - [x] GUI and CLI installer (`hawk-setup`): machine, relay, app; preflight, repair, uninstall
 - [ ] Installer pre-stamped by the dashboard with relay URL, pin and enroll code; Authenticode signing
-- [ ] Machine config file, schema-described and synced to the dashboard
+- [x] Machine config file, schema-described and synced to the dashboard: control reads it, the owner edits it
 - [ ] Multiple display support (per-display capture, display-aware input)
 - [x] Audio (WASAPI loopback, Opus) alongside the video stream
 - [x] Audio on the MSE fallback (Firefox for Android): Opus muxed into fragmented MP4
@@ -405,7 +405,29 @@ prompt, and a leaked installer is useless after the code's hour is up.
   keeps working for fleets, and the PowerShell scripts stay for people who
   prefer them.
 
-### Synced configuration file
+### Synced configuration file (built)
+
+Built: the machine's **Config** tab shows its `config.toml` as a form. The
+schema lives in one place, `settings()` in `src/service/config.cpp`: each
+setting's type (on/off, a whole number in a range, one of a list, text),
+its default, one line of help, whether it applies live or at the next
+start, and whether it's locked by default. The machine sends that schema
+with the values over a sealed `config` channel (its own session key), so
+the dashboard renders whatever it's sent. Control and the owner read it;
+only the owner changes it, elevated: the relay passes a change through the
+step-up gate for the owner alone, and the machine checks the role again.
+A change names the version (a hash of the file) it was made against; the
+machine refuses it if the file changed since, checks each value against
+the schema and the `[[locked]]` list, edits only those lines (comments
+stay), parses the result with the same rules it starts with, and renames
+it over the file. The clipboard settings and `audio.enabled` apply at once
+(hawk-capture restarts for a moment); the rest when the service next
+starts, and are marked so. The shell, file transfer, the drop folder, the
+relay URL and the update feed and key are locked unless the machine's own
+`[[locked]]` list says otherwise. Not yet: watching the file for local
+edits (the tab shows the file as it is on disk, and a local edit still
+needs a restart), and the display, network and encoder settings, which
+don't exist yet. The original plan:
 
 Every machine keeps one canonical, human-editable config
 (`C:\ProgramData\HawkService\config.toml`). The machine is the source of
@@ -543,7 +565,8 @@ may come later if they turn out to be worth the size. The directions are
   to a **view** share unless `view_pull` says so.
 
 It's set in the machine's own `C:\ProgramData\HawkService\config.toml`,
-read once when the service starts:
+read when the service starts, or by the owner from the machine's Config
+tab (see *Synced configuration file*):
 
 ```toml
 [[clipboard]]

@@ -3,11 +3,20 @@
 #include "common/clipboard_pipe.hpp"
 
 #include <cstdint>
+#include <expected>
+#include <filesystem>
+#include <optional>
+#include <span>
 #include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
 
 // The machine's own settings, from C:\ProgramData\HawkService\config.toml.
-// They're set on the machine, never through the relay, so nobody holding an
-// account there can widen what the machine allows. Read once at startup.
+// Read at startup. The owner can change the unlocked ones from the
+// dashboard too (config_sync.hpp), sealed end to end; anything that widens
+// what the machine allows is locked by default, so only someone at the
+// machine can change it.
 namespace hawk::service {
 
 // What viewers may do with the machine's clipboard.
@@ -99,6 +108,9 @@ struct MachineConfig {
     RelayConfig     relay;
     UpdateConfig    update;
     MetricsConfig   metrics;
+    // [[locked]] keys: the settings the dashboard may only read. nullopt
+    // means each setting's own default (Setting::locked).
+    std::optional<std::vector<std::string>> locked;
 };
 
 // The config, with defaults for what it leaves out (or for a missing file).
@@ -133,9 +145,55 @@ struct MachineConfig {
 //   manifest_url = ""    # empty: the release feed this build came from
 //   public_key = ""      # empty: the key this build trusts
 //
+//   [[locked]]
+//   keys = ["shell.enabled", "relay.url"]   # replaces the default list
+//
 // A relay url that doesn't parse leaves the service unconnected rather
 // than guessing; an [[update]] table that doesn't parse falls back to
 // notify, which never installs anything by itself.
 [[nodiscard]] MachineConfig load_machine_config();
+
+// Where it is.
+[[nodiscard]] const std::filesystem::path& machine_config_path();
+
+// The same rules, strictly: the first thing wrong with `text`, rather than
+// the defaults for that part. For checking a change before it's written.
+[[nodiscard]] std::expected<MachineConfig, std::string> parse_machine_config(std::string_view text);
+
+// --- Schema ------------------------------------------------------------------
+//
+// Every setting the dashboard shows, described so it can render a form
+// without knowing any of them: a new setting is its struct member, its
+// table's parser above, and one entry in settings().
+
+enum class SettingType : std::uint8_t { boolean, integer, choice, text };
+
+// When a change takes effect: at once, or when the service next starts.
+enum class SettingApply : std::uint8_t { live, restart };
+
+// A setting's value, as the dashboard sends and sees it.
+using SettingValue = std::variant<bool, std::uint64_t, std::string>;
+
+struct Setting {
+    std::string_view                  key{};  // "clipboard.mode": the table, a dot, the key
+    SettingType                       type = SettingType::text;
+    std::string_view                  description{};
+    std::span<const std::string_view> choices{};  // choice: as written in the file
+    std::uint64_t                     min = 0;  // integer
+    std::uint64_t                     max = 0;
+    std::string_view                  unit{};     // integer: "bytes", "days", "hours"
+    SettingApply                      apply = SettingApply::restart;
+    // Read-only from the dashboard unless [[locked]] says otherwise: on
+    // for anything that widens what the machine allows.
+    bool                              locked = false;
+    SettingValue (*value)(const MachineConfig&) = nullptr;
+};
+
+[[nodiscard]] std::span<const Setting> settings();
+[[nodiscard]] const Setting*           find_setting(std::string_view key);
+
+// Whether the dashboard may only read `key` under `config`'s [[locked]]
+// list. True for a key that isn't a setting.
+[[nodiscard]] bool is_locked(const MachineConfig& config, std::string_view key);
 
 }  // namespace hawk::service

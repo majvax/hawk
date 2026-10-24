@@ -34,7 +34,22 @@ Each release's section becomes its release notes (see
   fallback, how far playback runs behind instead), the round trip to the
   machine, and the sound's buffer. Remembered in the browser. The round
   trip is a ping the machine echoes back, sent only while the stats show.
-- Protocol version 5.
+- **Config tab** for a machine: its `config.toml` as a form, built from a
+  description the machine sends of each setting (type, range, default,
+  whether it applies at once). Control can read it; the owner can change
+  it after a fresh code. Changes are end-to-end encrypted, checked by the
+  machine against the same rules it starts with, and written over the file
+  in one piece, comments kept. The clipboard and sound settings apply at
+  once (the stream restarts for a moment); the rest when the service next
+  starts. Anything that widens what the machine allows (shell, file
+  transfer, the drop folder, the relay, the update feed and key) is locked
+  by default: a `[[locked]]` list on the machine says which settings the
+  dashboard may only read. A change made against a file that was edited
+  on the machine meanwhile is refused.
+- Fixed: an `[[audio]]` table in the machine's config made the whole file
+  fail to parse, turning the clipboard, file transfer, shell and relay
+  connection off.
+- Protocol version 6.
 
 ## 1.0.0
 

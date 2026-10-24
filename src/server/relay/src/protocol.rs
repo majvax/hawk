@@ -11,7 +11,7 @@ use crate::db::{Role, Signed};
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The first protocol whose machines take power actions.
 pub const POWER_PROTOCOL: u32 = 3;
@@ -22,6 +22,10 @@ pub const AUDIO_DEVICES_PROTOCOL: u32 = 5;
 
 /// The first protocol whose machines answer a ping.
 pub const PING_PROTOCOL: u32 = 5;
+
+/// The first protocol whose machines show their config and let the owner
+/// change it.
+pub const CONFIG_PROTOCOL: u32 = 6;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -119,6 +123,9 @@ pub enum DeviceMessage {
     /// The machine's output devices, sealed for one viewer: the answer to
     /// its asking for them, or to its choosing one.
     Audio { viewer: u64, sealed: String },
+    /// The machine's config and its schema, sealed for one viewer: the
+    /// answer to its asking, or to its changing it.
+    Config { viewer: u64, sealed: String },
     /// The echo of a viewer's ping, for its round trip.
     Pong { viewer: u64, nonce: String },
     /// The machine is about to restart (or shut down): Windows has accepted
@@ -185,6 +192,12 @@ pub enum DeviceCommand {
     /// A choice of output device, sealed by the viewer. Only passed on for
     /// control, elevated; the machine checks the role again.
     AudioSelect { viewer: u64, sealed: String },
+    /// A request for the config, sealed by the viewer. Passed on for
+    /// control and the owner; the machine checks the role.
+    ConfigGet { viewer: u64, sealed: String },
+    /// A change to the config, sealed by the viewer. Only passed on for the
+    /// owner, elevated; the machine checks the role again, and every value.
+    ConfigSet { viewer: u64, sealed: String },
     /// A viewer's ping, for the machine to echo straight back as a pong.
     Ping { viewer: u64, nonce: String },
     /// Every revocation the owner has signed for this machine.
@@ -250,6 +263,12 @@ pub const MAX_SEALED_AUDIO_REQUEST_LEN: usize = (8 + 256 + 16_usize).div_ceil(3)
 /// The machine's device list: counter, op, header length, a JSON header
 /// of up to 64 KB, and the tag, in base64.
 pub const MAX_SEALED_AUDIO_LEN: usize = (8 + 3 + 65_535 + 16_usize).div_ceil(3) * 4;
+/// A viewer's config request: counter, a JSON change of up to 16 KB (or
+/// nothing, to read it), and the tag, in base64.
+pub const MAX_SEALED_CONFIG_REQUEST_LEN: usize = (8 + 16 * 1024 + 16_usize).div_ceil(3) * 4;
+/// The machine's config: counter, op, header length, a JSON header of up to
+/// 64 KB, and the tag, in base64.
+pub const MAX_SEALED_CONFIG_LEN: usize = (8 + 3 + 65_535 + 16_usize).div_ceil(3) * 4;
 /// A ping's nonce, either way: a counter, in decimal.
 pub const MAX_PING_NONCE_LEN: usize = 32;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
@@ -313,6 +332,12 @@ pub enum DashboardCommand {
     /// A sealed choice of output device. Only passed on while viewing the
     /// machine with a control (or owner) role, elevated.
     AudioSelect { device_id: String, sealed: String },
+    /// A sealed request for the machine's config. Only passed on while
+    /// viewing the machine with a control (or owner) role.
+    ConfigGet { device_id: String, sealed: String },
+    /// A sealed change to the config. Only passed on while viewing the
+    /// machine as its owner, elevated.
+    ConfigSet { device_id: String, sealed: String },
     /// Asks the machine to echo `nonce` back, to time the round trip. Not
     /// sealed: it carries nothing. Only passed on while viewing the machine.
     Ping { device_id: String, nonce: String },
@@ -376,6 +401,9 @@ pub struct MachineView {
     pub audio_devices: bool,
     /// While online: the machine answers pings.
     pub ping: bool,
+    /// While online: the machine shows its config to this user's role
+    /// (control or owner), and lets the owner change it.
+    pub config: bool,
 }
 
 /// Messages pushed to connected dashboards.
@@ -424,6 +452,8 @@ pub enum DashboardEvent {
     Metrics { device_id: String, sealed: String },
     /// The machine's output devices, sealed for this viewer.
     Audio { device_id: String, sealed: String },
+    /// The machine's config, sealed for this viewer.
+    Config { device_id: String, sealed: String },
     /// The machine's echo of this dashboard's ping.
     Pong { device_id: String, nonce: String },
 }
@@ -569,6 +599,24 @@ mod tests {
         assert!(matches!(message, DeviceMessage::Shell { viewer: 3, .. }));
         let largest = BASE64.encode(vec![0u8; 8 + 3 + 1024 + 16 * 1024 + 16]);
         assert!(largest.len() <= MAX_SEALED_SHELL_LEN);
+    }
+
+    #[test]
+    fn config_messages_round_trip() {
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"config_set","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::ConfigSet { .. }));
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"config_get","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::ConfigGet { .. }));
+        let json = serde_json::to_value(DeviceCommand::ConfigSet { viewer: 3, sealed: "x".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"config_set","viewer":3,"sealed":"x"}));
+        let message: DeviceMessage = serde_json::from_str(r#"{"type":"config","viewer":3,"sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::Config { viewer: 3, .. }));
+        let json = serde_json::to_value(DashboardEvent::Config { device_id: "m1".into(), sealed: "x".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"config","deviceId":"m1","sealed":"x"}));
+        let largest = BASE64.encode(vec![0u8; 8 + 16 * 1024 + 16]);
+        assert!(largest.len() <= MAX_SEALED_CONFIG_REQUEST_LEN);
     }
 
     #[test]

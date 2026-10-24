@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -80,6 +80,9 @@ export interface Machine {
   audioDevices?: boolean;
   // While online: the machine answers pings (the stats' round trip).
   ping?: boolean;
+  // While online: the machine shows its config to this user's role
+  // (control or owner), and lets the owner change it.
+  config?: boolean;
 }
 
 // What a viewer with control can ask the machine to do with itself.
@@ -121,6 +124,8 @@ export type DashboardEvent =
   | { type: "metrics"; deviceId: string; sealed: string }
   // The machine's output devices, sealed for this viewer (ViewSession.openAudio).
   | { type: "audio"; deviceId: string; sealed: string }
+  // The machine's config and schema, sealed for this viewer (ViewSession.openConfig).
+  | { type: "config"; deviceId: string; sealed: string }
   // The machine's echo of a ping, for the round trip in the stream stats.
   | { type: "pong"; deviceId: string; nonce: string };
 
@@ -165,6 +170,10 @@ export type DashboardCommand =
   | { type: "audio_devices"; deviceId: string; sealed: string }
   // Chooses one (ViewSession.sealAudioSelect); control and owner, elevated.
   | { type: "audio_select"; deviceId: string; sealed: string }
+  // Asks for the config (ViewSession.sealConfigGet); control and owner.
+  | { type: "config_get"; deviceId: string; sealed: string }
+  // Changes it (ViewSession.sealConfigSet); the owner, elevated.
+  | { type: "config_set"; deviceId: string; sealed: string }
   // Asks the machine to echo `nonce` back (a pong); anyone watching. Not
   // sealed: it carries nothing, and only times the round trip.
   | { type: "ping"; deviceId: string; nonce: string }

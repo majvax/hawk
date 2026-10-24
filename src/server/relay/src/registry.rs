@@ -18,7 +18,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::protocol::{
-    AUDIO_DEVICES_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, PING_PROTOCOL, POWER_PROTOCOL, SignedView, is_audio,
+    AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, PING_PROTOCOL, POWER_PROTOCOL, SignedView, is_audio,
     is_keyframe,
 };
 
@@ -211,6 +211,7 @@ impl Inner {
             power: row.role.can_control() && device.is_some_and(|device| device.protocol >= POWER_PROTOCOL),
             audio_devices: device.is_some_and(|device| device.protocol >= AUDIO_DEVICES_PROTOCOL),
             ping: device.is_some_and(|device| device.protocol >= PING_PROTOCOL),
+            config: row.role.can_control() && device.is_some_and(|device| device.protocol >= CONFIG_PROTOCOL),
         }
     }
 
@@ -727,6 +728,40 @@ impl Registry {
         )
     }
 
+    /// Passes a sealed request for the machine's config on if this
+    /// dashboard may control the machine and is watching it. Reading it
+    /// needs no fresh factor; the machine checks the role again.
+    pub fn config_get(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
+        let may = inner
+            .dashboards
+            .get(&dashboard_id)
+            .and_then(|dashboard| dashboard.access.get(machine_id))
+            .is_some_and(|row| row.role.can_control());
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !may || !device.viewers.contains_key(&dashboard_id) || device.protocol < CONFIG_PROTOCOL {
+            return false;
+        }
+        device.send(DeviceCommand::ConfigGet { viewer: dashboard_id, sealed });
+        true
+    }
+
+    /// Passes a sealed change to the config on if this dashboard is the
+    /// owner's and is watching it, elevated: it's the machine's rules for
+    /// everyone it's shared with.
+    pub fn config_set(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        // A machine too old to have the config channel isn't sent one.
+        if self.lock().devices.get(machine_id).is_none_or(|device| device.protocol < CONFIG_PROTOCOL) {
+            return false;
+        }
+        self.pass_on(
+            dashboard_id,
+            machine_id,
+            |role| role == Role::Owner,
+            DeviceCommand::ConfigSet { viewer: dashboard_id, sealed },
+        )
+    }
+
     /// Passes the owner's go-ahead for an update on. Anyone else is ignored.
     pub fn install_update(&self, dashboard_id: DashboardId, machine_id: &str) {
         let inner = self.lock();
@@ -896,7 +931,7 @@ mod tests {
         let (handle, events_rx) = handle(user_id);
         let dashboard = registry.add_dashboard(handle, vec![row(role)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: PING_PROTOCOL }, outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: CONFIG_PROTOCOL }, outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture { .. })));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
@@ -944,7 +979,7 @@ mod tests {
         handle.step_up = StepUp { mfa: true, at: None };
         let dashboard = registry.add_dashboard(handle, vec![row(Role::Owner)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: CONFIG_PROTOCOL }, outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert_eq!(next_elevation(&mut events), Some(false));
         while next(&mut device_rx).is_some() {}
@@ -952,6 +987,7 @@ mod tests {
         assert!(!registry.input(dashboard, MACHINE, "sealed".to_owned()));
         assert!(!registry.shell(dashboard, MACHINE, "sealed".to_owned()));
         assert!(!registry.power(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
         registry.elevate(dashboard, MACHINE);
         assert_eq!(next_elevation(&mut events), Some(false));
 
@@ -961,6 +997,116 @@ mod tests {
         assert!(registry.input(dashboard, MACHINE, "sealed".to_owned()));
         assert!(registry.shell(dashboard, MACHINE, "sealed".to_owned()));
         assert!(registry.power(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+    }
+
+    /// Control reads the config; only the owner changes it, and a view
+    /// share does neither.
+    #[test]
+    fn changing_the_config_needs_the_owner() {
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::View);
+        assert!(!registry.config_get(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
+        assert!(registry.config_get(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ConfigGet { viewer, .. }) if viewer == dashboard));
+        assert!(!registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Owner);
+        assert!(registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ConfigSet { viewer, .. }) if viewer == dashboard));
+    }
+
+    /// Neither reading nor changing the config reaches a machine this
+    /// dashboard isn't watching, a dev share, or a machine too old for it.
+    #[test]
+    fn config_needs_a_watching_viewer_on_a_new_machine() {
+        // Owner access, the machine online, but no view.
+        let registry = Registry::default();
+        let (owner, _events) = handle(1);
+        let dashboard = registry.add_dashboard(owner, vec![row(Role::Owner)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: CONFIG_PROTOCOL }, outbound);
+        registry.elevate(dashboard, MACHINE);
+        assert!(!registry.config_get(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        // Watching, then stopped.
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Owner);
+        registry.stop_view(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.config_get(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        // An unknown (or offline) machine.
+        let (registry, dashboard, _device_rx, _events) = watching(Role::Owner);
+        assert!(!registry.config_get(dashboard, "other", "sealed".to_owned()));
+        assert!(!registry.config_set(dashboard, "other", "sealed".to_owned()));
+
+        // A dev share neither reads nor changes it.
+        let registry = Registry::default();
+        let (shared, _events) = handle(2);
+        let dashboard = registry.add_dashboard(shared, vec![row(Role::Dev)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: CONFIG_PROTOCOL }, outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        registry.elevate(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.config_get(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        // Control, elevated, still can't change it.
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
+        registry.elevate(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        // The owner, watching and elevated, of a machine below CONFIG_PROTOCOL.
+        let registry = Registry::default();
+        let (owner, _events) = handle(1);
+        let dashboard = registry.add_dashboard(owner, vec![row(Role::Owner)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: CONFIG_PROTOCOL - 1 }, outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        registry.elevate(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(registry.power(dashboard, MACHINE, "sealed".to_owned()), "the owner is elevated");
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.config_get(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.config_set(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// Only machines new enough to have a config editor offer it, and only
+    /// to control and the owner.
+    #[test]
+    fn config_follows_the_protocol() {
+        let registry = Registry::default();
+        let (owner, mut events) = handle(1);
+        registry.add_dashboard(owner, vec![row(Role::Owner)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        let info = DeviceInfo { version: None, protocol: PING_PROTOCOL };
+        let connection = registry.add_device(MACHINE, 1, info, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| !view.config));
+        registry.remove_device(MACHINE, connection, auth::now());
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        let info = DeviceInfo { version: None, protocol: CONFIG_PROTOCOL };
+        registry.add_device(MACHINE, 1, info, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| view.config));
+
+        let registry = Registry::default();
+        let (shared, mut events) = handle(2);
+        registry.add_dashboard(shared, vec![row(Role::View)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: CONFIG_PROTOCOL }, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| !view.config));
     }
 
     /// Restarting or signing out is control's to ask for, never a view

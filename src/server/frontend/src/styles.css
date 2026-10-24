@@ -1536,6 +1536,36 @@ select {
   height: min(70vh, 720px);
 }
 
+/* Config: one row per setting, generated from the machine's schema. */
+.config-form {
+  display: grid;
+  gap: 20px;
+  align-content: start;
+}
+
+.config-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 220px) minmax(0, 300px) minmax(0, 1fr);
+  align-items: center;
+  gap: 6px 14px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.config-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+@media (max-width: 860px) {
+  .config-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .tool-connect {
   display: flex;
   align-items: center;

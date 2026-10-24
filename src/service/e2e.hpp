@@ -152,6 +152,26 @@ public:
     // sends it. False when that viewer is gone or refused.
     bool send_audio(std::uint64_t viewer, const ChannelMessage& message);
 
+    // Opens a sealed request for the machine's config: true if it's
+    // genuine, new, and from a viewer with control (or the owner).
+    [[nodiscard]] bool config_get(std::uint64_t viewer, std::string_view sealed);
+
+    // Opens a sealed change to the config; returns its JSON (config_sync.hpp
+    // checks what it says) if it's genuine, new, and from the owner.
+    [[nodiscard]] std::optional<std::string> config_set(std::uint64_t viewer, std::string_view sealed);
+
+    // Whether this viewer may change the config: the owner.
+    [[nodiscard]] bool may_change_config(std::uint64_t viewer);
+
+    // Seals a config-channel message (the config and its schema) for one
+    // viewer and sends it. False when that viewer is gone or may not read it.
+    bool send_config(std::uint64_t viewer, const ChannelMessage& message);
+
+    // The clipboard rules from now on, after a change to the config.
+    // Viewers already admitted were told the old ones, and are held to the
+    // new ones.
+    void set_clipboard(const ClipboardConfig& clipboard);
+
     // "AB12 CD34 ..." for the viewer's identity key, for the log; empty
     // for a viewer that isn't here.
     [[nodiscard]] std::string fingerprint_of(std::uint64_t viewer);

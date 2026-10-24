@@ -14,6 +14,7 @@ add_executable(hawk-service
     service/audio_devices.cpp
     service/capture_host.cpp
     service/config.cpp
+    service/config_sync.cpp
     service/crypto.cpp
     service/e2e.cpp
     service/files.cpp

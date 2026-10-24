@@ -323,6 +323,13 @@ it says is taken on trust. Formats are in `relay/src/e2e.rs`,
   their own associated data. Only passed on for roles that may open shells
   (dev and owner); output shares the bounded per-dashboard queue with file
   data, and keystrokes are budgeted at 1 MB/s per dashboard.
+- **Config:** a request for the machine's config, or the owner's change to
+  it, is sealed like input with its own associated data. The machine's
+  answer (the schema, the values, or why a change was refused) uses an
+  eighth per-viewer key with its own counter. The relay passes requests on
+  for control and the owner, and changes for the owner alone, elevated;
+  the machine checks the role and every value again. At most 16 KB a
+  request, one a second per dashboard.
 - **Roles** are capabilities, not a ladder (see the top-level README): dev
   gets shells and files but no screen. The machine never gives a dev viewer
   the stream key, and the relay neither starts capture for it nor forwards

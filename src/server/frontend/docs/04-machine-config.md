@@ -1,19 +1,22 @@
 # Machine config file
 
-Some things are decided by the machine itself, never by the relay or the
-dashboard: whether its clipboard can be read, whether files can be sent
-to it, and whether it gives out shells. They're set in a file on the PC:
+Some things are decided by the machine itself, never by the relay:
+whether its clipboard can be read, whether files can be sent to it, and
+whether it gives out shells. They're set in a file on the PC:
 
 ```
 C:\ProgramData\HawkService\config.toml
 ```
 
-The service reads it **once, when it starts**. After editing it, restart
-the service, from an elevated PowerShell:
+The service reads it **when it starts**. After editing it, restart the
+service, from an elevated PowerShell:
 
 ```powershell
 Restart-Service HawkService
 ```
+
+The owner can also change it from the dashboard, in the machine's
+**Config** tab (see [below](/docs/machine-config#from-the-dashboard)).
 
 With no file, every feature has its defaults: sound **on**, clipboard
 **pull**, file transfer **off**, shells **off**.
@@ -46,7 +49,40 @@ command = "powershell.exe -NoLogo"   # or pwsh.exe, cmd.exe, ...
 [[metrics]]
 enabled = true           # the Analytics and Processes tabs
 history_days = 7         # how long the machine keeps its history, 1 to 90
+
+[[locked]]               # what the Config tab may only read; see below
+keys = ["shell.enabled", "shell.command", "files.enabled", "files.drop_dir",
+        "relay.url", "update.manifest_url", "update.public_key"]
 ```
+
+## From the dashboard
+
+The machine's **Config** tab shows this file as a form, with each
+setting's default and a line about it. It needs a live connection to the
+machine, and a machine whose service is new enough (older ones don't show
+it).
+
+- **Control** shares can read it. Only the **owner** can change it, after
+  confirming with a fresh code, as with power actions.
+- The change is end-to-end encrypted. The machine checks it against the
+  same rules it uses at startup and refuses it, saying why, if anything is
+  wrong. Only the lines that change are rewritten; comments stay.
+- The clipboard settings and `audio.enabled` take effect **at once** (the
+  picture pauses for a moment while the machine's capture restarts).
+  Settings marked **after restart** take effect when the service next
+  starts. Viewers already connected see a clipboard change in their menu
+  the next time they connect, but the machine holds them to it at once.
+- If the file was edited on the machine since the tab loaded it, the
+  change is refused and the tab shows the file as it is now.
+
+**Locked settings** can only be changed at the machine. By default those
+are the ones that widen what the machine allows: `shell.enabled`,
+`shell.command`, `files.enabled`, `files.drop_dir`, `relay.url`,
+`update.manifest_url` and `update.public_key`. A `[[locked]]` table
+replaces that list: add `clipboard.mode` to keep the clipboard as you set
+it here, or leave `keys = []` to let the owner change everything from the
+dashboard. A name in it that isn't a setting locks everything, so a typo
+can't unlock anything.
 
 ## Audio
 

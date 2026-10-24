@@ -23,7 +23,7 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
+    MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_CONFIG_LEN, MAX_SEALED_CONFIG_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
 use crate::registry::{Answer, DashboardHandle, DeviceInfo, DeviceOutbound, Outbound, RESTART_GRACE, Registry, StepUp};
@@ -403,6 +403,13 @@ fn route_device_answer(
             }
             return;
         }
+        Ok(DeviceMessage::Config { viewer, sealed }) if sealed.len() <= MAX_SEALED_CONFIG_LEN => {
+            let event = DashboardEvent::Config { device_id: machine_id.to_owned(), sealed };
+            if !registry.forward_bulk(machine_id, viewer, event) {
+                debug!(%machine_id, viewer, "relay: dropping the config for a viewer that isn't keeping up");
+            }
+            return;
+        }
         _ => {
             debug!(%machine_id, "relay: ignoring an unexpected message from a machine");
             return;
@@ -505,6 +512,7 @@ async fn handle_dashboard(
     let mut shell_budget = Budget::shell_bytes();
     let mut metrics_budget = Budget::metrics();
     let mut audio_budget = Budget::audio();
+    let mut config_budget = Budget::config();
     let mut ping_budget = Budget::ping();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
@@ -579,6 +587,18 @@ async fn handle_dashboard(
                     registry.audio_select(dashboard_id, &device_id, sealed);
                 }
             }
+            Ok(DashboardCommand::ConfigGet { device_id, sealed }) => {
+                // Opening the Config tab, or loading it again.
+                if sealed.len() <= MAX_SEALED_CONFIG_REQUEST_LEN && config_budget.take() {
+                    registry.config_get(dashboard_id, &device_id, sealed);
+                }
+            }
+            Ok(DashboardCommand::ConfigSet { device_id, sealed }) => {
+                // Each one rewrites the machine's config file.
+                if sealed.len() <= MAX_SEALED_CONFIG_REQUEST_LEN && config_budget.take() {
+                    registry.config_set(dashboard_id, &device_id, sealed);
+                }
+            }
             Ok(DashboardCommand::Ping { device_id, nonce }) => {
                 // Once a second while the stats are up.
                 if nonce.len() <= MAX_PING_NONCE_LEN && ping_budget.take() {
@@ -627,6 +647,12 @@ impl Budget {
     /// Asking for the output devices and choosing one, by hand: a few a
     /// minute, and each has the machine do work (a choice restarts capture).
     fn audio() -> Self {
+        Self::new(1.0, 5.0)
+    }
+
+    /// Reading the config and saving it, by hand: each has the machine read
+    /// (or write) its config file.
+    fn config() -> Self {
         Self::new(1.0, 5.0)
     }
 

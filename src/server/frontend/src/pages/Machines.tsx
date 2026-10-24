@@ -25,6 +25,7 @@ import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
 import { useStepUp } from "../stepUp.js";
 import { AnalyticsPanel, ProcessesPanel } from "./AnalyticsPanel.js";
+import { ANSWER_TIMEOUT_MS, ConfigPanel } from "./ConfigPanel.js";
 import { FilesPanel } from "./FilesPanel.js";
 import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
 
@@ -234,6 +235,9 @@ export function MachinesPage({
                   <ProcessesPanel metrics={dashboard.metrics} actions={dashboard.metricsActions} />
                 )}
               </AnalyticsTab>
+            )}
+            {detailTab === "config" && (
+              <ConfigTab dashboard={dashboard} machine={selected} viewing={viewing} onConnect={connect} />
             )}
             {detailTab === "sharing" && <SharingPanel key={selected.id} machine={selected} identity={identity} />}
             {detailTab === "machine" && (
@@ -1246,11 +1250,12 @@ function Viewer({
   );
 }
 
-type DetailTab = "screen" | "terminal" | "files" | "analytics" | "processes" | "sharing" | "machine";
+type DetailTab = "screen" | "terminal" | "files" | "analytics" | "processes" | "config" | "sharing" | "machine";
 
 // The tabs a machine's user gets: only what they can use. A dev share has
 // no screen, so it starts on the terminal; analytics is the owner's, or a
-// share's the owner allowed it for.
+// share's the owner allowed it for; control reads the config, and only the
+// owner changes it.
 function tabsFor(machine: Machine): [DetailTab, string][] {
   const { role } = machine;
   const tabs: [DetailTab, string][] = [];
@@ -1258,6 +1263,7 @@ function tabsFor(machine: Machine): [DetailTab, string][] {
   if (canShell(role)) tabs.push(["terminal", "Terminal"]);
   if (canFiles(role)) tabs.push(["files", "Files"]);
   if (role === "owner" || machine.analytics === true) tabs.push(["analytics", "Analytics"], ["processes", "Processes"]);
+  if (roleCanControl(role)) tabs.push(["config", "Config"]);
   if (role === "owner") tabs.push(["sharing", "Sharing"], ["machine", "Machine"]);
   return tabs;
 }
@@ -1400,6 +1406,68 @@ function AnalyticsTab({
         </div>
       )}
       {secured && dashboard.metrics.enabled && children}
+    </div>
+  );
+}
+
+// The Config tab: over the view, like analytics. Reading it needs no second
+// factor; the owner's changes do, and the machine checks each one.
+function ConfigTab({
+  dashboard,
+  machine,
+  viewing,
+  onConnect,
+}: {
+  dashboard: Dashboard;
+  machine: Machine;
+  viewing: Machine | null;
+  onConnect: (machine: Machine) => void;
+}): JSX.Element {
+  const secured = isSecured(dashboard, machine, viewing);
+  // A machine too old to send its config never shows the editor.
+  const supported = machine.config === true;
+  const owner = machine.role === "owner";
+  const { config, requestConfig, saveConfig } = dashboard;
+  // Bumped by Try again; a load the machine never answers stops waiting.
+  const [attempt, setAttempt] = useState(0);
+  const [loadTimedOut, setLoadTimedOut] = useState(false);
+  const waiting = secured && supported && config === null;
+
+  // Fresh whenever the tab is opened on a live view.
+  useEffect(() => {
+    if (secured && supported) requestConfig();
+  }, [secured, supported, requestConfig, attempt]);
+
+  useEffect(() => {
+    setLoadTimedOut(false);
+    if (!waiting) return;
+    const timer = window.setTimeout(() => setLoadTimedOut(true), ANSWER_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [waiting, attempt]);
+
+  return (
+    <div className="tool-wrap">
+      {!secured && <NotConnected dashboard={dashboard} machine={machine} viewing={viewing} onConnect={onConnect} />}
+      {secured && !supported && (
+        <div className="empty">
+          This machine's service is too old to show its config here. Update it, or edit config.toml on the machine.
+        </div>
+      )}
+      {secured && supported && owner && !dashboard.elevated && (
+        <StepUpNeeded dashboard={dashboard} what="Changing the config" />
+      )}
+      {waiting && !loadTimedOut && <div className="empty">Loading the config…</div>}
+      {waiting && loadTimedOut && (
+        <div className="empty tool-connect">
+          <span>No answer from the machine.</span>
+          <button type="button" className="btn btn-sm" onClick={() => setAttempt((count) => count + 1)}>
+            Try again
+          </button>
+        </div>
+      )}
+      {secured && supported && config !== null && (
+        <ConfigPanel config={config} editable={owner && dashboard.elevated && config.writable} onSave={saveConfig} />
+      )}
     </div>
   );
 }

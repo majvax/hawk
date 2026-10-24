@@ -8,6 +8,7 @@ not. Select one to open it. Its tabs depend on what you're allowed to do:
 | **Screen** | Owner, *View only*, *Can control* |
 | **Terminal** | Owner, *Shell only* |
 | **Files** | Owner, *Can control*, *Shell only* |
+| **Config** | Owner (to change it), *Can control* (to read it) |
 | **Sharing**, **Machine** | Owner |
 
 The connection to each machine is encrypted end to end before anything
@@ -147,6 +148,15 @@ tab. **Full screen** sends shortcuts like `Ctrl+W` to the shell too.
 
 Shells are off unless the machine's
 [config file](/docs/machine-config#shell) turns them on.
+
+## Config
+
+The machine's [config file](/docs/machine-config) as a form, while
+connected. With control you can read it; as the owner you can change what
+isn't locked, after confirming it's you, and **Save**. The machine checks
+every change and says why if it refuses one. Settings marked **after
+restart** wait for the machine's service to start again; the rest apply at
+once.
 
 ## Who's watching
 
