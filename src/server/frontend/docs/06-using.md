@@ -44,8 +44,8 @@ off** above the screen mutes it on your side, and is remembered in this
 browser. If it says **Click for sound**, your browser is holding the sound
 back until you click the page. A quiet machine sends no sound at all.
 
-Sound needs a browser that can decode it (Chrome, Edge, Firefox on a
-computer, recent Safari). Where it can't, the button doesn't show, and the
+Sound needs a browser that can decode it (Chrome, Edge, Firefox, on a
+phone too, recent Safari). Where it can't, the button doesn't show, and the
 picture plays as before. The machine's owner can turn sound off in the
 [config file](/docs/machine-config#audio).
 

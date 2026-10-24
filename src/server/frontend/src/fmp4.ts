@@ -2,7 +2,8 @@
 // streams, so the stream can play through Media Source Extensions on
 // browsers without a WebCodecs H.264 decoder (Firefox for Android). Each
 // access unit becomes its own fragment (moof + mdat), appended as it
-// arrives.
+// arrives. The sound gets the same treatment in an Opus track of its own,
+// for browsers without a WebCodecs AudioDecoder.
 
 const NAL_SPS = 7;
 const NAL_PPS = 8;
@@ -224,14 +225,21 @@ const zeros = (count: number): Uint8Array => new Uint8Array(count);
 // The unity transform every header box carries.
 const MATRIX = fields([32, 0x00010000], [32, 0], [32, 0], [32, 0], [32, 0x00010000], [32, 0], [32, 0], [32, 0], [32, 0x40000000]);
 
-// ftyp + moov for one H.264 track of the given parameter sets.
-export function initSegment({ sps, pps }: ParameterSets): Uint8Array {
-  const { width, height } = spsDimensions(sps);
-
+// ftyp + moov around one track: what the H.264 and Opus init segments share.
+function singleTrackInit(track: {
+  timescale: number;
+  width: number;
+  height: number;
+  volume: number; // 8.8 fixed point: 0x0100 for sound, 0 for video
+  handler: "vide" | "soun";
+  handlerName: string;
+  mediaHeader: Uint8Array; // vmhd or smhd
+  sampleEntry: Uint8Array;
+}): Uint8Array {
   const ftyp = box("ftyp", ascii("isom"), fields([32, 0x200]), ascii("isomiso6avc1mp41"));
   const mvhd = box(
     "mvhd",
-    fields([32, 0], [32, 0], [32, 0], [32, TIMESCALE], [32, 0], [32, 0x00010000], [16, 0x0100]),
+    fields([32, 0], [32, 0], [32, 0], [32, track.timescale], [32, 0], [32, 0x00010000], [16, 0x0100]),
     zeros(10),
     MATRIX,
     zeros(24),
@@ -241,13 +249,34 @@ export function initSegment({ sps, pps }: ParameterSets): Uint8Array {
     "tkhd",
     fields([32, 0x00000003], [32, 0], [32, 0], [32, 1], [32, 0], [32, 0]),
     zeros(8),
-    fields([16, 0], [16, 0], [16, 0], [16, 0]),
+    fields([16, 0], [16, 0], [16, track.volume], [16, 0]),
     MATRIX,
-    fields([32, width << 16], [32, height << 16]),
+    fields([32, track.width << 16], [32, track.height << 16]),
   );
-  const mdhd = box("mdhd", fields([32, 0], [32, 0], [32, 0], [32, TIMESCALE], [32, 0], [16, 0x55c4], [16, 0]));
-  const hdlr = box("hdlr", fields([32, 0], [32, 0]), ascii("vide"), zeros(12), ascii("VideoHandler\0"));
+  const mdhd = box("mdhd", fields([32, 0], [32, 0], [32, 0], [32, track.timescale], [32, 0], [16, 0x55c4], [16, 0]));
+  const hdlr = box("hdlr", fields([32, 0], [32, 0]), ascii(track.handler), zeros(12), ascii(`${track.handlerName} `));
+  const stbl = box(
+    "stbl",
+    box("stsd", fields([32, 0], [32, 1]), track.sampleEntry),
+    box("stts", fields([32, 0], [32, 0])),
+    box("stsc", fields([32, 0], [32, 0])),
+    box("stsz", fields([32, 0], [32, 0], [32, 0])),
+    box("stco", fields([32, 0], [32, 0])),
+  );
+  const minf = box(
+    "minf",
+    track.mediaHeader,
+    box("dinf", box("dref", fields([32, 0], [32, 1]), box("url ", fields([32, 1])))),
+    stbl,
+  );
+  const trak = box("trak", tkhd, box("mdia", mdhd, hdlr, minf));
+  const mvex = box("mvex", box("trex", fields([32, 0], [32, 1], [32, 1], [32, 0], [32, 0], [32, 0])));
+  return concat([ftyp, box("moov", mvhd, trak, mvex)]);
+}
 
+// ftyp + moov for one H.264 track of the given parameter sets.
+export function initSegment({ sps, pps }: ParameterSets): Uint8Array {
+  const { width, height } = spsDimensions(sps);
   const avcC = box(
     "avcC",
     fields([8, 1], [8, sps[1] ?? 0], [8, sps[2] ?? 0], [8, sps[3] ?? 0], [8, 0xff], [8, 0xe1], [16, sps.length]),
@@ -265,23 +294,78 @@ export function initSegment({ sps, pps }: ParameterSets): Uint8Array {
     fields([16, 0x0018], [16, 0xffff]),
     avcC,
   );
-  const stbl = box(
-    "stbl",
-    box("stsd", fields([32, 0], [32, 1]), avc1),
-    box("stts", fields([32, 0], [32, 0])),
-    box("stsc", fields([32, 0], [32, 0])),
-    box("stsz", fields([32, 0], [32, 0], [32, 0])),
-    box("stco", fields([32, 0], [32, 0])),
+  return singleTrackInit({
+    timescale: TIMESCALE,
+    width,
+    height,
+    volume: 0,
+    handler: "vide",
+    handlerName: "VideoHandler",
+    mediaHeader: box("vmhd", fields([32, 1], [16, 0], [16, 0], [16, 0], [16, 0])),
+    sampleEntry: avc1,
+  });
+}
+
+// The sound's track: Opus at 48 kHz, which is also its clock.
+export const OPUS_SAMPLE_RATE = 48_000;
+
+// ftyp + moov for one Opus track (the machine's sound: 48 kHz stereo), per
+// "Encapsulation of Opus in ISO Base Media File Format".
+export function opusInitSegment(channels: number): Uint8Array {
+  const dOps = box(
+    "dOps",
+    // Version, output channels, pre-skip, input rate, output gain, mapping
+    // family 0. No pre-skip: the stream is live and joined part way, so
+    // there is no encoder priming at its start to trim.
+    fields([8, 0], [8, channels], [16, 0], [32, OPUS_SAMPLE_RATE], [16, 0], [8, 0]),
   );
-  const minf = box(
-    "minf",
-    box("vmhd", fields([32, 1], [16, 0], [16, 0], [16, 0], [16, 0])),
-    box("dinf", box("dref", fields([32, 0], [32, 1]), box("url ", fields([32, 1])))),
-    stbl,
+  const opus = box(
+    "Opus",
+    zeros(6),
+    fields([16, 1]), // data_reference_index
+    zeros(8),
+    fields([16, channels], [16, 16], [16, 0], [16, 0], [32, OPUS_SAMPLE_RATE * 0x10000]),
+    dOps,
   );
-  const trak = box("trak", tkhd, box("mdia", mdhd, hdlr, minf));
-  const mvex = box("mvex", box("trex", fields([32, 0], [32, 1], [32, 1], [32, 0], [32, 0], [32, 0])));
-  return concat([ftyp, box("moov", mvhd, trak, mvex)]);
+  return singleTrackInit({
+    timescale: OPUS_SAMPLE_RATE,
+    width: 0,
+    height: 0,
+    volume: 0x0100,
+    handler: "soun",
+    handlerName: "SoundHandler",
+    mediaHeader: box("smhd", fields([32, 0], [16, 0], [16, 0])),
+    sampleEntry: opus,
+  });
+}
+
+// moof + mdat, with the moof's trun pointed at the samples in the mdat.
+function fragment(sequence: number, decodeTime: number, trun: Uint8Array, samples: Uint8Array[]): Uint8Array {
+  const moof = box(
+    "moof",
+    box("mfhd", fields([32, 0], [32, sequence])),
+    box(
+      "traf",
+      box("tfhd", fields([32, 0x00020000], [32, 1])), // default-base-is-moof
+      box("tfdt", fields([32, 0x01000000], [64, decodeTime])),
+      trun,
+    ),
+  );
+  // trun ends the moof; its data_offset (to the first sample, past mdat's
+  // header) sits 16 bytes in.
+  new DataView(moof.buffer).setUint32(moof.length - trun.length + 16, moof.length + 8);
+  return concat([moof, box("mdat", ...samples)]);
+}
+
+// Opus packets of `duration` samples each, back to back in one fragment.
+// Every one is a sync sample, the trex default.
+export function audioSegment(sequence: number, decodeTime: number, duration: number, packets: Uint8Array[]): Uint8Array {
+  const trun = box(
+    "trun",
+    fields([32, 0x00000301], [32, packets.length], [32, 0]),
+    ...packets.map((packet) => fields([32, duration], [32, packet.length])),
+  );
+  return fragment(sequence, decodeTime, trun, packets);
 }
 
 // One fragment holding one sample: moof + mdat.
@@ -298,18 +382,5 @@ export function mediaSegment(
     "trun",
     fields([32, 0x00000701], [32, 1], [32, 0], [32, duration], [32, sample.length], [32, sampleFlags]),
   );
-  const moof = box(
-    "moof",
-    box("mfhd", fields([32, 0], [32, sequence])),
-    box(
-      "traf",
-      box("tfhd", fields([32, 0x00020000], [32, 1])), // default-base-is-moof
-      box("tfdt", fields([32, 0x01000000], [64, decodeTime])),
-      trun,
-    ),
-  );
-  // trun ends the moof; its data_offset (to the sample, past mdat's header)
-  // sits 16 bytes in.
-  new DataView(moof.buffer).setUint32(moof.length - trun.length + 16, moof.length + 8);
-  return concat([moof, box("mdat", sample)]);
+  return fragment(sequence, decodeTime, trun, [sample]);
 }
