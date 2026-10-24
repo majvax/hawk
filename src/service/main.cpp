@@ -10,6 +10,7 @@
 #include "metrics.hpp"
 #include "audio_devices.hpp"
 #include "power.hpp"
+#include "quality.hpp"
 #include "updater.hpp"
 #include "websocket/websocket.hpp"
 
@@ -56,7 +57,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 6;
+constexpr std::uint32_t kProtocolVersion = 7;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -108,6 +109,16 @@ struct PongMessage {
     std::string   nonce;
 };
 
+// What the stream is encoded at now, for the relay (Auto's controller
+// runs there) and the stats of everyone watching. Nothing in it is
+// secret: the relay sees about as much from the frames' sizes.
+struct QualityMessage {
+    std::string   type = "quality";
+    std::string   preset;
+    std::uint32_t bitrate = 0;
+    std::uint32_t fps = 0;
+};
+
 // The header of the audio channel's one message: the machine's output
 // devices, and which one the stream captures (empty for the default).
 struct AudioDeviceEntry {
@@ -141,13 +152,14 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*, config_*, ping
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*, config_*, quality, ping
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power, audio_*, config_*
+    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power, audio_*, config_*, quality
     std::vector<svc::SignedStatement>            revocations;    // revocations
     bool                                         audio = false;  // start_capture: the relay passes sound on
+    std::uint32_t                                bitrate = 0;    // bitrate: Auto's next step, bits per second
 };
 
 }  // namespace
@@ -187,6 +199,12 @@ struct glz::meta<GoingDownMessage> {
 };
 
 template <>
+struct glz::meta<QualityMessage> {
+    using T                     = QualityMessage;
+    static constexpr auto value = object("type", &T::type, "preset", &T::preset, "bitrate", &T::bitrate, "fps", &T::fps);
+};
+
+template <>
 struct glz::meta<PongMessage> {
     using T                     = PongMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "nonce", &T::nonce);
@@ -205,7 +223,7 @@ struct glz::meta<RelayCommand> {
         object("type", &T::type, "nonce", &T::nonce, "machine_id", &T::machine_id, "owner_key", &T::owner_key,
                "owner_binding", &T::owner_binding, "viewer", &T::viewer, "statement", &T::statement, "signature",
                &T::signature, "grant", &T::grant, "sealed", &T::sealed, "revocations", &T::revocations, "audio",
-               &T::audio);
+               &T::audio, "bitrate", &T::bitrate);
 };
 
 template <>
@@ -400,43 +418,6 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
     return {};
 }
 
-// Launches hawk-capture in the console session (the sign-in screen when
-// nobody is signed in) and forwards every
-// packet it produces to the relay, sealed for the machine's viewers. With
-// the clipboard allowed, what hawk-capture reads off it goes to the viewers
-// that asked (or, in sync mode, everyone who may read it).
-void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::ViewerHub& hub,
-                  const svc::ClipboardConfig& clipboard, bool audio, const std::string& audio_device) {
-    if (capture.is_running()) {
-        spdlog::info("relay: start_capture ignored, capture already running");
-        return;
-    }
-
-    const svc::CaptureOptions options{.clipboard = clipboard.mode != svc::ClipboardMode::off,
-                                      .clipboard_listen = clipboard.mode == svc::ClipboardMode::sync,
-                                      .audio = audio,
-                                      // plausible_device_id() let only ASCII through.
-                                      .audio_device = std::wstring(audio_device.begin(), audio_device.end())};
-    auto on_clipboard = [&hub](ipc::ClipboardKind kind, std::string_view text) {
-        hub.deliver_clipboard(text, kind == ipc::ClipboardKind::changed);
-    };
-    auto started = capture.start([&client, &hub](const svc::CapturePacket& packet) {
-        // Frames come steadily, so this is where shares that ran out are
-        // noticed and their viewers cut off.
-        hub.check_expiry();
-        const auto frame = hub.seal_frame(packet.data, packet.is_keyframe, packet.timestamp, packet.is_audio);
-        if (frame.empty()) {
-            return;
-        }
-        if (auto sent = client.send_binary(frame); !sent.has_value()) {
-            spdlog::warn("relay: failed to forward video packet: {}", net::to_string(sent.error()));
-        }
-    }, options, on_clipboard);
-    if (!started.has_value()) {
-        spdlog::error("relay: failed to start capture: {}", svc::to_string(started.error()));
-    }
-}
-
 // Hands input to hawk-capture, which replays it in the user's session.
 // Whether it landed is CaptureHost's business to log: one lost input event
 // is never worth more than a line in the log.
@@ -488,6 +469,15 @@ bool CompleteEnrollment(Session& session, const RelayCommand& command) {
     return true;
 }
 
+// What hawk-capture encodes the picture at.
+struct Encoding {
+    svc::QualityPreset preset = svc::QualityPreset::automatic;
+    std::uint32_t      bitrate_bps = 0;
+    std::uint32_t      fps = 0;
+
+    bool operator==(const Encoding&) const = default;
+};
+
 // Everything one relay connection works with.
 struct Connection {
     net::WebSocketClient&                client;
@@ -514,7 +504,108 @@ struct Connection {
     // The output device a viewer chose for this stream (an endpoint id),
     // empty for the default. Forgotten when the stream stops.
     std::string audio_device;
+    // The quality preset a viewer with control chose for this stream;
+    // without one, the config's. Forgotten when the stream stops.
+    std::optional<svc::QualityPreset> quality_choice;
+    // Auto's bitrate, as the relay's controller last steered it.
+    std::uint32_t auto_bitrate = svc::level(svc::QualityPreset::automatic).bitrate_bps;
+    // What hawk-capture was last started with or told, and whether telling
+    // it failed (its input pipe wasn't open yet) and should be tried again.
+    Encoding encoding;
+    bool     encoder_pending = false;
 };
+
+// What the stream should be encoded at now.
+[[nodiscard]] Encoding CurrentEncoding(const Connection& connection) {
+    const auto  preset = connection.quality_choice.value_or(connection.config.stream.quality);
+    const auto& level = svc::level(preset);
+    const auto  bitrate =
+        preset == svc::QualityPreset::automatic ? svc::clamp_auto_bitrate(connection.auto_bitrate) : level.bitrate_bps;
+    return {.preset = preset, .bitrate_bps = bitrate, .fps = level.fps};
+}
+
+// Tells the relay, and through it everyone watching, what the stream is
+// encoded at.
+void ReportQuality(net::WebSocketClient& client, const Encoding& encoding) {
+    const QualityMessage message{.preset = std::string(svc::to_string(encoding.preset)),
+                                 .bitrate = encoding.bitrate_bps,
+                                 .fps = encoding.fps};
+    if (auto json = glz::write_json(message); json.has_value()) {
+        if (auto sent = client.send_text(*json); !sent.has_value()) {
+            spdlog::warn("relay: failed to say what the stream is encoded at: {}", net::to_string(sent.error()));
+        }
+    }
+}
+
+// Launches hawk-capture in the console session (the sign-in screen when
+// nobody is signed in) and forwards every
+// packet it produces to the relay, sealed for the machine's viewers. With
+// the clipboard allowed, what hawk-capture reads off it goes to the viewers
+// that asked (or, in sync mode, everyone who may read it). The stream starts
+// at the quality it should have now, which the relay is told.
+void StartCapture(Connection& connection) {
+    auto&       client = connection.client;
+    auto&       capture = connection.capture;
+    auto&       hub = *connection.hub;
+    const auto& clipboard = connection.config.clipboard;
+    const bool  audio = connection.capture_audio;
+    const auto& audio_device = connection.audio_device;
+    if (capture.is_running()) {
+        spdlog::info("relay: start_capture ignored, capture already running");
+        return;
+    }
+
+    const auto                encoding = CurrentEncoding(connection);
+    const svc::CaptureOptions options{.clipboard = clipboard.mode != svc::ClipboardMode::off,
+                                      .clipboard_listen = clipboard.mode == svc::ClipboardMode::sync,
+                                      .audio = audio,
+                                      // plausible_device_id() let only ASCII through.
+                                      .audio_device = std::wstring(audio_device.begin(), audio_device.end()),
+                                      .bitrate_bps = encoding.bitrate_bps,
+                                      .fps = encoding.fps};
+    auto on_clipboard = [&hub](ipc::ClipboardKind kind, std::string_view text) {
+        hub.deliver_clipboard(text, kind == ipc::ClipboardKind::changed);
+    };
+    auto started = capture.start([&client, &hub](const svc::CapturePacket& packet) {
+        // Frames come steadily, so this is where shares that ran out are
+        // noticed and their viewers cut off.
+        hub.check_expiry();
+        const auto frame = hub.seal_frame(packet.data, packet.is_keyframe, packet.timestamp, packet.is_audio);
+        if (frame.empty()) {
+            return;
+        }
+        if (auto sent = client.send_binary(frame); !sent.has_value()) {
+            spdlog::warn("relay: failed to forward video packet: {}", net::to_string(sent.error()));
+        }
+    }, options, on_clipboard);
+    if (!started.has_value()) {
+        spdlog::error("relay: failed to start capture: {}", svc::to_string(started.error()));
+        return;
+    }
+    connection.encoding = encoding;
+    connection.encoder_pending = false;
+    ReportQuality(connection.client, encoding);
+}
+
+// Moves the stream to the quality it should have now (a viewer's choice,
+// the config's default, Auto's latest step) if it isn't there already, and
+// tells the relay. hawk-capture takes it without starting over; one that
+// hasn't opened its input pipe yet is told again by CaptureSupervisor.
+void ApplyQuality(Connection& connection) {
+    const auto encoding = CurrentEncoding(connection);
+    const bool changed = encoding != connection.encoding;
+    if (connection.capture.is_running() && (changed || connection.encoder_pending)) {
+        const ipc::InputPacket packet{.kind = static_cast<std::uint8_t>(ipc::InputKind::encoder),
+                                      .bitrate_bps = encoding.bitrate_bps,
+                                      .fps = encoding.fps};
+        connection.encoder_pending = !connection.capture.send_input(packet);
+    }
+    if (changed && connection.capture.is_running()) {
+        connection.encoding = encoding;
+        ReportQuality(connection.client, encoding);
+    }
+}
+
 
 // Sends one viewer the machine's output devices, and which one is captured.
 void SendAudioDevices(svc::ViewerHub& hub, std::uint64_t viewer, const Connection& connection) {
@@ -554,8 +645,7 @@ void SelectAudioDevice(Connection& connection, const std::string& id) {
     connection.audio_device = id;
     if (connection.capture_audio && connection.capture.is_running()) {
         connection.capture.stop();
-        StartCapture(connection.client, connection.capture, *connection.hub, connection.config.clipboard,
-                     connection.capture_audio, connection.audio_device);
+        StartCapture(connection);
     }
 }
 
@@ -574,22 +664,40 @@ void SendConfig(svc::ViewerHub& hub, std::uint64_t viewer, bool saved = false, s
 }
 
 // Takes what a change to the config makes live at once: the clipboard rules,
-// and whether sound goes with the stream. Both are hawk-capture's options,
-// so a stream that's running starts over with them. The rest waits for the
-// service to start again.
+// whether sound goes with the stream, and its default quality. The first
+// two are hawk-capture's options, so a stream that's running starts over
+// with them; the quality it takes as it runs, unless a viewer chose one.
+// The rest waits for the service to start again.
 void ApplyConfig(Connection& connection, const svc::MachineConfig& saved) {
     auto&      config = connection.config;
     const bool restart_capture =
         saved.clipboard.mode != config.clipboard.mode || saved.audio.enabled != config.audio.enabled;
+    const bool was_auto = CurrentEncoding(connection).preset == svc::QualityPreset::automatic;
     config.clipboard = saved.clipboard;
     config.audio = saved.audio;
+    config.stream = saved.stream;
+    // Back on Auto from a fixed preset: it starts over from its start.
+    if (!was_auto && CurrentEncoding(connection).preset == svc::QualityPreset::automatic) {
+        connection.auto_bitrate = svc::level(svc::QualityPreset::automatic).bitrate_bps;
+    }
     connection.hub->set_clipboard(config.clipboard);
     connection.capture_audio = connection.relay_audio && config.audio.enabled;
     if (restart_capture && connection.capture.is_running()) {
         connection.capture.stop();
-        StartCapture(connection.client, connection.capture, *connection.hub, config.clipboard,
-                     connection.capture_audio, connection.audio_device);
+        StartCapture(connection);
+    } else {
+        ApplyQuality(connection);
     }
+}
+
+// A viewer with control chose a preset for the stream. Auto picks up from
+// the bitrate the stream has now.
+void ChooseQuality(Connection& connection, svc::QualityPreset preset) {
+    if (preset == svc::QualityPreset::automatic && CurrentEncoding(connection).preset != preset) {
+        connection.auto_bitrate = svc::clamp_auto_bitrate(CurrentEncoding(connection).bitrate_bps);
+    }
+    connection.quality_choice = preset;
+    ApplyQuality(connection);
 }
 
 // Makes the change the owner asked for, if it's still against the file as
@@ -705,7 +813,8 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         return;
     }
     auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater, capture_wanted,
-           capture_audio, relay_audio, audio_device] = connection;
+           capture_audio, relay_audio, audio_device, quality_choice, auto_bitrate, encoding, encoder_pending] =
+        connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -726,14 +835,21 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         // Not enrolled, or the owner key didn't check out: nothing to serve.
         spdlog::debug("relay: ignoring \"{}\" before enrollment", command.type);
     } else if (command.type == "start_capture") {
+        // A new stream: Auto starts from its start, whatever came before.
+        if (!capture.is_running()) {
+            auto_bitrate = svc::level(svc::QualityPreset::automatic).bitrate_bps;
+        }
         capture_wanted = true;
         // A relay too old to pass sound on doesn't ask for it.
         relay_audio = command.audio;
         capture_audio = relay_audio && config.audio.enabled;
-        StartCapture(client, capture, *hub, config.clipboard, capture_audio, audio_device);
+        StartCapture(connection);
     } else if (command.type == "stop_capture") {
         capture_wanted = false;
         audio_device.clear();
+        quality_choice.reset();
+        auto_bitrate = svc::level(svc::QualityPreset::automatic).bitrate_bps;
+        encoding = {};
         capture.stop();
     } else if (command.type == "viewer_join") {
         hub->join(command.viewer, {.statement = command.statement, .signature = command.signature}, command.grant);
@@ -797,6 +913,20 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         if (const auto json = hub->config_set(command.viewer, command.sealed); json.has_value()) {
             ChangeConfig(connection, command.viewer, *json);
         }
+    } else if (command.type == "quality") {
+        if (const auto preset = hub->quality(command.viewer, command.sealed); preset.has_value()) {
+            ChooseQuality(connection, *preset);
+        }
+    } else if (command.type == "bitrate") {
+        // Only ever from the relay, whose controller runs Auto: anything
+        // else ignores it, and Auto keeps it in range (quality.hpp).
+        // A late one, after the stream stopped, would set where the next
+        // stream starts: only a running stream takes it.
+        if (command.bitrate != 0 && capture_wanted && capture.is_running() &&
+            CurrentEncoding(connection).preset == svc::QualityPreset::automatic) {
+            auto_bitrate = svc::clamp_auto_bitrate(command.bitrate);
+            ApplyQuality(connection);
+        }
     } else if (command.type == "ping") {
         SendPong(client, command.viewer, command.nonce);
     } else if (command.type == "revocations") {
@@ -857,6 +987,9 @@ void CaptureSupervisor(const std::stop_token& stop_token, std::mutex& lock, Conn
             if (now - started_at > kCaptureRetryMax) {
                 retry_delay = kCaptureCheckInterval;  // it ran fine; a later failure starts the backoff over
             }
+            if (connection.encoder_pending) {
+                ApplyQuality(connection);  // hawk-capture's input pipe wasn't open the last time
+            }
             continue;
         }
         if (now < next_attempt) {
@@ -868,8 +1001,7 @@ void CaptureSupervisor(const std::stop_token& stop_token, std::mutex& lock, Conn
             spdlog::info("capture: hawk-capture isn't running, starting it again");
         }
         capture.stop();
-        StartCapture(connection.client, capture, *connection.hub, connection.config.clipboard,
-                     connection.capture_audio, connection.audio_device);
+        StartCapture(connection);
         started_at = now;
         next_attempt = now + retry_delay;
         retry_delay = std::min(retry_delay * 2, kCaptureRetryMax);
@@ -1079,6 +1211,7 @@ void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* ar
     spdlog::info("config: file transfer {}", config.files.enabled ? "on" : "off");
     spdlog::info("config: shell {}", config.shell.enabled ? std::format("on (\"{}\")", config.shell.command) : "off");
     spdlog::info("config: sound {}", config.audio.enabled ? "on" : "off");
+    spdlog::info("config: stream quality {}", svc::to_string(config.stream.quality));
 
     ServiceContext service;
     service.status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;

@@ -49,7 +49,19 @@ Each release's section becomes its release notes (see
 - Fixed: an `[[audio]]` table in the machine's config made the whole file
   fail to parse, turning the clipboard, file transfer, shell and relay
   connection off.
-- Protocol version 6.
+- **Quality ▾** in the live view: Auto, Low (1 Mbit/s, 30 fps), Balanced
+  (4), High (8) or Max (16), for control and the owner, for everyone
+  watching, until the stream stops. The machine's default is
+  `[[stream]] quality` in its config (`auto` unless set), which applies at
+  once. The encoder takes a new bitrate without restarting; a new frame
+  rate starts it over. The choice is end-to-end encrypted like input, and
+  the machine checks the role again.
+- **Auto** adapts the bitrate (0.5 to 12 Mbit/s) to the connection: the
+  relay measures how long frames take to arrive from the machine and how
+  many wait for each viewer, cuts by 30% on congestion and climbs slowly
+  once it's clear. The slowest viewer sets the pace. **Stats** shows the
+  preset and the bitrate the machine targets.
+- Protocol version 7.
 
 ## 1.0.0
 

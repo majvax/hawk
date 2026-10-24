@@ -9,6 +9,7 @@ mod machines;
 mod mail;
 mod mfa;
 mod protocol;
+mod quality;
 mod registry;
 mod e2e;
 mod routes;

@@ -27,6 +27,7 @@ import { useStepUp } from "../stepUp.js";
 import { AnalyticsPanel, ProcessesPanel } from "./AnalyticsPanel.js";
 import { ANSWER_TIMEOUT_MS, ConfigPanel } from "./ConfigPanel.js";
 import { FilesPanel } from "./FilesPanel.js";
+import { QUALITY_PRESETS, describeQuality } from "../quality.js";
 import { KeyStorage, MachineSettings, SharingPanel } from "./MachineAccess.js";
 
 // xterm.js is most of a terminal's weight, and most visits never open one:
@@ -664,6 +665,8 @@ function Viewer({
     statsShown,
     setStatsShown,
     setStatsVisible,
+    streamQuality,
+    setQuality,
   } = dashboard;
   const requestStepUp = useStepUp();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -676,6 +679,7 @@ function Viewer({
   const [clipMenu, setClipMenu] = useState(false);
   const [powerMenu, setPowerMenu] = useState(false);
   const [soundMenu, setSoundMenu] = useState(false);
+  const [qualityMenu, setQualityMenu] = useState(false);
   // The power action waiting for its second click.
   const [armed, setArmed] = useState<PowerAction | null>(null);
   const [powerNote, setPowerNote] = useState<string | null>(null);
@@ -716,6 +720,10 @@ function Viewer({
   const chooseHint = mayChooseDevice ? "Confirm it's you first" : "Choosing the device needs control";
   const defaultName = audioDevices?.devices.find((device) => device.default)?.name;
   const soundMenuShown = onScreen && (sound.supported || listsDevices);
+  // The stream's quality preset: control (or the owner) picks it for
+  // everyone watching, on a machine new enough to take one. No fresh
+  // factor: it only changes how the picture is encoded.
+  const canChooseQuality = secured && viewing.quality === true && roleCanControl(security.role);
 
   const canSendFiles = secured && files.enabled && elevated;
   // Dropping files on the screen sends them; the Files tab follows them.
@@ -756,6 +764,7 @@ function Viewer({
   useEffect(() => {
     setPowerMenu(false);
     setSoundMenu(false);
+    setQualityMenu(false);
     setArmed(null);
     setPowerNote(null);
   }, [viewing?.id]);
@@ -872,6 +881,15 @@ function Viewer({
     return () => document.removeEventListener("pointerdown", onPointer);
   }, [soundMenu]);
   useEffect(() => {
+    if (!qualityMenu) return;
+    const onPointer = (event: PointerEvent): void => {
+      const target = event.target as Element | null;
+      if (target?.closest(".stage-menu, [data-quality-menu]") == null) setQualityMenu(false);
+    };
+    document.addEventListener("pointerdown", onPointer);
+    return () => document.removeEventListener("pointerdown", onPointer);
+  }, [qualityMenu]);
+  useEffect(() => {
     if (!powerMenu) return;
     const onPointer = (event: PointerEvent): void => {
       const target = event.target as Element | null;
@@ -981,6 +999,7 @@ function Viewer({
               onClick={() => {
                 setPowerMenu(false);
                 setSoundMenu(false);
+                setQualityMenu(false);
                 setClipMenu(!clipMenu);
               }}
             >
@@ -995,6 +1014,7 @@ function Viewer({
               onClick={() => {
                 setClipMenu(false);
                 setSoundMenu(false);
+                setQualityMenu(false);
                 setArmed(null);
                 setPowerMenu(!powerMenu);
               }}
@@ -1020,6 +1040,7 @@ function Viewer({
               onClick={() => {
                 setClipMenu(false);
                 setPowerMenu(false);
+                setQualityMenu(false);
                 setArmed(null);
                 // Fresh each time: devices come and go.
                 if (!soundMenu && listsDevices) requestAudioDevices();
@@ -1027,6 +1048,22 @@ function Viewer({
               }}
             >
               Sound ▾
+            </button>
+          )}
+          {canChooseQuality && (
+            <button
+              type="button"
+              data-quality-menu
+              aria-expanded={qualityMenu}
+              onClick={() => {
+                setClipMenu(false);
+                setPowerMenu(false);
+                setSoundMenu(false);
+                setArmed(null);
+                setQualityMenu(!qualityMenu);
+              }}
+            >
+              Quality ▾
             </button>
           )}
           {onScreen && (
@@ -1129,6 +1166,28 @@ function Viewer({
             )}
           </div>
         )}
+        {canChooseQuality && qualityMenu && (
+          <div className="stage-menu" role="menu">
+            <div className="stage-menu-label">Quality, for everyone watching</div>
+            {QUALITY_PRESETS.map((entry) => (
+              <button
+                key={entry.preset}
+                type="button"
+                role="menuitemradio"
+                aria-checked={streamQuality?.preset === entry.preset}
+                title={entry.hint}
+                onClick={() => {
+                  setQualityMenu(false);
+                  if (streamQuality?.preset !== entry.preset) setQuality(entry.preset);
+                }}
+              >
+                {streamQuality?.preset === entry.preset ? "✓ " : ""}
+                {entry.label}
+                <span className="stage-menu-hint"> · {entry.hint}</span>
+              </button>
+            ))}
+          </div>
+        )}
         {canPower && powerMenu && (
           <div className="stage-menu" role="menu">
             {POWER_ITEMS.map((item) => (
@@ -1165,7 +1224,9 @@ function Viewer({
             tabIndex={canControl ? 0 : -1}
             aria-label={onScreen ? `${name} screen` : undefined}
           />
-          {onScreen && statsShown && <StatsOverlay stats={stats} picture={picture} pings={viewing.ping === true} />}
+          {onScreen && statsShown && (
+            <StatsOverlay stats={stats} picture={picture} pings={viewing.ping === true} quality={streamQuality} />
+          )}
           {signal}
         </div>
       </div>
@@ -1523,14 +1584,17 @@ function orNa(value: number | null, format: (value: number) => string): string {
 // The stream's numbers over the picture, top left. It takes no clicks, so
 // input goes on to the screen under it.
 // `pings`: the machine answers pings; an older one has no round trip.
+// `quality`: what the machine says it encodes at; an older one doesn't.
 function StatsOverlay({
   stats,
   picture,
   pings,
+  quality,
 }: {
   stats: Dashboard["stats"];
   picture: Dashboard["picture"];
   pings: boolean;
+  quality: Dashboard["streamQuality"];
 }): JSX.Element {
   const rows: [string, string][] =
     stats === null
@@ -1539,6 +1603,7 @@ function StatsOverlay({
           ["Decoder", stats.backend === null ? "…" : BACKEND_LABEL[stats.backend]],
           ["Picture", picture === null ? "…" : `${picture.width}×${picture.height}`],
           ["Video", formatBitrate(stats.kbps)],
+          ["Quality", quality === null ? "N/A" : describeQuality(quality)],
           ["Frames/s", `${stats.received} in · ${orNa(stats.decoded, String)} decoded · ${stats.fps} shown`],
           ["Lost/s", `${stats.dropped} dropped · ${stats.skipped} skipped`],
           ["Waiting", `${stats.pending} decrypting · ${orNa(stats.queue, String)} in decoder`],

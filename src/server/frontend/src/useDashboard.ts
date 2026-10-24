@@ -26,6 +26,7 @@ import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
 import { AudioPlayer, type SoundState, soundSupported } from "./audio.js";
 import type { SoundMode } from "./soundMode.js";
+import { type QualityPreset, type StreamQuality, parseQuality } from "./quality.js";
 import { DecodeClock, PingTracker, type Quality, type StreamStats, qualityDelta, summarize } from "./streamStats.js";
 import type {
   ClipboardAccess,
@@ -282,6 +283,13 @@ export interface Dashboard {
   setMuted: (muted: boolean) => void;
   // Call from a click or key press: lets the browser start the sound.
   unlockSound: () => void;
+  // What the open view's stream is encoded at, as the machine last said;
+  // null before it has (or from a machine too old to say).
+  streamQuality: StreamQuality | null;
+  // Picks the stream's preset for everyone watching. The relay drops it
+  // unless this view has control, and the machine checks the role again.
+  // False when there's no secured view with control to send it to.
+  setQuality: (preset: QualityPreset) => boolean;
   // Prefer sync over latency: the picture waits for the sound (soundMode.ts).
   sync: boolean;
   setSync: (sync: boolean) => void;
@@ -390,6 +398,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const metricsChainRef = useRef<Promise<void>>(Promise.resolve());
   const audioChainRef = useRef<Promise<void>>(Promise.resolve());
   const [audioDevices, setAudioDevices] = useState<AudioDevicesState | null>(null);
+  const [streamQuality, setStreamQuality] = useState<StreamQuality | null>(null);
   const configChainRef = useRef<Promise<void>>(Promise.resolve());
   const [config, setConfig] = useState<ConfigState | null>(null);
   const configRef = useRef<ConfigState | null>(null);
@@ -816,6 +825,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       metricsManagerRef.current = deviceId === null ? null : new MetricsManager(setMetrics);
       setMetrics(EMPTY_METRICS);
       setAudioDevices(null);
+      setStreamQuality(null);
       setConfig(null);
     },
     [publishFiles, publishShells],
@@ -1045,6 +1055,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
             .catch((error: unknown) => console.error("config:", error));
           break;
         }
+        case "quality":
+          if (viewing === payload.deviceId) setStreamQuality(parseQuality(payload));
+          break;
         case "pong":
           if (viewing === payload.deviceId) pingRef.current.answer(payload.nonce, performance.now());
           break;
@@ -1421,7 +1434,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   // chain: it's numbered from the same counter.
   const sendSealed = useCallback(
     (
-      type: "audio_devices" | "audio_select" | "config_get" | "config_set",
+      type: "audio_devices" | "audio_select" | "config_get" | "config_set" | "quality",
       seal: (session: ViewSession) => Promise<string> | null,
     ): boolean => {
       const deviceId = streamingRef.current;
@@ -1453,6 +1466,14 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   );
   const requestConfig = useCallback(
     (): boolean => sendSealed("config_get", (session) => session.sealConfigGet()),
+    [sendSealed],
+  );
+  const setQuality = useCallback(
+    (preset: QualityPreset): boolean => {
+      const role = sessionRef.current?.role;
+      if (role !== "owner" && role !== "control") return false;
+      return sendSealed("quality", (session) => session.sealQuality(preset));
+    },
     [sendSealed],
   );
   const saveConfig = useCallback(
@@ -1500,6 +1521,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     sound,
     setMuted,
     unlockSound,
+    streamQuality,
+    setQuality,
     sync,
     setSync,
     statsShown,

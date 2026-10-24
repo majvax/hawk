@@ -237,6 +237,7 @@ const AUDIO_AAD = utf8("hawk-audio-v1");
 // Likewise reading the config and changing it.
 const CONFIG_GET_AAD = utf8("hawk-config-get-v1");
 const CONFIG_SET_AAD = utf8("hawk-config-set-v1");
+const QUALITY_AAD = utf8("hawk-quality-v1");
 const CONFIG_AAD = utf8("hawk-config-v1");
 // The byte a sealed power request carries; must match PowerAction in
 // src/service/power.hpp.
@@ -498,6 +499,11 @@ export class ViewSession {
   // values by key (see machineConfig.ts).
   sealConfigSet(change: { version: string; changes: Record<string, boolean | number | string> }): Promise<string> | null {
     return this.sealRequest(utf8(JSON.stringify(change)), CONFIG_SET_AAD);
+  }
+
+  // Picks the stream's quality preset by name (quality.ts).
+  sealQuality(preset: string): Promise<string> | null {
+    return this.sealRequest(utf8(preset), QUALITY_AAD);
   }
 
   // A file-channel message from the machine; null for anything that

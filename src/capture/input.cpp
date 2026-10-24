@@ -17,6 +17,7 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace hawk::capture {
@@ -235,6 +236,25 @@ private:
     DesktopBounds      bounds_{};
 };
 
+// The encoder settings the input thread took off the pipe, until the capture
+// loop picks them up.
+class SharedEncoderRequest {
+public:
+    [[nodiscard]] std::optional<EncoderRequest> take() {
+        const std::scoped_lock lock(mutex_);
+        return std::exchange(request_, std::nullopt);
+    }
+
+    void set(EncoderRequest request) {
+        const std::scoped_lock lock(mutex_);
+        request_ = request;
+    }
+
+private:
+    std::mutex                    mutex_;
+    std::optional<EncoderRequest> request_;
+};
+
 // Replays input events with SendInput, remembering what it has pressed so it
 // can let go of all of it on demand.
 class Injector {
@@ -421,6 +441,7 @@ struct InputChannel::Impl {
     HANDLE       io_event = nullptr;    // manual-reset; the read's OVERLAPPED event
     HANDLE       stop_event = nullptr;  // manual-reset; set by close()
     SharedBounds bounds;
+    SharedEncoderRequest encoder;
     std::jthread reader;
 
     ~Impl() { close(); }
@@ -479,6 +500,10 @@ struct InputChannel::Impl {
             if (packet.magic != ipc::input_packet_magic) {
                 spdlog::error("input: malformed packet from hawk-service, dropping input");
                 break;
+            }
+            if (packet.kind == static_cast<std::uint8_t>(ipc::InputKind::encoder)) {
+                encoder.set({.bitrate_bps = packet.bitrate_bps, .fps = packet.fps});
+                continue;
             }
             static_cast<void>(follow_input_desktop(input_desktop));
             injector.apply(packet);
@@ -554,6 +579,10 @@ bool InputChannel::open(const std::string& pipe_name, DesktopBounds bounds) {
 
 void InputChannel::set_bounds(DesktopBounds bounds) {
     impl_->bounds.set(bounds);
+}
+
+std::optional<EncoderRequest> InputChannel::take_encoder_request() {
+    return impl_->encoder.take();
 }
 
 void InputChannel::close() noexcept {

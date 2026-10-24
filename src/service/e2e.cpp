@@ -51,6 +51,7 @@ constexpr std::string_view kAudioAad = "hawk-audio-v1";
 constexpr std::string_view kConfigGetAad = "hawk-config-get-v1";
 constexpr std::string_view kConfigSetAad = "hawk-config-set-v1";
 constexpr std::string_view kConfigAad = "hawk-config-v1";
+constexpr std::string_view kQualityAad = "hawk-quality-v1";
 // A file- or shell-channel plaintext: op, header length (u16, big-endian),
 // the JSON header, then bytes.
 constexpr std::size_t kChannelPreamble = 3;
@@ -1436,6 +1437,27 @@ bool ViewerHub::send_config(std::uint64_t viewer, const ChannelMessage& message)
     lock.unlock();
     impl.send(json);
     return true;
+}
+
+std::optional<QualityPreset> ViewerHub::quality(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused || !Impl::can_control(found->second)) {
+        spdlog::warn("quality: viewer {} asked for a quality preset, which its role doesn't allow; ignored", viewer);
+        return std::nullopt;
+    }
+    const auto plain = Impl::open_request(found->second, sealed, kQualityAad);
+    if (!plain.has_value()) {
+        return std::nullopt;
+    }
+    const auto preset = parse_quality(std::string_view(reinterpret_cast<const char*>(plain->data()), plain->size()));
+    if (!preset.has_value()) {
+        spdlog::warn("quality: viewer {} asked for a preset there isn't; ignored", viewer);
+        return std::nullopt;
+    }
+    spdlog::info("quality: viewer {} ({}) chose {}", viewer, found->second.fingerprint, to_string(*preset));
+    return preset;
 }
 
 void ViewerHub::set_clipboard(const ClipboardConfig& clipboard) {

@@ -43,6 +43,9 @@ view picks up where it was.
 corner of the picture, each over the last second:
 
 - **Video**: what the picture costs your connection.
+- **Quality**: the stream's preset and the bitrate the machine encodes
+  at; on *Auto*, its current target. *N/A* from a machine older than
+  this dashboard.
 - **Frames/s**: frames that arrived, came out of the decoder, and were
   shown. **Lost/s**: decoded but never shown (*dropped*), or thrown away
   before decoding because they piled up (*skipped*); the picture then
@@ -58,6 +61,28 @@ corner of the picture, each over the last second:
 
 The overlay doesn't take clicks, so you can control the machine through
 it. It's remembered in this browser.
+
+## Quality
+
+**Quality ▾** above the screen picks how the picture is encoded, with
+control or as the owner (no code needed: it changes nothing but the
+picture). Everyone watching shares one stream, so the choice is for all of
+them, and lasts until the stream stops; then the machine's own default
+(`stream.quality` in its [config](/docs/machine-config#stream-quality))
+applies again.
+
+- **Auto** follows the connection: the relay watches how long the
+  machine's frames take to reach it and how many are waiting for each
+  viewer, cuts the bitrate by 30% when frames pile up, and raises it
+  slowly (0.3 Mb/s a second) once things have been clear for a few
+  seconds and the picture is using what it has. With several viewers, the
+  slowest one sets the pace. Between 0.5 and 12 Mb/s.
+- **Low** (1 Mb/s, 30 fps), **Balanced** (4 Mb/s), **High** (8 Mb/s) and
+  **Max** (16 Mb/s) hold one bitrate whatever the connection does.
+
+A new bitrate takes effect at once; a new frame rate (to or from Low)
+starts the machine's encoder over, so the picture may hitch once.
+View-only shares don't get the menu, but see the preset in **Stats**.
 
 ## Sound
 

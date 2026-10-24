@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -139,8 +140,9 @@ private:
 
 // hawk-service launches us with `--pipe <name> --input-pipe <name>`,
 // `--clipboard-pipe <name>` (plus `--clipboard-listen`) when its config
-// allows the clipboard, and `--audio` when the machine's sound goes too
-// (plus `--audio-device <endpoint id>` when a viewer chose the device).
+// allows the clipboard, `--audio` when the machine's sound goes too
+// (plus `--audio-device <endpoint id>` when a viewer chose the device), and
+// `--bitrate <bits/s> --fps <n>` for the stream's quality preset.
 [[nodiscard]] std::optional<std::string> option_value(std::span<char* const> args, std::string_view option) {
     for (std::size_t i = 1; i + 1 < args.size(); ++i) {
         if (std::string_view(args[i]) == option) {
@@ -152,6 +154,31 @@ private:
 
 [[nodiscard]] bool has_flag(std::span<char* const> args, std::string_view flag) {
     return std::ranges::any_of(args.subspan(1), [flag](const char* arg) { return std::string_view(arg) == flag; });
+}
+
+[[nodiscard]] std::uint32_t number_value(std::span<char* const> args, std::string_view option) {
+    const auto value = option_value(args, option);
+    if (!value.has_value()) {
+        return 0;
+    }
+    std::uint32_t number = 0;
+    std::from_chars(value->data(), value->data() + value->size(), number);
+    return number;
+}
+
+// What hawk-service asked the stream to be encoded at, within what makes
+// sense for a desktop; the encoder's defaults for anything it left out.
+// The frame rate never goes past the default, which the capture loop's
+// clock and the encoder's pipeline are tuned for.
+[[nodiscard]] capture::EncoderRequest sane_encoder(capture::EncoderRequest request) {
+    constexpr std::uint32_t min_bitrate = 100'000;
+    constexpr std::uint32_t max_bitrate = 50'000'000;
+    return {
+        .bitrate_bps = request.bitrate_bps == 0 ? capture::default_encoder_bitrate_bps
+                                                : std::clamp(request.bitrate_bps, min_bitrate, max_bitrate),
+        .fps = request.fps == 0 ? capture::default_encoder_fps
+                                : std::clamp(request.fps, std::uint32_t{1}, capture::default_encoder_fps),
+    };
 }
 
 // Launched by hawk-service there is no console to log to, so log to
@@ -240,6 +267,9 @@ int main(int argc, char* argv[]) {
 
     capture::H264Encoder encoder;
     bool                 encoder_ready = false;
+    // What it's encoding at: from the command line, then whatever
+    // hawk-service sends over the input pipe.
+    auto encoding = sane_encoder({.bitrate_bps = number_value(args, "--bitrate"), .fps = number_value(args, "--fps")});
 
     std::uint64_t captured_count = 0;
     std::uint64_t encoded_count = 0;
@@ -283,7 +313,7 @@ int main(int argc, char* argv[]) {
     // holds that lock for the whole AcquireNextFrame timeout, which starves
     // the async encoder's worker thread and drops most frames. So each tick
     // only polls for the newest frame (timeout 0) and then sleeps unlocked.
-    constexpr auto                frame_interval = std::chrono::microseconds{1'000'000 / capture::default_encoder_fps};
+    auto                          frame_interval = std::chrono::microseconds{1'000'000 / encoding.fps};
     auto                          next_tick = std::chrono::steady_clock::now();
     std::optional<capture::Frame> last_frame;
 
@@ -300,6 +330,28 @@ int main(int argc, char* argv[]) {
 
     for (;;) {
         std::this_thread::sleep_until(next_tick);
+
+        // A new quality preset, or Auto's next step. A bitrate goes to the
+        // running encoder when it takes one; a new frame rate (or an encoder
+        // that won't change its bitrate) means a new encoder, which starts
+        // on a keyframe: its rate control spends the bitrate per frame.
+        if (auto request = input.take_encoder_request(); request.has_value()) {
+            const auto wanted = sane_encoder(*request);
+            const bool new_fps = wanted.fps != encoding.fps;
+            if (encoder_ready && (new_fps || (wanted.bitrate_bps != encoding.bitrate_bps &&
+                                              !encoder.set_bitrate(wanted.bitrate_bps)))) {
+                encoder = capture::H264Encoder();
+                encoder_ready = false;
+            }
+            if (new_fps) {
+                frame_interval = std::chrono::microseconds{1'000'000 / wanted.fps};
+            }
+            if (wanted.bitrate_bps != encoding.bitrate_bps || new_fps) {
+                spdlog::info("capture: encoding at {} kbps, {} fps{}", wanted.bitrate_bps / 1000, wanted.fps,
+                             encoder_ready ? "" : " (new encoder)");
+            }
+            encoding = wanted;
+        }
 
         auto frame = duplicator.capture_frame(0);
         if (frame.has_value()) {
@@ -353,13 +405,17 @@ int main(int argc, char* argv[]) {
         }
 
         if (!encoder_ready) {
-            const capture::EncoderConfig config{.width = last_frame->width, .height = last_frame->height};
+            const capture::EncoderConfig config{.width = last_frame->width,
+                                                .height = last_frame->height,
+                                                .fps = encoding.fps,
+                                                .bitrate_bps = encoding.bitrate_bps};
             if (auto opened = encoder.open(duplicator.device(), config); !opened.has_value()) {
                 spdlog::error("capture: failed to open encoder: {}", capture::to_string(opened.error()));
                 return EXIT_FAILURE;
             }
             encoder_ready = true;
-            spdlog::info("capture: hardware H.264 encoder ready ({}x{})", last_frame->width, last_frame->height);
+            spdlog::info("capture: hardware H.264 encoder ready ({}x{}, {} kbps, {} fps)", last_frame->width,
+                         last_frame->height, encoding.bitrate_bps / 1000, encoding.fps);
         }
 
         const auto now = std::chrono::steady_clock::now();

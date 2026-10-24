@@ -1626,6 +1626,10 @@ select {
   border-top: 0;
 }
 
+.stage-menu-hint {
+  color: var(--fg-3);
+}
+
 .terminal-host[hidden] {
   display: none;
 }

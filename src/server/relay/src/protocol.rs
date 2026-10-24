@@ -7,11 +7,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::db::{Role, Signed};
+use crate::quality::Preset;
 
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The first protocol whose machines take power actions.
 pub const POWER_PROTOCOL: u32 = 3;
@@ -26,6 +27,10 @@ pub const PING_PROTOCOL: u32 = 5;
 /// The first protocol whose machines show their config and let the owner
 /// change it.
 pub const CONFIG_PROTOCOL: u32 = 6;
+
+/// The first protocol whose machines take a quality preset from a viewer,
+/// say what they stream at, and follow the relay's bitrate on Auto.
+pub const QUALITY_PROTOCOL: u32 = 7;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -128,6 +133,12 @@ pub enum DeviceMessage {
     Config { viewer: u64, sealed: String },
     /// The echo of a viewer's ping, for its round trip.
     Pong { viewer: u64, nonce: String },
+    /// What the stream is encoded at now: the preset (a viewer's choice,
+    /// or the machine's config), its bitrate in bits per second (Auto's
+    /// current target) and frame rate. Sent when capture starts and
+    /// whenever one of them changes. Not sealed: the relay sees roughly
+    /// this from the frames' sizes anyway, and runs Auto on it.
+    Quality { preset: Preset, bitrate: u32, fps: u32 },
     /// The machine is about to restart (or shut down): Windows has accepted
     /// it, and the connection drops shortly. Only ever about the machine
     /// itself, so nothing a viewer could be misled by.
@@ -200,6 +211,15 @@ pub enum DeviceCommand {
     ConfigSet { viewer: u64, sealed: String },
     /// A viewer's ping, for the machine to echo straight back as a pong.
     Ping { viewer: u64, nonce: String },
+    /// A quality preset, sealed by the viewer. Only passed on for control
+    /// (no fresh factor needed: it changes nothing but the picture); the
+    /// machine checks the role again.
+    Quality { viewer: u64, sealed: String },
+    /// Auto's new target, in bits per second, from the relay's controller
+    /// (crate::quality). The machine ignores it on any other preset and
+    /// keeps it within Auto's range: all a relay could do with it is make
+    /// the picture worse, which it can by dropping frames anyway.
+    Bitrate { bitrate: u32 },
     /// Every revocation the owner has signed for this machine.
     Revocations { revocations: Vec<SignedView> },
     /// The owner asks the machine to install the update it's holding now.
@@ -269,6 +289,8 @@ pub const MAX_SEALED_CONFIG_REQUEST_LEN: usize = (8 + 16 * 1024 + 16_usize).div_
 /// The machine's config: counter, op, header length, a JSON header of up to
 /// 64 KB, and the tag, in base64.
 pub const MAX_SEALED_CONFIG_LEN: usize = (8 + 3 + 65_535 + 16_usize).div_ceil(3) * 4;
+/// A viewer's quality preset: counter, its name, and the tag, in base64.
+pub const MAX_SEALED_QUALITY_LEN: usize = (8 + 16 + 16_usize).div_ceil(3) * 4;
 /// A ping's nonce, either way: a counter, in decimal.
 pub const MAX_PING_NONCE_LEN: usize = 32;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
@@ -341,6 +363,9 @@ pub enum DashboardCommand {
     /// Asks the machine to echo `nonce` back, to time the round trip. Not
     /// sealed: it carries nothing. Only passed on while viewing the machine.
     Ping { device_id: String, nonce: String },
+    /// A sealed quality preset. Only passed on while viewing the machine
+    /// with a control (or owner) role.
+    Quality { device_id: String, sealed: String },
     /// The owner asks the machine to install the update it's holding.
     InstallUpdate { device_id: String },
 }
@@ -404,6 +429,9 @@ pub struct MachineView {
     /// While online: the machine shows its config to this user's role
     /// (control or owner), and lets the owner change it.
     pub config: bool,
+    /// While online: the machine takes a quality preset from this user's
+    /// role (control or owner).
+    pub quality: bool,
 }
 
 /// Messages pushed to connected dashboards.
@@ -456,6 +484,9 @@ pub enum DashboardEvent {
     Config { device_id: String, sealed: String },
     /// The machine's echo of this dashboard's ping.
     Pong { device_id: String, nonce: String },
+    /// What the stream this dashboard watches is encoded at (see
+    /// DeviceMessage::Quality): when it starts watching, and on every change.
+    Quality { device_id: String, preset: Preset, bitrate: u32, fps: u32 },
 }
 
 /// Binary video frame produced by hawk-service (BuildVideoFrame):
@@ -473,6 +504,12 @@ pub fn is_keyframe(frame: &[u8]) -> bool {
 /// keyframe one, so the relay can treat it apart.
 pub fn is_audio(frame: &[u8]) -> bool {
     frame.get(1).is_some_and(|flags| flags & 0x02 != 0)
+}
+
+/// When the frame was captured, on the stream's clock: in the clear too,
+/// for Auto to tell how long frames take to get here (crate::quality).
+pub fn timestamp_us(frame: &[u8]) -> Option<i64> {
+    frame.get(2..10).and_then(|bytes| bytes.try_into().ok()).map(i64::from_le_bytes)
 }
 
 #[cfg(test)]
@@ -630,6 +667,33 @@ mod tests {
         assert!(matches!(message, DeviceMessage::Pong { viewer: 3, .. }));
         let json = serde_json::to_value(DashboardEvent::Pong { device_id: "m1".into(), nonce: "7".into() }).unwrap();
         assert_eq!(json, serde_json::json!({"type":"pong","deviceId":"m1","nonce":"7"}));
+    }
+
+    #[test]
+    fn quality_round_trips() {
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"quality","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::Quality { .. }));
+        let json = serde_json::to_value(DeviceCommand::Bitrate { bitrate: 2_000_000 }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"bitrate","bitrate":2_000_000}));
+        let message: DeviceMessage =
+            serde_json::from_str(r#"{"type":"quality","preset":"auto","bitrate":4000000,"fps":60}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::Quality { preset: Preset::Auto, bitrate: 4_000_000, fps: 60 }));
+        assert!(serde_json::from_str::<DeviceMessage>(r#"{"type":"quality","preset":"x","bitrate":1,"fps":1}"#).is_err());
+        let event = DashboardEvent::Quality { device_id: "m1".into(), preset: Preset::Low, bitrate: 1_000_000, fps: 30 };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({"type":"quality","deviceId":"m1","preset":"low","bitrate":1_000_000,"fps":30})
+        );
+    }
+
+    #[test]
+    fn frames_say_when_they_were_captured() {
+        let mut frame = vec![2, 1];
+        frame.extend_from_slice(&1_234_567_i64.to_le_bytes());
+        frame.push(9);
+        assert_eq!(timestamp_us(&frame), Some(1_234_567));
+        assert_eq!(timestamp_us(&frame[..9]), None);
     }
 
     #[test]

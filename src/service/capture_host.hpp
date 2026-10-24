@@ -50,6 +50,11 @@ struct CaptureOptions {
     bool audio = false;
     // From this output device (an endpoint id) rather than the default.
     std::wstring audio_device;
+    // What the picture is encoded at to start with; 0 for hawk-capture's
+    // own defaults. Changed while it runs with an ipc::InputKind::encoder
+    // packet through send_input().
+    std::uint32_t bitrate_bps = 0;
+    std::uint32_t fps = 0;
 };
 
 // Runs hawk-capture.exe inside the active console session and receives its

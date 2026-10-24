@@ -167,6 +167,10 @@ public:
     // viewer and sends it. False when that viewer is gone or may not read it.
     bool send_config(std::uint64_t viewer, const ChannelMessage& message);
 
+    // Opens a sealed quality preset; returns it if it's genuine, new, one
+    // there is, and from a viewer with control (or the owner).
+    [[nodiscard]] std::optional<QualityPreset> quality(std::uint64_t viewer, std::string_view sealed);
+
     // The clipboard rules from now on, after a change to the config.
     // Viewers already admitted were told the old ones, and are held to the
     // new ones.

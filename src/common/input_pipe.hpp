@@ -14,7 +14,8 @@
 // video pipe, and its name is handed to hawk-capture on its command line as
 // `--input-pipe <name>`. Keeping input off the video pipe is the control /
 // data channel separation the README asks for: a stalled video reader can't
-// hold up input, and neither end has to frame two kinds of packet.
+// hold up input, and neither end has to frame two kinds of packet. The
+// stream's encoder settings travel here too: they're control, not data.
 namespace hawk::ipc {
 
 inline constexpr std::uint32_t input_packet_magic = 0x504E4948;  // "HINP", little-endian
@@ -27,6 +28,9 @@ enum class InputKind : std::uint8_t {
     // Release everything input is holding down (the viewer stopped watching
     // or lost control), so nothing stays stuck on the machine.
     release_all = 5,
+    // Encode at `bitrate_bps` and `fps` from now on (the viewer's quality
+    // preset, or Auto's next step).
+    encoder = 6,
 };
 
 enum class InputButton : std::uint8_t {
@@ -60,7 +64,10 @@ struct InputPacket {
     // The physical key, as `KeyboardEvent.code` ("KeyA", "ShiftLeft"),
     // NUL-terminated. key only.
     std::array<char, max_key_code_size> code{};
+    // encoder only.
+    std::uint32_t bitrate_bps = 0;
+    std::uint32_t fps = 0;
 };
-static_assert(sizeof(InputPacket) == 64);
+static_assert(sizeof(InputPacket) == 72);
 
 }  // namespace hawk::ipc

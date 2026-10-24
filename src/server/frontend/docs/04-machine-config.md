@@ -29,6 +29,9 @@ feature **off**, and the log says why
 ## A full example
 
 ```toml
+[[stream]]
+quality = "auto"         # auto | low | balanced | high | max
+
 [[audio]]
 enabled = true           # what the machine plays goes to its viewers
 
@@ -68,7 +71,9 @@ it).
   same rules it uses at startup and refuses it, saying why, if anything is
   wrong. Only the lines that change are rewritten; comments stay.
 - The clipboard settings and `audio.enabled` take effect **at once** (the
-  picture pauses for a moment while the machine's capture restarts).
+  picture pauses for a moment while the machine's capture restarts), and
+  so does `stream.quality`, without a pause, unless a viewer picked a
+  preset for the stream that's running.
   Settings marked **after restart** take effect when the service next
   starts. Viewers already connected see a clipboard change in their menu
   the next time they connect, but the machine holds them to it at once.
@@ -151,3 +156,20 @@ default: nothing leaves the machine unless someone allowed asks for it.
   stored on the relay.
 - `enabled = false` stops the sampling and closes both tabs for everyone.
 - See [Analytics](/docs/analytics) for what's measured and who can see it.
+
+## Stream quality
+
+`[[stream]] quality` is how the picture is encoded until a viewer with
+control picks another preset from **Quality ▾** in the live view (see
+[Using a machine](/docs/using#quality)):
+
+| Preset     | Bitrate                          | Frame rate |
+| ---------- | -------------------------------- | ---------- |
+| `auto`     | follows the connection, 0.5–12 Mb/s, starting at 4 | 60 |
+| `low`      | 1 Mb/s                           | 30         |
+| `balanced` | 4 Mb/s                           | 60         |
+| `high`     | 8 Mb/s                           | 60         |
+| `max`      | 16 Mb/s                          | 60         |
+
+The default is `auto`. A value it doesn't know is logged, and the stream
+stays on `auto`.

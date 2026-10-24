@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/clipboard_pipe.hpp"
+#include "quality.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -100,7 +101,14 @@ struct AudioConfig {
     bool enabled = true;
 };
 
+// [[stream]]: how the picture is encoded, until a viewer with control picks
+// another preset for the stream (quality.hpp).
+struct StreamConfig {
+    QualityPreset quality = QualityPreset::automatic;
+};
+
 struct MachineConfig {
+    StreamConfig    stream;
     AudioConfig     audio;
     ClipboardConfig clipboard;
     FilesConfig     files;
@@ -117,6 +125,9 @@ struct MachineConfig {
 // A file that doesn't parse, or says something that makes no sense, is
 // logged and turns the clipboard off: a typo should never open up more
 // than the defaults would.
+//
+//   [[stream]]
+//   quality = "auto"     # auto | low | balanced | high | max
 //
 //   [[audio]]
 //   enabled = true

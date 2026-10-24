@@ -82,6 +82,13 @@ public:
     [[nodiscard]] std::expected<std::vector<EncodedPacket>, EncoderError> encode(
         ID3D11Texture2D* bgra_texture, std::chrono::microseconds timestamp);
 
+    // Retargets the open encoder's bitrate without starting the stream
+    // over, through ICodecAPI's mean bitrate, which hardware encoders take
+    // mid-stream from the next frame on (no keyframe needed: nothing the
+    // decoder holds changes). False when this encoder doesn't take it; the
+    // caller then opens a new one at the new bitrate.
+    [[nodiscard]] bool set_bitrate(std::uint32_t bitrate_bps);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

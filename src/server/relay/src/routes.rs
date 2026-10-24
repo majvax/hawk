@@ -23,10 +23,12 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_CONFIG_LEN, MAX_SEALED_CONFIG_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
+    MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_CONFIG_LEN, MAX_SEALED_CONFIG_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_QUALITY_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
-use crate::registry::{Answer, DashboardHandle, DeviceInfo, DeviceOutbound, Outbound, RESTART_GRACE, Registry, StepUp};
+use crate::registry::{
+    Answer, DashboardHandle, DeviceInfo, DeviceOutbound, Outbound, RESTART_GRACE, Registry, StepUp, StreamQuality,
+};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -312,6 +314,10 @@ async fn handle_device(socket: WebSocket, state: AppState) {
                         }
                         continue;
                     }
+                    Ok(DeviceMessage::Quality { preset, bitrate, fps }) => {
+                        state.registry.set_quality(&machine_id, connection, StreamQuality { preset, bitrate, fps });
+                        continue;
+                    }
                     _ => {}
                 }
                 route_device_answer(&state.registry, &machine_id, &text, &mut clipboard_budgets);
@@ -514,6 +520,7 @@ async fn handle_dashboard(
     let mut audio_budget = Budget::audio();
     let mut config_budget = Budget::config();
     let mut ping_budget = Budget::ping();
+    let mut quality_budget = Budget::quality();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -605,6 +612,13 @@ async fn handle_dashboard(
                     registry.ping(dashboard_id, &device_id, nonce);
                 }
             }
+            Ok(DashboardCommand::Quality { device_id, sealed }) => {
+                // Picking a preset, by hand: each one may have the machine
+                // start its encoder over.
+                if sealed.len() <= MAX_SEALED_QUALITY_LEN && quality_budget.take() {
+                    registry.quality(dashboard_id, &device_id, sealed);
+                }
+            }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
                 warn!(%error, "dashboard: received invalid command (further ones are logged at debug)")
             }
@@ -653,6 +667,11 @@ impl Budget {
     /// Reading the config and saving it, by hand: each has the machine read
     /// (or write) its config file.
     fn config() -> Self {
+        Self::new(1.0, 5.0)
+    }
+
+    /// Quality presets from one dashboard, picked by hand.
+    fn quality() -> Self {
         Self::new(1.0, 5.0)
     }
 

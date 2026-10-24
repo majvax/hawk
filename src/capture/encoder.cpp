@@ -15,6 +15,8 @@
 #include <mftransform.h>
 #include <wrl/client.h>
 
+#include <spdlog/spdlog.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -298,17 +300,39 @@ struct VideoProcessor {
 // Best-effort: ask for real-time, low-latency behavior if this encoder
 // exposes ICodecAPI. Not every hardware MFT implements it, and that's not
 // fatal — it just means we take whatever its defaults are.
-void enable_low_latency_mode(IMFTransform& transform) {
-    ComPtr<ICodecAPI> codec_api;
-    if (FAILED(transform.QueryInterface(__uuidof(ICodecAPI), &codec_api))) {
-        return;
-    }
-
+void enable_low_latency_mode(ICodecAPI& codec_api) {
     VARIANT enabled{};
     enabled.vt = VT_BOOL;
     enabled.boolVal = VARIANT_TRUE;
-    codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &enabled);
-    codec_api->SetValue(&CODECAPI_AVEncCommonRealTime, &enabled);
+    codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &enabled);
+    codec_api.SetValue(&CODECAPI_AVEncCommonRealTime, &enabled);
+}
+
+[[nodiscard]] std::string_view rate_control_name(ULONG mode) {
+    switch (mode) {
+        case eAVEncCommonRateControlMode_CBR:
+            return "CBR";
+        case eAVEncCommonRateControlMode_PeakConstrainedVBR:
+            return "peak-constrained VBR";
+        case eAVEncCommonRateControlMode_UnconstrainedVBR:
+            return "VBR";
+        case eAVEncCommonRateControlMode_Quality:
+            return "constant quality";
+        default:
+            return "unknown";
+    }
+}
+
+// For the log: how this encoder spends its bitrate (the mode is left as the
+// driver sets it, usually CBR for a hardware encoder), and whether it lets
+// the bitrate change mid-stream.
+void log_rate_control(ICodecAPI& codec_api) {
+    VARIANT mode{};
+    const bool known = SUCCEEDED(codec_api.GetValue(&CODECAPI_AVEncCommonRateControlMode, &mode)) && mode.vt == VT_UI4;
+    const bool modifiable = codec_api.IsModifiable(&CODECAPI_AVEncCommonMeanBitRate) == S_OK;
+    spdlog::info("encoder: rate control {}, bitrate {} mid-stream", known ? rate_control_name(mode.ulVal) : "not reported",
+                 modifiable ? "changes" : "may not change");
+    VariantClear(&mode);
 }
 
 }  // namespace
@@ -342,6 +366,7 @@ std::string to_string(const EncoderError& error) {
 struct H264Encoder::Impl {
     ComPtr<IMFDXGIDeviceManager>            device_manager;
     ComPtr<IMFTransform>                    transform;
+    ComPtr<ICodecAPI>                       codec_api;  // null if the encoder doesn't expose it
     ComPtr<ID3D11VideoDevice>               video_device;
     ComPtr<ID3D11VideoContext>              video_context;
     ComPtr<ID3D11VideoProcessorEnumerator>  video_enumerator;
@@ -574,6 +599,7 @@ struct H264Encoder::Impl {
         // would run in declaration order, but Reset() here makes that
         // ordering an explicit invariant rather than an accident of layout.
         event_generator.Reset();
+        codec_api.Reset();
         transform.Reset();
         video_processor.Reset();
         video_enumerator.Reset();
@@ -669,7 +695,12 @@ std::expected<void, EncoderError> H264Encoder::open(ID3D11Device* device, const 
         return std::unexpected(result.error());
     }
 
-    enable_low_latency_mode(*impl_->transform.Get());
+    if (SUCCEEDED(impl_->transform.As(&impl_->codec_api))) {
+        enable_low_latency_mode(*impl_->codec_api.Get());
+        log_rate_control(*impl_->codec_api.Get());
+    } else {
+        spdlog::info("encoder: no ICodecAPI; a new bitrate restarts the encoder");
+    }
 
     MFT_OUTPUT_STREAM_INFO stream_info{};
     hresult = impl_->transform->GetOutputStreamInfo(0, &stream_info);
@@ -757,6 +788,22 @@ std::expected<std::vector<EncodedPacket>, EncoderError> H264Encoder::encode(
         return std::unexpected(drained.error());
     }
     return packets;
+}
+
+bool H264Encoder::set_bitrate(std::uint32_t bitrate_bps) {
+    if (impl_->codec_api.Get() == nullptr) {
+        return false;
+    }
+    VARIANT value{};
+    value.vt = VT_UI4;
+    value.ulVal = bitrate_bps;
+    const HRESULT hresult = impl_->codec_api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value);
+    if (FAILED(hresult)) {
+        spdlog::info("encoder: the bitrate can't change mid-stream (HRESULT 0x{:08X})",
+                     static_cast<std::uint32_t>(hresult));
+        return false;
+    }
+    return true;
 }
 
 }  // namespace hawk::capture

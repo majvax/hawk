@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -83,6 +83,9 @@ export interface Machine {
   // While online: the machine shows its config to this user's role
   // (control or owner), and lets the owner change it.
   config?: boolean;
+  // While online: the machine takes a quality preset from this user's role
+  // (control or owner).
+  quality?: boolean;
 }
 
 // What a viewer with control can ask the machine to do with itself.
@@ -127,7 +130,10 @@ export type DashboardEvent =
   // The machine's config and schema, sealed for this viewer (ViewSession.openConfig).
   | { type: "config"; deviceId: string; sealed: string }
   // The machine's echo of a ping, for the round trip in the stream stats.
-  | { type: "pong"; deviceId: string; nonce: string };
+  | { type: "pong"; deviceId: string; nonce: string }
+  // What the stream is encoded at: on starting to watch, and on every
+  // change (a preset chosen, Auto's next step). See quality.ts.
+  | { type: "quality"; deviceId: string; preset: string; bitrate: number; fps: number };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -177,6 +183,9 @@ export type DashboardCommand =
   // Asks the machine to echo `nonce` back (a pong); anyone watching. Not
   // sealed: it carries nothing, and only times the round trip.
   | { type: "ping"; deviceId: string; nonce: string }
+  // Picks the stream's quality preset (ViewSession.sealQuality); control and
+  // owner, no fresh factor needed. Everyone watching shares the stream.
+  | { type: "quality"; deviceId: string; sealed: string }
   // Owner only: install the update the machine is holding. The machine
   // checks the release's signature itself.
   | { type: "install_update"; deviceId: string };

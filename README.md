@@ -182,6 +182,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [x] Audio on the MSE fallback (Firefox for Android): Opus muxed into fragmented MP4
 - [x] A/V sync: video slewed to the audio clock, a prefer latency / prefer sync toggle
 - [x] Output device picker: listed for anyone watching, chosen by control for the stream
+- [x] Quality presets, and Auto: adaptive bitrate steered by the relay from its own queues
+- [ ] Quality: capture scale, keyframe interval, per-viewer layers (simulcast / SVC)
 - [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
 - [x] File transfer into and out of one drop folder, resumable and hash-checked, off unless the machine's config turns it on
 - [x] Remote power actions (lock, sign out, restart, shut down), reboot-and-reconnect, remote sign-in at the sign-in screen
@@ -973,7 +975,26 @@ as a fallback is non-negotiable either way, which means two paths to
 maintain — the reason this isn't scheduled rather than any doubt that it's
 the right destination.
 
-### Quality controls
+### Quality controls (first part built)
+
+Built: **Quality ▾** in the live view picks a preset for the stream (Auto,
+Low 1 Mbit/s at 30 fps, Balanced 4, High 8, Max 16), with the machine's
+default in `[[stream]] quality`. Control and the owner choose it, sealed
+like input (`hawk-quality-v1`), no step-up; the machine checks the role
+again. hawk-service tells hawk-capture over its input pipe, and the
+encoder takes a new bitrate mid-stream through `ICodecAPI`
+(`CODECAPI_AVEncCommonMeanBitRate`); a new frame rate, or an encoder that
+won't take it, opens a new encoder, which starts on a keyframe. Auto runs
+in the relay (`src/server/relay/src/quality.rs`), where congestion shows
+on both legs: each frame's capture time is in the clear, so its transit
+over the quickest lately is the machine's uplink queue (pipe, socket,
+network), and each viewer's bounded frame queue shows its downlink. AIMD
+on those once a second: ×0.7 on congestion with a two-tick hold, +0.3
+Mbit/s a tick after three clear ticks, only while the stream uses at least
+half its target, inside 0.5–12 Mbit/s, which the machine enforces whatever
+the relay sends. One stream for everyone, so the slowest viewer sets the
+pace. Not yet: capture scale, the keyframe interval, and per-viewer layers.
+The original plan:
 
 Encoder settings are fixed at build time, so a 4K screen over a tethered
 phone and a LAN link get the same treatment. What's wanted: presets

@@ -61,6 +61,10 @@ struct AudioTable {
     std::optional<bool> enabled;
 };
 
+struct StreamTable {
+    std::optional<std::string> quality;
+};
+
 struct LockedTable {
     std::optional<std::vector<std::string>> keys;
 };
@@ -73,6 +77,7 @@ struct ConfigFile {
     std::vector<UpdateTable>    update;
     std::vector<MetricsTable>   metrics;
     std::vector<AudioTable>     audio;
+    std::vector<StreamTable>    stream;
     std::vector<LockedTable>    locked;
 };
 
@@ -124,6 +129,12 @@ struct glz::meta<hawk::service::AudioTable> {
 };
 
 template <>
+struct glz::meta<hawk::service::StreamTable> {
+    using T                     = hawk::service::StreamTable;
+    static constexpr auto value = object("quality", &T::quality);
+};
+
+template <>
 struct glz::meta<hawk::service::LockedTable> {
     using T                     = hawk::service::LockedTable;
     static constexpr auto value = object("keys", &T::keys);
@@ -134,7 +145,7 @@ struct glz::meta<hawk::service::ConfigFile> {
     using T                     = hawk::service::ConfigFile;
     static constexpr auto value = object("clipboard", &T::clipboard, "files", &T::files, "shell", &T::shell, "relay",
                                          &T::relay, "update", &T::update, "metrics", &T::metrics, "audio", &T::audio,
-                                         "locked", &T::locked);
+                                         "stream", &T::stream, "locked", &T::locked);
 };
 
 namespace hawk::service {
@@ -292,6 +303,25 @@ using Checked = std::expected<T, std::string>;
     return config;
 }
 
+[[nodiscard]] Checked<StreamConfig> stream_config(const std::vector<StreamTable>& tables) {
+    StreamConfig config;
+    if (tables.empty()) {
+        return config;
+    }
+    if (tables.size() > 1) {
+        return std::unexpected(more_than_one("stream"));
+    }
+    if (const auto& quality = tables.front().quality; quality.has_value()) {
+        const auto preset = parse_quality(*quality);
+        if (!preset.has_value()) {
+            return std::unexpected(
+                std::format("stream quality \"{}\" isn't one of auto, low, balanced, high or max", *quality));
+        }
+        config.quality = *preset;
+    }
+    return config;
+}
+
 [[nodiscard]] Checked<MetricsConfig> metrics_config(const std::vector<MetricsTable>& tables) {
     MetricsConfig config;
     if (tables.empty()) {
@@ -425,6 +455,11 @@ MachineConfig load_machine_config() {
         spdlog::error("config: {}; sound is off until {} is fixed", audio.error(), kConfigPath.string());
         config.audio.enabled = false;
     }
+    if (auto stream = stream_config(parsed.stream); stream.has_value()) {
+        config.stream = *stream;
+    } else {
+        spdlog::error("config: {}; the stream is on auto until {} is fixed", stream.error(), kConfigPath.string());
+    }
     if (auto locked = locked_keys(parsed.locked); locked.has_value()) {
         config.locked = *locked;
     } else {
@@ -451,11 +486,12 @@ std::expected<MachineConfig, std::string> parse_machine_config(std::string_view 
     auto update = update_config(parsed.update);
     auto metrics = metrics_config(parsed.metrics);
     auto audio = audio_config(parsed.audio);
+    auto stream = stream_config(parsed.stream);
     auto locked = locked_keys(parsed.locked);
     for (const std::string* error :
          {clipboard ? nullptr : &clipboard.error(), files ? nullptr : &files.error(), shell ? nullptr : &shell.error(),
           relay ? nullptr : &relay.error(), update ? nullptr : &update.error(), metrics ? nullptr : &metrics.error(),
-          audio ? nullptr : &audio.error(), locked ? nullptr : &locked.error()}) {
+          audio ? nullptr : &audio.error(), stream ? nullptr : &stream.error(), locked ? nullptr : &locked.error()}) {
         if (error != nullptr) {
             return std::unexpected(*error);
         }
@@ -467,6 +503,7 @@ std::expected<MachineConfig, std::string> parse_machine_config(std::string_view 
     config.update = *update;
     config.metrics = *metrics;
     config.audio = *audio;
+    config.stream = *stream;
     config.locked = *locked;
     return config;
 }
@@ -512,6 +549,13 @@ constexpr std::array kSettings{
             .description = "Send what this PC plays to everyone watching, with the picture.",
             .apply = SettingApply::live,
             .value = [](const MachineConfig& c) -> SettingValue { return c.audio.enabled; }},
+    Setting{.key = "stream.quality",
+            .type = SettingType::choice,
+            .description = "How the picture is encoded until a viewer with control picks otherwise: auto (follows "
+                           "the connection), low (1 Mbps, 30 fps), balanced (4 Mbps), high (8 Mbps) or max (16 Mbps).",
+            .choices = kQualityNames,
+            .apply = SettingApply::live,
+            .value = [](const MachineConfig& c) -> SettingValue { return std::string(to_string(c.stream.quality)); }},
     Setting{.key = "files.enabled",
             .type = SettingType::boolean,
             .description = "File transfer into and out of the drop folder, for control, dev and the owner.",

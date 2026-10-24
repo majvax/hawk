@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use bytes::Bytes;
 use time::OffsetDateTime;
@@ -18,9 +19,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::protocol::{
-    AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, PING_PROTOCOL, POWER_PROTOCOL, SignedView, is_audio,
-    is_keyframe,
+    AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, PING_PROTOCOL, POWER_PROTOCOL,
+    QUALITY_PROTOCOL, SignedView, is_audio, is_keyframe, timestamp_us,
 };
+use crate::quality::{Meter, Preset, RateController, TICK_US};
 
 pub type DashboardId = u64;
 
@@ -123,6 +125,40 @@ struct Device {
     update_available: Option<String>,
     /// The protocol the machine said it speaks in its hello.
     protocol: u32,
+    /// What the relay's clock measures frames' arrival from.
+    epoch: Instant,
+    stream: Stream,
+}
+
+/// What the machine said its stream is encoded at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamQuality {
+    pub preset: Preset,
+    pub bitrate: u32,
+    pub fps: u32,
+}
+
+/// The machine's stream, while it captures: what it's encoded at, and on
+/// Auto, the controller steering its bitrate and what it measures.
+/// Everyone watching shares the one stream, so the slowest viewer's queue
+/// is what counts. Forgotten when capture stops.
+#[derive(Default)]
+struct Stream {
+    quality: Option<StreamQuality>,
+    controller: Option<RateController>,
+    meter: Meter,
+    next_tick_us: Option<i64>,
+}
+
+impl Stream {
+    fn event(&self, device_id: &str) -> Option<DashboardEvent> {
+        self.quality.map(|quality| DashboardEvent::Quality {
+            device_id: device_id.to_owned(),
+            preset: quality.preset,
+            bitrate: quality.bitrate,
+            fps: quality.fps,
+        })
+    }
 }
 
 /// What a machine says about itself in its hello.
@@ -212,6 +248,7 @@ impl Inner {
             audio_devices: device.is_some_and(|device| device.protocol >= AUDIO_DEVICES_PROTOCOL),
             ping: device.is_some_and(|device| device.protocol >= PING_PROTOCOL),
             config: row.role.can_control() && device.is_some_and(|device| device.protocol >= CONFIG_PROTOCOL),
+            quality: row.role.can_control() && device.is_some_and(|device| device.protocol >= QUALITY_PROTOCOL),
         }
     }
 
@@ -233,6 +270,7 @@ impl Inner {
         device.send(DeviceCommand::ViewerLeft { viewer: dashboard });
         if left.video && !device.viewers.values().any(|viewer| viewer.video) {
             device.send(DeviceCommand::StopCapture);
+            device.stream = Stream::default();
         }
         self.publish(machine_id); // the owner's viewer list changed
         true
@@ -338,6 +376,8 @@ impl Registry {
             version: info.version,
             update_available: None,
             protocol: info.protocol,
+            epoch: Instant::now(),
+            stream: Stream::default(),
         };
         inner.devices.insert(machine_id.to_owned(), device);
         inner.restarting.remove(machine_id); // it's back
@@ -364,10 +404,18 @@ impl Registry {
     /// Fans one video frame out to the machine's viewers without blocking: a
     /// viewer whose queue is full loses frames until the next keyframe.
     pub fn forward_frame(&self, machine_id: &str, frame: Bytes) {
+        self.forward_frame_at(machine_id, frame, Instant::now());
+    }
+
+    /// The same, for a frame that arrived at `now`. On Auto, what it shows
+    /// of the queues goes to the stream's meter, and once a tick the
+    /// controller may tell the machine a new bitrate.
+    fn forward_frame_at(&self, machine_id: &str, frame: Bytes, now: Instant) {
         let keyframe = is_keyframe(&frame);
         let audio = is_audio(&frame);
         let mut inner = self.lock();
         let Some(device) = inner.devices.get_mut(machine_id) else { return };
+        let auto = device.stream.controller.is_some();
         for viewer in device.viewers.values_mut().filter(|viewer| viewer.video) {
             if audio {
                 // Each packet stands alone: a lost one is a click, not a
@@ -378,7 +426,69 @@ impl Registry {
             if viewer.awaiting_keyframe && !keyframe {
                 continue;
             }
-            viewer.awaiting_keyframe = viewer.frames.try_send(frame.clone()).is_err();
+            let dropped = viewer.frames.try_send(frame.clone()).is_err();
+            viewer.awaiting_keyframe = dropped;
+            if auto {
+                let waiting = viewer.frames.max_capacity() - viewer.frames.capacity();
+                device.stream.meter.queue(waiting, dropped);
+            }
+        }
+        if !auto || audio {
+            return;
+        }
+        let arrival_us = i64::try_from(now.saturating_duration_since(device.epoch).as_micros()).unwrap_or(i64::MAX);
+        if let Some(timestamp) = timestamp_us(&frame) {
+            device.stream.meter.frame(arrival_us, timestamp, frame.len());
+        }
+        let stream = &mut device.stream;
+        let Some(due) = stream.next_tick_us else {
+            stream.next_tick_us = Some(arrival_us + TICK_US);
+            return;
+        };
+        if arrival_us < due {
+            return;
+        }
+        let signals = stream.meter.take(arrival_us - due + TICK_US);
+        stream.next_tick_us = Some(arrival_us + TICK_US);
+        let Some(controller) = stream.controller.as_mut() else { return };
+        let before = controller.target();
+        let target = controller.tick(&signals);
+        if target != before {
+            device.send(DeviceCommand::Bitrate { bitrate: target });
+        }
+    }
+
+    /// The machine says what its stream is encoded at now. On Auto, the
+    /// controller starts from there, or carries on if that's where it had
+    /// the machine; on anything else it stops. Everyone watching is told.
+    pub fn set_quality(&self, machine_id: &str, connection: u64, quality: StreamQuality) {
+        let mut inner = self.lock();
+        let Some(device) = inner
+            .devices
+            .get_mut(machine_id)
+            .filter(|device| device.connection == connection && device.protocol >= QUALITY_PROTOCOL)
+        else {
+            return;
+        };
+        let stream = &mut device.stream;
+        stream.quality = Some(quality);
+        if quality.preset != Preset::Auto {
+            stream.controller = None;
+        } else if stream.controller.is_none() {
+            stream.controller = Some(RateController::new(quality.bitrate));
+            stream.meter = Meter::default();
+            stream.next_tick_us = None;
+        } else if stream.controller.as_ref().is_some_and(|controller| controller.target() != quality.bitrate) {
+            // Not what it was told (the machine started over): follow it.
+            stream.controller = Some(RateController::new(quality.bitrate));
+        }
+        let Some(event) = stream.event(machine_id) else { return };
+        let watchers: Vec<DashboardId> =
+            device.viewers.iter().filter(|(_, viewer)| viewer.video).map(|(id, _)| *id).collect();
+        for id in watchers {
+            if let Some(dashboard) = inner.dashboards.get(&id) {
+                dashboard.handle.send(event.clone());
+            }
         }
     }
 
@@ -475,8 +585,13 @@ impl Registry {
             signature: join.signature,
             grant,
         });
+        let quality = if video { device.stream.event(machine_id) } else { None };
         if let Some(dashboard) = inner.dashboards.get(&dashboard_id) {
             dashboard.handle.send(DashboardEvent::Elevation { device_id: machine_id.to_owned(), elevated });
+            // A stream already running: what it's encoded at, for the stats.
+            if let Some(quality) = quality {
+                dashboard.handle.send(quality);
+            }
         }
         inner.publish(machine_id);
         true
@@ -760,6 +875,25 @@ impl Registry {
             |role| role == Role::Owner,
             DeviceCommand::ConfigSet { viewer: dashboard_id, sealed },
         )
+    }
+
+    /// Passes a sealed quality preset on to the machine if this dashboard
+    /// may control it and is watching it. No fresh factor: it changes only
+    /// how the picture is encoded, for everyone watching. The machine
+    /// checks the role again.
+    pub fn quality(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
+        let may = inner
+            .dashboards
+            .get(&dashboard_id)
+            .and_then(|dashboard| dashboard.access.get(machine_id))
+            .is_some_and(|row| row.role.can_control());
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !may || !device.viewers.contains_key(&dashboard_id) || device.protocol < QUALITY_PROTOCOL {
+            return false;
+        }
+        device.send(DeviceCommand::Quality { viewer: dashboard_id, sealed });
+        true
     }
 
     /// Passes the owner's go-ahead for an update on. Anyone else is ignored.
@@ -1474,6 +1608,219 @@ mod tests {
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StopCapture)));
     }
 
+    fn quality(preset: Preset, bitrate: u32) -> StreamQuality {
+        StreamQuality { preset, bitrate, fps: 60 }
+    }
+
+    /// A registry with a machine on the quality protocol and one dashboard
+    /// of `role` watching it. Its frame queue is closed, so every frame
+    /// offered to it counts as dropped.
+    fn watching_quality(
+        role: Role,
+    ) -> (Registry, DashboardId, u64, mpsc::UnboundedReceiver<DeviceOutbound>, mpsc::UnboundedReceiver<Outbound>) {
+        let registry = Registry::default();
+        let (handle, events) = handle(if role == Role::Owner { 1 } else { 2 });
+        let dashboard = registry.add_dashboard(handle, vec![row(role)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        let connection =
+            registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: QUALITY_PROTOCOL }, outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        while next(&mut device_rx).is_some() {}
+        (registry, dashboard, connection, device_rx, events)
+    }
+
+    fn next_quality(events: &mut mpsc::UnboundedReceiver<Outbound>) -> Option<(Preset, u32)> {
+        while let Ok(outbound) = events.try_recv() {
+            if let Outbound::Event(event) = outbound
+                && let DashboardEvent::Quality { preset, bitrate, .. } = *event
+            {
+                return Some((preset, bitrate));
+            }
+        }
+        None
+    }
+
+    /// A video frame captured at `timestamp_us`.
+    fn video_frame(timestamp_us: i64) -> Bytes {
+        let mut frame = vec![2, 1];
+        frame.extend_from_slice(&timestamp_us.to_le_bytes());
+        frame.extend_from_slice(&[0; 100]);
+        Bytes::from(frame)
+    }
+
+    /// Control chooses the preset; a view share can't, and neither can
+    /// anyone on a machine too old for it.
+    #[test]
+    fn quality_needs_control_and_the_protocol() {
+        let (registry, dashboard, _connection, mut device_rx, mut events) = watching_quality(Role::Control);
+        assert!(last_view(&mut events).is_some_and(|view| view.quality));
+        assert!(registry.quality(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Quality { viewer, .. }) if viewer == dashboard));
+        registry.stop_view(dashboard, MACHINE);
+        assert!(!registry.quality(dashboard, MACHINE, "sealed".to_owned()));
+
+        let (registry, dashboard, _connection, mut device_rx, mut events) = watching_quality(Role::View);
+        assert!(last_view(&mut events).is_some_and(|view| !view.quality));
+        assert!(!registry.quality(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        let (registry, dashboard, mut device_rx, _events) = watching(Role::Owner);
+        assert!(!registry.quality(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// Everyone watching hears what the stream is encoded at, and a viewer
+    /// joining later hears it on joining.
+    #[test]
+    fn quality_reaches_every_viewer() {
+        let (registry, _dashboard, connection, _device_rx, mut events) = watching_quality(Role::View);
+        registry.set_quality(MACHINE, connection, quality(Preset::High, 8_000_000));
+        assert_eq!(next_quality(&mut events), Some((Preset::High, 8_000_000)));
+        // An older connection's word doesn't count.
+        registry.set_quality(MACHINE, connection + 100, quality(Preset::Low, 1_000_000));
+        assert_eq!(next_quality(&mut events), None);
+
+        let (handle, mut late_events) = handle(3);
+        let late = registry.add_dashboard(handle, vec![row(Role::View)]);
+        assert!(registry.start_view(late, MACHINE, join()));
+        assert_eq!(next_quality(&mut late_events), Some((Preset::High, 8_000_000)));
+    }
+
+    /// On Auto, a viewer that can't keep up has the relay lower the
+    /// machine's bitrate once a tick has gone by; on a fixed preset,
+    /// nothing is touched.
+    #[test]
+    fn auto_lowers_the_bitrate_for_a_viewer_falling_behind() {
+        let (registry, _dashboard, connection, mut device_rx, _events) = watching_quality(Role::View);
+        let start = Instant::now();
+        registry.set_quality(MACHINE, connection, quality(Preset::Balanced, 4_000_000));
+        for tick in 0..3_i64 {
+            let at = start + std::time::Duration::from_millis(1100 * tick.unsigned_abs());
+            registry.forward_frame_at(MACHINE, video_frame(tick * 1_100_000), at);
+        }
+        assert!(next(&mut device_rx).is_none(), "a fixed preset is left alone");
+
+        registry.set_quality(MACHINE, connection, quality(Preset::Auto, 4_000_000));
+        for tick in 3..6_i64 {
+            let at = start + std::time::Duration::from_millis(1100 * tick.unsigned_abs());
+            registry.forward_frame_at(MACHINE, video_frame(tick * 1_100_000), at);
+        }
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Bitrate { bitrate: 2_800_000 })));
+        // The machine confirms it; the controller carries on from there.
+        registry.set_quality(MACHINE, connection, quality(Preset::Auto, 2_800_000));
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// Frames `ticks` seconds' worth apart from `from`, one per 1.1 s.
+    fn frames_over(registry: &Registry, start: Instant, ticks: std::ops::Range<i64>) {
+        for tick in ticks {
+            let at = start + std::time::Duration::from_millis(1100 * tick.unsigned_abs());
+            registry.forward_frame_at(MACHINE, video_frame(tick * 1_100_000), at);
+        }
+    }
+
+    fn bitrates(device_rx: &mut mpsc::UnboundedReceiver<DeviceOutbound>) -> Vec<u32> {
+        let mut found = Vec::new();
+        while let Ok(outbound) = device_rx.try_recv() {
+            if let DeviceOutbound::Command(DeviceCommand::Bitrate { bitrate }) = outbound {
+                found.push(bitrate);
+            }
+        }
+        found
+    }
+
+    /// Leaving Auto stops the relay steering at once, and coming back to it
+    /// starts from where the machine says it is.
+    #[test]
+    fn bitrate_only_goes_out_on_auto() {
+        let (registry, _dashboard, connection, mut device_rx, _events) = watching_quality(Role::View);
+        let start = Instant::now();
+        registry.set_quality(MACHINE, connection, quality(Preset::Auto, 4_000_000));
+        frames_over(&registry, start, 0..3);
+        assert_eq!(bitrates(&mut device_rx), vec![2_800_000]);
+        for preset in [Preset::Low, Preset::Balanced, Preset::High, Preset::Max] {
+            registry.set_quality(MACHINE, connection, quality(preset, 8_000_000));
+            frames_over(&registry, start, 3..20);
+            assert!(bitrates(&mut device_rx).is_empty(), "{preset:?} was steered");
+        }
+        registry.set_quality(MACHINE, connection, quality(Preset::Auto, 8_000_000));
+        frames_over(&registry, start, 20..23);
+        assert_eq!(bitrates(&mut device_rx), vec![5_600_000]);
+    }
+
+    /// A machine too old for presets never hears a bitrate, even if it
+    /// somehow said what it streams at.
+    #[test]
+    fn an_old_machine_is_never_steered() {
+        let (registry, _dashboard, mut device_rx, _events) = watching(Role::Owner);
+        let start = Instant::now();
+        registry.set_quality(MACHINE, 1, quality(Preset::Auto, 4_000_000));
+        frames_over(&registry, start, 0..10);
+        assert!(bitrates(&mut device_rx).is_empty());
+    }
+
+    /// Once nobody watches, the stream's quality and Auto's state go with
+    /// it: whoever watches next starts afresh from what the machine says.
+    #[test]
+    fn the_stream_is_forgotten_when_the_last_viewer_leaves() {
+        let (registry, dashboard, connection, mut device_rx, mut events) = watching_quality(Role::Control);
+        let start = Instant::now();
+        registry.set_quality(MACHINE, connection, quality(Preset::Auto, 4_000_000));
+        assert!(next_quality(&mut events).is_some());
+        frames_over(&registry, start, 0..2);
+        let _ = bitrates(&mut device_rx);
+        registry.stop_view(dashboard, MACHINE);
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerLeft { .. })));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StopCapture)));
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert_eq!(next_quality(&mut events), None, "a stale quality from the last stream");
+        frames_over(&registry, start, 2..10);
+        assert!(bitrates(&mut device_rx).is_empty(), "steered a stream nobody said was on Auto");
+    }
+
+    /// A viewer that couldn't keep up stops counting once it leaves: the
+    /// others' healthy queues let the bitrate climb again.
+    #[test]
+    fn a_slow_viewer_leaving_stops_the_cuts() {
+        let (registry, slow, connection, mut device_rx, _events) = watching_quality(Role::View);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let (frames, mut frames_rx) = mpsc::channel(32);
+        let (bulk, _bulk_rx) = mpsc::channel(1);
+        let fast = registry.add_dashboard(
+            DashboardHandle {
+                events,
+                frames,
+                bulk,
+                user_id: 3,
+                session_id: 3,
+                email: "fast@example.com".to_owned(),
+                step_up: StepUp::default(),
+            },
+            vec![row(Role::View)],
+        );
+        assert!(registry.start_view(fast, MACHINE, join()));
+        let start = Instant::now();
+        let mut tick = 0_i64;
+        let mut feed = |registry: &Registry, ticks: i64| {
+            for _ in 0..ticks {
+                let at = start + std::time::Duration::from_millis(1100 * tick.unsigned_abs());
+                // Keyframes, so the healthy viewer takes every one.
+                let mut frame = video_frame(tick * 1_100_000).to_vec();
+                frame[1] |= 0x01;
+                registry.forward_frame_at(MACHINE, Bytes::from(frame), at);
+                while frames_rx.try_recv().is_ok() {}
+                tick += 1;
+            }
+        };
+        registry.set_quality(MACHINE, connection, quality(Preset::Auto, 4_000_000));
+        feed(&registry, 6);
+        assert!(!bitrates(&mut device_rx).is_empty(), "the slow viewer's drops didn't count");
+        registry.stop_view(slow, MACHINE);
+        let _ = bitrates(&mut device_rx);
+        feed(&registry, 20);
+        let after = bitrates(&mut device_rx);
+        assert!(after.windows(2).all(|pair| pair[1] >= pair[0]), "still cut after it left: {after:?}");
+    }
     /// Answers only go to a dashboard that is watching that machine.
     #[test]
     fn answers_for_strangers_are_dropped() {

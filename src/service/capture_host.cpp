@@ -32,7 +32,7 @@ constexpr DWORD             pipe_buffer_size = 1024 * 1024;
 constexpr DWORD             capture_exit_timeout_ms = 2000;
 constexpr DWORD             no_console_session = 0xFFFFFFFF;
 
-// The input pipe carries 64-byte packets at the rate a person moves a mouse,
+// The input pipe carries 72-byte packets at the rate a person moves a mouse,
 // so this holds a few hundred of them if hawk-capture ever falls behind.
 constexpr DWORD input_buffer_size = 16 * 1024;
 // Input is sent from the relay thread, which has to keep servicing the
@@ -193,9 +193,7 @@ private:
                                                                             const std::wstring& pipe_name,
                                                                             const std::wstring& input_pipe_name,
                                                                             const std::wstring& clipboard_pipe_name,
-                                                                            bool                clipboard_listen,
-                                                                            bool                audio,
-                                                                            const std::wstring& audio_device) {
+                                                                            const CaptureOptions& options) {
     auto directory = service_directory();
     if (!directory.has_value()) {
         return std::unexpected(directory.error());
@@ -205,15 +203,18 @@ private:
         std::format(L"\"{}\" --pipe {} --input-pipe {}", executable, pipe_name, input_pipe_name);
     if (!clipboard_pipe_name.empty()) {
         command_line += std::format(L" --clipboard-pipe {}", clipboard_pipe_name);
-        if (clipboard_listen) {
+        if (options.clipboard_listen) {
             command_line += L" --clipboard-listen";
         }
     }
-    if (audio) {
+    if (options.audio) {
         command_line += L" --audio";
-        if (!audio_device.empty()) {
-            command_line += std::format(L" --audio-device {}", audio_device);
+        if (!options.audio_device.empty()) {
+            command_line += std::format(L" --audio-device {}", options.audio_device);
         }
+    }
+    if (options.bitrate_bps != 0 && options.fps != 0) {
+        command_line += std::format(L" --bitrate {} --fps {}", options.bitrate_bps, options.fps);
     }
     std::wstring desktop = L"winsta0\\default";
 
@@ -660,8 +661,7 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
     }
 
     auto process =
-        launch_capture(session, pipe_name, input_pipe_name, clipboard_pipe_name, options.clipboard_listen,
-                       options.audio, options.audio_device);
+        launch_capture(session, pipe_name, input_pipe_name, clipboard_pipe_name, options);
     if (!process.has_value()) {
         return std::unexpected(process.error());
     }
