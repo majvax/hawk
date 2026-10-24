@@ -238,6 +238,12 @@ const AUDIO_AAD = utf8("hawk-audio-v1");
 const CONFIG_GET_AAD = utf8("hawk-config-get-v1");
 const CONFIG_SET_AAD = utf8("hawk-config-set-v1");
 const QUALITY_AAD = utf8("hawk-quality-v1");
+// Ctrl+Alt+Del, and the machine's answer to it on the reply key.
+const SAS_AAD = utf8("hawk-sas-v1");
+// The first byte of that answer; must match kSasSent and kSasFailed in
+// src/service/e2e.cpp.
+const SAS_SENT = 1;
+const SAS_FAILED = 2;
 const CONFIG_AAD = utf8("hawk-config-v1");
 // The byte a sealed power request carries; must match PowerAction in
 // src/service/power.hpp.
@@ -504,6 +510,34 @@ export class ViewSession {
   // Picks the stream's quality preset by name (quality.ts).
   sealQuality(preset: string): Promise<string> | null {
     return this.sealRequest(utf8(preset), QUALITY_AAD);
+  }
+
+  // Presses Ctrl+Alt+Del: nothing but the counter.
+  sealSas(): Promise<string> | null {
+    return this.sealRequest(new Uint8Array(0), SAS_AAD);
+  }
+
+  // The machine's answer to it: pressed, or why not. On the reply key, so
+  // numbered with clipboard text. null for anything that doesn't open, or
+  // that was seen before.
+  async openSas(sealed: string): Promise<{ sent: boolean; error: string } | null> {
+    const key = this.replyKey;
+    if (key === null) return null;
+    try {
+      const bytes = fromBase64(sealed);
+      if (bytes.length < 8 + 16) return null;
+      const counter = new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(0);
+      if (counter <= this.replyCounter) return null;
+      const iv = concat(bytes.slice(0, 8), new Uint8Array(4));
+      const plain = await aesDecrypt(key, iv, bytes.slice(8), SAS_AAD);
+      if (counter <= this.replyCounter) return null; // another one got there first
+      const op = plain[0];
+      if (op !== SAS_SENT && op !== SAS_FAILED) return null;
+      this.replyCounter = counter;
+      return { sent: op === SAS_SENT, error: new TextDecoder().decode(plain.slice(1)) };
+    } catch {
+      return null;
+    }
   }
 
   // A file-channel message from the machine; null for anything that

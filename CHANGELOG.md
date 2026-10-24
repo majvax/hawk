@@ -61,7 +61,19 @@ Each release's section becomes its release notes (see
   many wait for each viewer, cuts by 30% on congestion and climbs slowly
   once it's clear. The slowest viewer sets the pace. **Stats** shows the
   preset and the bitrate the machine targets.
-- Protocol version 7.
+- **Ctrl+Alt+Del** in the live view, or `Ctrl+Alt+End` on the screen as in
+  Remote Desktop: the machine has Windows press it (`SendSAS`), so a
+  sign-in screen that asks for Ctrl+Alt+Del can be signed in to remotely,
+  and a signed-in machine shows its security options. For control and the
+  owner, end-to-end encrypted like input, and the machine checks the role
+  again. Windows only takes it from a service when its
+  `SoftwareSASGeneration` policy allows that: `hawk-setup install machine`
+  turns services on (1, or 3 where ease of access apps already had it)
+  and puts the policy back on uninstall. Updates don't change the policy:
+  a machine that updates to this release needs `hawk-setup install machine`
+  run on it once to allow it. A machine that doesn't allow it says so in
+  the live view, with what to change.
+- Protocol version 8.
 
 ## 1.0.0
 

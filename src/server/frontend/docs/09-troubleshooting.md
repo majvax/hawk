@@ -62,6 +62,25 @@ Either your access level doesn't include it (see
 the service after editing the config, and check the log for `config:`
 lines if a change didn't take.
 
+## Ctrl+Alt+Del does nothing
+
+The message under the screen says why. Usually it's Windows' policy on
+who may press `Ctrl+Alt+Del` in software, which has to allow services:
+
+- **Run `hawk-setup install machine` on the PC again.** It sets
+  `SoftwareSASGeneration` under
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` to 1
+  (services), or to 3 where it was 2 (ease of access apps), and leaves it
+  alone if it already allows services. Uninstalling puts it back as it
+  was, unless it was changed since. A machine installed before this
+  needs that once; updates don't change the policy.
+- **Or set it yourself:** `gpedit.msc` > Computer Configuration >
+  Administrative Templates > Windows Components > Windows Logon Options >
+  **Disable or enable software Secure Attention Sequence**, enabled, set
+  to **Services**.
+- **On a domain**, a group policy can set it back. Ask whoever manages
+  the domain's policies.
+
 ## "Confirm to control" or "needs a fresh code"
 
 You have two-factor on, and taking control, files and shells need a code

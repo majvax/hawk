@@ -171,6 +171,14 @@ public:
     // there is, and from a viewer with control (or the owner).
     [[nodiscard]] std::optional<QualityPreset> quality(std::uint64_t viewer, std::string_view sealed);
 
+    // Opens a sealed Ctrl+Alt+Del: true if it's genuine, new, and from a
+    // viewer with control (or the owner).
+    [[nodiscard]] bool sas(std::uint64_t viewer, std::string_view sealed);
+
+    // Tells that viewer whether it was pressed: an empty `error` for yes,
+    // otherwise why not. Sealed on its reply key.
+    void send_sas_result(std::uint64_t viewer, std::string_view error);
+
     // The clipboard rules from now on, after a change to the config.
     // Viewers already admitted were told the old ones, and are held to the
     // new ones.

@@ -11,6 +11,7 @@
 #include "audio_devices.hpp"
 #include "power.hpp"
 #include "quality.hpp"
+#include "sas.hpp"
 #include "updater.hpp"
 #include "websocket/websocket.hpp"
 
@@ -57,7 +58,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 7;
+constexpr std::uint32_t kProtocolVersion = 8;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -152,11 +153,11 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*, config_*, quality, ping
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*, config_*, quality, sas, ping
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power, audio_*, config_*, quality
+    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power, audio_*, config_*, quality, sas
     std::vector<svc::SignedStatement>            revocations;    // revocations
     bool                                         audio = false;  // start_capture: the relay passes sound on
     std::uint32_t                                bitrate = 0;    // bitrate: Auto's next step, bits per second
@@ -759,6 +760,16 @@ void RunPowerAction(net::WebSocketClient& client, svc::PowerAction action) {
     }
 }
 
+// Presses Ctrl+Alt+Del for a viewer, and tells it whether that worked:
+// SendSAS itself says nothing, so mostly whether the policy allows it.
+void PressCtrlAltDel(svc::ViewerHub& hub, std::uint64_t viewer) {
+    const auto done = svc::send_sas();
+    if (!done.has_value()) {
+        spdlog::warn("sas: couldn't press Ctrl+Alt+Del: {}", done.error());
+    }
+    hub.send_sas_result(viewer, done.has_value() ? std::string_view{} : std::string_view(done.error()));
+}
+
 // The longest nonce echoed back; the dashboard sends a counter.
 constexpr std::size_t kMaxPingNonce = 32;
 
@@ -916,6 +927,10 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
     } else if (command.type == "quality") {
         if (const auto preset = hub->quality(command.viewer, command.sealed); preset.has_value()) {
             ChooseQuality(connection, *preset);
+        }
+    } else if (command.type == "sas") {
+        if (hub->sas(command.viewer, command.sealed)) {
+            PressCtrlAltDel(*hub, command.viewer);
         }
     } else if (command.type == "bitrate") {
         // Only ever from the relay, whose controller runs Auto: anything

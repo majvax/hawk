@@ -290,6 +290,14 @@ export interface Dashboard {
   // unless this view has control, and the machine checks the role again.
   // False when there's no secured view with control to send it to.
   setQuality: (preset: QualityPreset) => boolean;
+  // Presses Ctrl+Alt+Del on the machine being watched. The relay drops it
+  // unless this view has control and is elevated, as with input, and the
+  // machine checks the role again; its answer lands in `sasResult`. False
+  // when there's no secured view with control to send it to.
+  sendSas: () => boolean;
+  sasResult: SasResult | null;
+  // Call once `sasResult` is shown, so it isn't shown again.
+  clearSasResult: () => void;
   // Prefer sync over latency: the picture waits for the sound (soundMode.ts).
   sync: boolean;
   setSync: (sync: boolean) => void;
@@ -300,6 +308,14 @@ export interface Dashboard {
   // Whether the overlay is on screen now (the Screen tab is up): pings
   // only go out while it is.
   setStatsVisible: (visible: boolean) => void;
+}
+
+// The machine's answer to a Ctrl+Alt+Del: pressed, or why not. Numbered, so
+// the same answer twice still counts as new.
+export interface SasResult {
+  id: number;
+  sent: boolean;
+  error: string;
 }
 
 export interface AudioDevice {
@@ -388,6 +404,10 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const fileManagerRef = useRef<FileManager | null>(null);
   // File messages are opened one at a time, in the order they arrived.
   const fileChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Clipboard text and Ctrl+Alt+Del answers share the reply key's counter,
+  // so they're opened one at a time, in the order they arrived: otherwise a
+  // slow earlier one could be dropped as already seen.
+  const replyChainRef = useRef<Promise<void>>(Promise.resolve());
   const fileFrameRef = useRef<number | null>(null);
   const [shells, setShells] = useState<ShellsState>(NO_SHELLS);
   const shellsEnabledRef = useRef(false);
@@ -399,6 +419,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const audioChainRef = useRef<Promise<void>>(Promise.resolve());
   const [audioDevices, setAudioDevices] = useState<AudioDevicesState | null>(null);
   const [streamQuality, setStreamQuality] = useState<StreamQuality | null>(null);
+  const [sasResult, setSasResult] = useState<SasResult | null>(null);
+  const sasIdRef = useRef(0);
   const configChainRef = useRef<Promise<void>>(Promise.resolve());
   const [config, setConfig] = useState<ConfigState | null>(null);
   const configRef = useRef<ConfigState | null>(null);
@@ -826,6 +848,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       setMetrics(EMPTY_METRICS);
       setAudioDevices(null);
       setStreamQuality(null);
+      setSasResult(null);
       setConfig(null);
     },
     [publishFiles, publishShells],
@@ -985,12 +1008,15 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
         case "clipboard": {
           const session = sessionRef.current;
           if (viewing !== payload.deviceId || session === null) break;
-          void session.openClipboard(payload.sealed).then((opened) => {
-            if (opened === null || sessionRef.current !== session) return;
-            clipboardIdRef.current += 1;
-            const latest = { id: clipboardIdRef.current, ...opened };
-            setClipboard((prev) => ({ ...prev, waiting: false, latest }));
-          });
+          replyChainRef.current = replyChainRef.current
+            .then(() => session.openClipboard(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              clipboardIdRef.current += 1;
+              const latest = { id: clipboardIdRef.current, ...opened };
+              setClipboard((prev) => ({ ...prev, waiting: false, latest }));
+            })
+            .catch((error: unknown) => console.error("clipboard message:", error));
           break;
         }
         case "file": {
@@ -1058,6 +1084,19 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
         case "quality":
           if (viewing === payload.deviceId) setStreamQuality(parseQuality(payload));
           break;
+        case "sas": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          replyChainRef.current = replyChainRef.current
+            .then(() => session.openSas(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              sasIdRef.current += 1;
+              setSasResult({ id: sasIdRef.current, ...opened });
+            })
+            .catch((error: unknown) => console.error("Ctrl+Alt+Del answer:", error));
+          break;
+        }
         case "pong":
           if (viewing === payload.deviceId) pingRef.current.answer(payload.nonce, performance.now());
           break;
@@ -1434,7 +1473,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   // chain: it's numbered from the same counter.
   const sendSealed = useCallback(
     (
-      type: "audio_devices" | "audio_select" | "config_get" | "config_set" | "quality",
+      type: "audio_devices" | "audio_select" | "config_get" | "config_set" | "quality" | "sas",
       seal: (session: ViewSession) => Promise<string> | null,
     ): boolean => {
       const deviceId = streamingRef.current;
@@ -1476,6 +1515,12 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     },
     [sendSealed],
   );
+  const sendSas = useCallback((): boolean => {
+    const role = sessionRef.current?.role;
+    if (role !== "owner" && role !== "control") return false;
+    return sendSealed("sas", (session) => session.sealSas());
+  }, [sendSealed]);
+  const clearSasResult = useCallback((): void => setSasResult(null), []);
   const saveConfig = useCallback(
     (changes: Record<string, SettingValue>): boolean => {
       const version = configRef.current?.version;
@@ -1523,6 +1568,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     unlockSound,
     streamQuality,
     setQuality,
+    sendSas,
+    sasResult,
+    clearSasResult,
     sync,
     setSync,
     statsShown,

@@ -24,6 +24,7 @@ add_executable(hawk-service
     service/machine_key.cpp
     service/metrics.cpp
     service/power.cpp
+    service/sas.cpp
     service/websocket/websocket.cpp
     ${HAWK_VERSION_RC}
 )

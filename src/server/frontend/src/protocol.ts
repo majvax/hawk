@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -86,6 +86,9 @@ export interface Machine {
   // While online: the machine takes a quality preset from this user's role
   // (control or owner).
   quality?: boolean;
+  // While online: the machine presses Ctrl+Alt+Del for this user's role
+  // (control or owner).
+  sas?: boolean;
 }
 
 // What a viewer with control can ask the machine to do with itself.
@@ -133,7 +136,10 @@ export type DashboardEvent =
   | { type: "pong"; deviceId: string; nonce: string }
   // What the stream is encoded at: on starting to watch, and on every
   // change (a preset chosen, Auto's next step). See quality.ts.
-  | { type: "quality"; deviceId: string; preset: string; bitrate: number; fps: number };
+  | { type: "quality"; deviceId: string; preset: string; bitrate: number; fps: number }
+  // Whether the machine pressed this viewer's Ctrl+Alt+Del, sealed for it
+  // (ViewSession.openSas).
+  | { type: "sas"; deviceId: string; sealed: string };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -186,6 +192,9 @@ export type DashboardCommand =
   // Picks the stream's quality preset (ViewSession.sealQuality); control and
   // owner, no fresh factor needed. Everyone watching shares the stream.
   | { type: "quality"; deviceId: string; sealed: string }
+  // Presses Ctrl+Alt+Del on the machine (ViewSession.sealSas); control and
+  // owner, elevated, as input is.
+  | { type: "sas"; deviceId: string; sealed: string }
   // Owner only: install the update the machine is holding. The machine
   // checks the release's signature itself.
   | { type: "install_update"; deviceId: string };

@@ -52,6 +52,8 @@ constexpr std::string_view kConfigGetAad = "hawk-config-get-v1";
 constexpr std::string_view kConfigSetAad = "hawk-config-set-v1";
 constexpr std::string_view kConfigAad = "hawk-config-v1";
 constexpr std::string_view kQualityAad = "hawk-quality-v1";
+// Ctrl+Alt+Del, and the machine's answer to it on the reply key.
+constexpr std::string_view kSasAad = "hawk-sas-v1";
 // A file- or shell-channel plaintext: op, header length (u16, big-endian),
 // the JSON header, then bytes.
 constexpr std::size_t kChannelPreamble = 3;
@@ -63,6 +65,15 @@ constexpr std::byte kClipboardSet{1};
 constexpr std::byte kClipboardGet{2};
 constexpr std::byte kClipboardText{3};
 constexpr std::byte kClipboardPush{4};
+
+// The first byte of the answer to a Ctrl+Alt+Del: pressed, or not (with why,
+// in UTF-8, after it). Must match SAS_SENT and SAS_FAILED in
+// frontend/src/e2e.ts.
+constexpr std::byte kSasSent{1};
+constexpr std::byte kSasFailed{2};
+// The longest reason sent with it; the relay drops a longer answer
+// (MAX_SEALED_SAS_REPLY_LEN).
+constexpr std::size_t kMaxSasError = 512;
 
 // A single-view grant still admits its viewer this long after their
 // viewing ends, so a dashboard that dropped and reconnects isn't refused.
@@ -753,7 +764,10 @@ struct ViewerHub::Impl {
     }
 
     // counter || AES-GCM(reply key, op || text), base64: for one viewer.
-    [[nodiscard]] static std::string seal_reply(Viewer& viewer, std::byte op, std::string_view text) {
+    // Clipboard text and Ctrl+Alt+Del answers share the key and its counter,
+    // and are told apart by `aad`.
+    [[nodiscard]] static std::string seal_reply(Viewer& viewer, std::string_view aad, std::byte op,
+                                                std::string_view text) {
         crypto::Bytes plain;
         plain.reserve(1 + text.size());
         plain.push_back(op);
@@ -762,7 +776,7 @@ struct ViewerHub::Impl {
         const auto    counter = ++viewer.reply_counter;
         crypto::Bytes out;
         put_u64_be(out, counter);
-        const auto sealed = viewer.reply_key.encrypt(counter_nonce(counter), plain, crypto::as_bytes(kClipboardAad));
+        const auto sealed = viewer.reply_key.encrypt(counter_nonce(counter), plain, crypto::as_bytes(aad));
         out.insert(out.end(), sealed.begin(), sealed.end());
         return crypto::base64_encode(out);
     }
@@ -1142,7 +1156,8 @@ void ViewerHub::deliver_clipboard(std::string_view text, bool pushed) {
         spdlog::info("clipboard: {} viewer {} ({}) the clipboard ({} bytes)", pushed ? "pushed to" : "sent", id,
                      viewer.fingerprint, prefix.size());
         impl.send(to_json(ClipboardMessage{
-            .viewer = id, .sealed = Impl::seal_reply(viewer, pushed ? kClipboardPush : kClipboardText, prefix)}));
+            .viewer = id,
+            .sealed = Impl::seal_reply(viewer, kClipboardAad, pushed ? kClipboardPush : kClipboardText, prefix)}));
     }
 }
 
@@ -1458,6 +1473,33 @@ std::optional<QualityPreset> ViewerHub::quality(std::uint64_t viewer, std::strin
     }
     spdlog::info("quality: viewer {} ({}) chose {}", viewer, found->second.fingerprint, to_string(*preset));
     return preset;
+}
+
+bool ViewerHub::sas(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused || !Impl::can_control(found->second)) {
+        spdlog::warn("sas: viewer {} asked for Ctrl+Alt+Del, which its role doesn't allow; ignored", viewer);
+        return false;
+    }
+    if (!Impl::open_request(found->second, sealed, kSasAad).has_value()) {
+        return false;
+    }
+    spdlog::info("sas: viewer {} ({}) pressed Ctrl+Alt+Del", viewer, found->second.fingerprint);
+    return true;
+}
+
+void ViewerHub::send_sas_result(std::uint64_t viewer, std::string_view error) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused) {
+        return;
+    }
+    const auto sealed = Impl::seal_reply(found->second, kSasAad, error.empty() ? kSasSent : kSasFailed,
+                                         utf8_prefix(error, kMaxSasError));
+    impl.send(to_json(ChannelOutMessage{.type = "sas", .viewer = viewer, .sealed = sealed}));
 }
 
 void ViewerHub::set_clipboard(const ClipboardConfig& clipboard) {

@@ -20,7 +20,7 @@ use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::protocol::{
     AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, PING_PROTOCOL, POWER_PROTOCOL,
-    QUALITY_PROTOCOL, SignedView, is_audio, is_keyframe, timestamp_us,
+    QUALITY_PROTOCOL, SAS_PROTOCOL, SignedView, is_audio, is_keyframe, timestamp_us,
 };
 use crate::quality::{Meter, Preset, RateController, TICK_US};
 
@@ -195,6 +195,7 @@ pub enum Answer {
     StreamKey { wrapped_key: String },
     Clipboard { sealed: String },
     Pong { nonce: String },
+    Sas { sealed: String },
 }
 
 #[derive(Default)]
@@ -249,6 +250,7 @@ impl Inner {
             ping: device.is_some_and(|device| device.protocol >= PING_PROTOCOL),
             config: row.role.can_control() && device.is_some_and(|device| device.protocol >= CONFIG_PROTOCOL),
             quality: row.role.can_control() && device.is_some_and(|device| device.protocol >= QUALITY_PROTOCOL),
+            sas: row.role.can_control() && device.is_some_and(|device| device.protocol >= SAS_PROTOCOL),
         }
     }
 
@@ -742,6 +744,7 @@ impl Registry {
             Answer::StreamKey { wrapped_key } => DashboardEvent::StreamKey { device_id, wrapped_key },
             Answer::Clipboard { sealed } => DashboardEvent::Clipboard { device_id, sealed },
             Answer::Pong { nonce } => DashboardEvent::Pong { device_id, nonce },
+            Answer::Sas { sealed } => DashboardEvent::Sas { device_id, sealed },
             Answer::Reject { reason } => {
                 inner.detach(viewer, machine_id);
                 DashboardEvent::ViewRejected { device_id, reason }
@@ -894,6 +897,17 @@ impl Registry {
         }
         device.send(DeviceCommand::Quality { viewer: dashboard_id, sealed });
         true
+    }
+
+    /// Passes a sealed Ctrl+Alt+Del on to the machine if this dashboard may
+    /// control it and is watching it, elevated: the gate input has, since
+    /// it's a key press, and no more. Everything the screen it brings up
+    /// offers (lock, sign out, Task Manager) input reaches anyway. The
+    /// machine checks the role again.
+    pub fn sas(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let new_enough = self.lock().devices.get(machine_id).is_some_and(|device| device.protocol >= SAS_PROTOCOL);
+        new_enough
+            && self.pass_on(dashboard_id, machine_id, Role::can_control, DeviceCommand::Sas { viewer: dashboard_id, sealed })
     }
 
     /// Passes the owner's go-ahead for an update on. Anyone else is ignored.
@@ -1264,6 +1278,123 @@ mod tests {
         while next(&mut device_rx).is_some() {}
         assert!(!registry.power(dashboard, MACHINE, "sealed".to_owned()));
         assert!(next(&mut device_rx).is_none());
+    }
+
+    /// Ctrl+Alt+Del has input's gate: control (or the owner), watching,
+    /// elevated, on a machine new enough to press it.
+    #[test]
+    fn sas_needs_control_elevation_and_the_protocol() {
+        let registry = Registry::default();
+        let (mut owner, mut events) = handle(1);
+        owner.step_up = StepUp { mfa: true, at: None };
+        let dashboard = registry.add_dashboard(owner, vec![row(Role::Owner)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: SAS_PROTOCOL }, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| view.sas));
+        assert!(!registry.sas(dashboard, MACHINE, "sealed".to_owned()), "not watching");
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.sas(dashboard, MACHINE, "sealed".to_owned()), "not elevated");
+        assert!(next(&mut device_rx).is_none());
+        registry.note_step_up(1, auth::now());
+        registry.elevate(dashboard, MACHINE);
+        assert!(registry.sas(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Sas { viewer, .. }) if viewer == dashboard));
+
+        // A view share is never offered it, and the relay drops it anyway.
+        let registry = Registry::default();
+        let (handle, mut events) = handle(2);
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::View)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: SAS_PROTOCOL }, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| !view.sas));
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.sas(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        // An older machine would ignore it; it isn't offered or passed on.
+        let (registry, dashboard, _connection, mut device_rx, mut events) = watching_quality(Role::Control);
+        assert!(last_view(&mut events).is_some_and(|view| !view.sas));
+        assert!(!registry.sas(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// The machine's answer goes to the viewer that asked, and nobody else.
+    #[test]
+    fn sas_answers_reach_only_the_viewer() {
+        let (registry, dashboard, _device_rx, mut events) = watching(Role::Control);
+        while events.try_recv().is_ok() {}
+        registry.answer(MACHINE, dashboard, Answer::Sas { sealed: "done".to_owned() });
+        let Ok(Outbound::Event(event)) = events.try_recv() else { panic!("no answer") };
+        assert!(matches!(*event, DashboardEvent::Sas { ref sealed, .. } if sealed == "done"));
+        registry.answer(MACHINE, dashboard + 1, Answer::Sas { sealed: "stray".to_owned() });
+        assert!(events.try_recv().is_err());
+    }
+
+    fn sas_events(events: &mut mpsc::UnboundedReceiver<Outbound>) -> Vec<String> {
+        let mut found = Vec::new();
+        while let Ok(outbound) = events.try_recv() {
+            if let Outbound::Event(event) = outbound
+                && let DashboardEvent::Sas { sealed, .. } = *event
+            {
+                found.push(sealed);
+            }
+        }
+        found
+    }
+
+    /// Two dashboards watching: the one that asked gets the answer, the
+    /// other (the owner, even) sees none of it.
+    #[test]
+    fn sas_answers_skip_other_viewers() {
+        let registry = Registry::default();
+        let (owner, mut owner_events) = handle(1);
+        let owner = registry.add_dashboard(owner, vec![row(Role::Owner)]);
+        let (control, mut control_events) = handle(2);
+        let control = registry.add_dashboard(control, vec![row(Role::Control)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: SAS_PROTOCOL }, outbound);
+        assert!(registry.start_view(owner, MACHINE, join()));
+        assert!(registry.start_view(control, MACHINE, join()));
+        while next(&mut device_rx).is_some() {}
+        assert!(registry.sas(control, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Sas { viewer, .. }) if viewer == control));
+        sas_events(&mut owner_events);
+        sas_events(&mut control_events);
+        registry.answer(MACHINE, control, Answer::Sas { sealed: "pressed".to_owned() });
+        assert_eq!(sas_events(&mut control_events), ["pressed"]);
+        assert!(sas_events(&mut owner_events).is_empty());
+    }
+
+    /// Dev gets a shell and files, never input, so never Ctrl+Alt+Del; and
+    /// a viewer that stopped watching can't press it any more.
+    #[test]
+    fn sas_refused_to_dev_and_after_watching_ends() {
+        let registry = Registry::default();
+        let (dev, mut events) = handle(2);
+        let dev = registry.add_dashboard(dev, vec![row(Role::Dev)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: SAS_PROTOCOL }, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| !view.sas));
+        registry.start_view(dev, MACHINE, join());
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.sas(dev, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        let registry = Registry::default();
+        let (control, _events) = handle(2);
+        let control = registry.add_dashboard(control, vec![row(Role::Control)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: SAS_PROTOCOL }, outbound);
+        assert!(registry.start_view(control, MACHINE, join()));
+        assert!(registry.sas(control, MACHINE, "sealed".to_owned()));
+        registry.stop_view(control, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.sas(control, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+        // Nor on a machine that isn't connected.
+        assert!(!registry.sas(control, "another-machine", "sealed".to_owned()));
     }
 
     /// Anyone watching may see the output devices; only control may choose.

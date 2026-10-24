@@ -23,7 +23,7 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_CONFIG_LEN, MAX_SEALED_CONFIG_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_QUALITY_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
+    MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_CONFIG_LEN, MAX_SEALED_CONFIG_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_QUALITY_LEN, MAX_SEALED_SAS_LEN, MAX_SEALED_SAS_REPLY_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
 use crate::registry::{
@@ -374,6 +374,10 @@ fn route_device_answer(
         Ok(DeviceMessage::Pong { viewer, nonce }) if nonce.len() <= MAX_PING_NONCE_LEN => {
             (viewer, Answer::Pong { nonce })
         }
+        // One per Ctrl+Alt+Del, which the relay passed on within its budget.
+        Ok(DeviceMessage::Sas { viewer, sealed }) if sealed.len() <= MAX_SEALED_SAS_REPLY_LEN => {
+            (viewer, Answer::Sas { sealed })
+        }
         Ok(DeviceMessage::Clipboard { viewer, sealed }) if sealed.len() <= MAX_SEALED_CLIPBOARD_LEN => {
             if !clipboard_budgets.entry(viewer).or_insert_with(Budget::clipboard).take() {
                 debug!(%machine_id, viewer, "relay: dropping clipboard text over the budget");
@@ -521,6 +525,7 @@ async fn handle_dashboard(
     let mut config_budget = Budget::config();
     let mut ping_budget = Budget::ping();
     let mut quality_budget = Budget::quality();
+    let mut sas_budget = Budget::sas();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -619,6 +624,12 @@ async fn handle_dashboard(
                     registry.quality(dashboard_id, &device_id, sealed);
                 }
             }
+            Ok(DashboardCommand::Sas { device_id, sealed }) => {
+                // By hand: each one switches the machine to its secure desktop.
+                if sealed.len() <= MAX_SEALED_SAS_LEN && sas_budget.take() {
+                    registry.sas(dashboard_id, &device_id, sealed);
+                }
+            }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
                 warn!(%error, "dashboard: received invalid command (further ones are logged at debug)")
             }
@@ -675,6 +686,11 @@ impl Budget {
         Self::new(1.0, 5.0)
     }
 
+    /// Ctrl+Alt+Del from one dashboard, pressed by hand.
+    fn sas() -> Self {
+        Self::new(1.0, 3.0)
+    }
+
     /// Pings from one dashboard: the stats overlay sends one a second.
     fn ping() -> Self {
         Self::new(2.0, 5.0)
@@ -717,4 +733,24 @@ impl Budget {
 
 fn close(code: u16, reason: &'static str) -> Message {
     Message::Close(Some(CloseFrame { code, reason: reason.into() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ctrl+Alt+Del: three at once, then one a second.
+    #[test]
+    fn sas_budget_allows_a_burst_of_three_then_one_a_second() {
+        let mut budget = Budget::sas();
+        assert!(budget.take() && budget.take() && budget.take());
+        assert!(!budget.take(), "a fourth press within the burst got through");
+        budget.refilled -= Duration::from_millis(1100);
+        assert!(budget.take());
+        assert!(!budget.take());
+        // Idle for long: still no more than the burst.
+        budget.refilled -= Duration::from_secs(60);
+        assert!(budget.take() && budget.take() && budget.take());
+        assert!(!budget.take());
+    }
 }

@@ -12,7 +12,7 @@ use crate::quality::Preset;
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The first protocol whose machines take power actions.
 pub const POWER_PROTOCOL: u32 = 3;
@@ -31,6 +31,9 @@ pub const CONFIG_PROTOCOL: u32 = 6;
 /// The first protocol whose machines take a quality preset from a viewer,
 /// say what they stream at, and follow the relay's bitrate on Auto.
 pub const QUALITY_PROTOCOL: u32 = 7;
+
+/// The first protocol whose machines press Ctrl+Alt+Del for a viewer.
+pub const SAS_PROTOCOL: u32 = 8;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -139,6 +142,9 @@ pub enum DeviceMessage {
     /// whenever one of them changes. Not sealed: the relay sees roughly
     /// this from the frames' sizes anyway, and runs Auto on it.
     Quality { preset: Preset, bitrate: u32, fps: u32 },
+    /// Whether Ctrl+Alt+Del was pressed, and why not, sealed for the viewer
+    /// that asked.
+    Sas { viewer: u64, sealed: String },
     /// The machine is about to restart (or shut down): Windows has accepted
     /// it, and the connection drops shortly. Only ever about the machine
     /// itself, so nothing a viewer could be misled by.
@@ -215,6 +221,9 @@ pub enum DeviceCommand {
     /// (no fresh factor needed: it changes nothing but the picture); the
     /// machine checks the role again.
     Quality { viewer: u64, sealed: String },
+    /// Ctrl+Alt+Del, sealed by the viewer. Passed on for control, elevated,
+    /// as input is (it's a key press); the machine checks the role again.
+    Sas { viewer: u64, sealed: String },
     /// Auto's new target, in bits per second, from the relay's controller
     /// (crate::quality). The machine ignores it on any other preset and
     /// keeps it within Auto's range: all a relay could do with it is make
@@ -291,6 +300,11 @@ pub const MAX_SEALED_CONFIG_REQUEST_LEN: usize = (8 + 16 * 1024 + 16_usize).div_
 pub const MAX_SEALED_CONFIG_LEN: usize = (8 + 3 + 65_535 + 16_usize).div_ceil(3) * 4;
 /// A viewer's quality preset: counter, its name, and the tag, in base64.
 pub const MAX_SEALED_QUALITY_LEN: usize = (8 + 16 + 16_usize).div_ceil(3) * 4;
+/// A viewer's Ctrl+Alt+Del: nothing but the counter and the tag, in base64.
+pub const MAX_SEALED_SAS_LEN: usize = (8 + 16_usize).div_ceil(3) * 4;
+/// The machine's answer to it: counter, a status byte, a reason of up to
+/// 512 bytes, and the tag, in base64.
+pub const MAX_SEALED_SAS_REPLY_LEN: usize = (8 + 1 + 512 + 16_usize).div_ceil(3) * 4;
 /// A ping's nonce, either way: a counter, in decimal.
 pub const MAX_PING_NONCE_LEN: usize = 32;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
@@ -366,6 +380,9 @@ pub enum DashboardCommand {
     /// A sealed quality preset. Only passed on while viewing the machine
     /// with a control (or owner) role.
     Quality { device_id: String, sealed: String },
+    /// A sealed Ctrl+Alt+Del. Only passed on while viewing the machine with
+    /// a control (or owner) role, elevated, like input.
+    Sas { device_id: String, sealed: String },
     /// The owner asks the machine to install the update it's holding.
     InstallUpdate { device_id: String },
 }
@@ -432,6 +449,9 @@ pub struct MachineView {
     /// While online: the machine takes a quality preset from this user's
     /// role (control or owner).
     pub quality: bool,
+    /// While online: the machine presses Ctrl+Alt+Del for this user's role
+    /// (control or owner).
+    pub sas: bool,
 }
 
 /// Messages pushed to connected dashboards.
@@ -487,6 +507,8 @@ pub enum DashboardEvent {
     /// What the stream this dashboard watches is encoded at (see
     /// DeviceMessage::Quality): when it starts watching, and on every change.
     Quality { device_id: String, preset: Preset, bitrate: u32, fps: u32 },
+    /// The machine's answer to this dashboard's Ctrl+Alt+Del, sealed for it.
+    Sas { device_id: String, sealed: String },
 }
 
 /// Binary video frame produced by hawk-service (BuildVideoFrame):
@@ -685,6 +707,21 @@ mod tests {
             serde_json::to_value(event).unwrap(),
             serde_json::json!({"type":"quality","deviceId":"m1","preset":"low","bitrate":1_000_000,"fps":30})
         );
+    }
+
+    #[test]
+    fn sas_round_trips() {
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"sas","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::Sas { .. }));
+        let json = serde_json::to_value(DeviceCommand::Sas { viewer: 7, sealed: "x".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"sas","viewer":7,"sealed":"x"}));
+        let message: DeviceMessage = serde_json::from_str(r#"{"type":"sas","viewer":3,"sealed":"y"}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::Sas { viewer: 3, .. }));
+        let event = DashboardEvent::Sas { device_id: "m1".into(), sealed: "y".into() };
+        assert_eq!(serde_json::to_value(event).unwrap(), serde_json::json!({"type":"sas","deviceId":"m1","sealed":"y"}));
+        // The request is only a counter and a tag.
+        assert_eq!(BASE64.encode([0u8; 8 + 16]).len(), MAX_SEALED_SAS_LEN);
     }
 
     #[test]

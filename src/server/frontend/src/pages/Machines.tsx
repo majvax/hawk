@@ -667,6 +667,9 @@ function Viewer({
     setStatsVisible,
     streamQuality,
     setQuality,
+    sendSas,
+    sasResult,
+    clearSasResult,
   } = dashboard;
   const requestStepUp = useStepUp();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -683,6 +686,9 @@ function Viewer({
   // The power action waiting for its second click.
   const [armed, setArmed] = useState<PowerAction | null>(null);
   const [powerNote, setPowerNote] = useState<string | null>(null);
+  const [sasNote, setSasNote] = useState<string | null>(null);
+  // When the Ctrl+Alt+Del waiting for its answer was sent; 0 for none.
+  const [sasWaiting, setSasWaiting] = useState(0);
 
   const onScreen = shown && viewing !== null && selected?.id === viewing.id;
   // Nothing to send input to unless a picture is actually up, and the relay
@@ -724,6 +730,9 @@ function Viewer({
   // everyone watching, on a machine new enough to take one. No fresh
   // factor: it only changes how the picture is encoded.
   const canChooseQuality = secured && viewing.quality === true && roleCanControl(security.role);
+  // Ctrl+Alt+Del: control, elevated, as with input (it's a key press), on a
+  // machine new enough to press it. The machine checks the role again.
+  const canSas = secured && viewing.sas === true && roleCanControl(security.role) && elevated;
 
   const canSendFiles = secured && files.enabled && elevated;
   // Dropping files on the screen sends them; the Files tab follows them.
@@ -767,6 +776,8 @@ function Viewer({
     setQualityMenu(false);
     setArmed(null);
     setPowerNote(null);
+    setSasNote(null);
+    setSasWaiting(0);
   }, [viewing?.id]);
 
   // A second click has to come soon after the first.
@@ -787,6 +798,37 @@ function Viewer({
     setPowerMenu(false);
     if (sendPower(action)) setPowerNote(item.sent(viewing.name));
   };
+
+  const pressSas = (): void => {
+    if (!sendSas()) return;
+    setSasNote("Pressing Ctrl+Alt+Del…");
+    setSasWaiting(Date.now());
+  };
+
+  // The relay drops a request it won't pass on without a word, and a
+  // machine can go away before answering.
+  useEffect(() => {
+    if (sasWaiting === 0) return;
+    const timer = window.setTimeout(() => {
+      setSasWaiting(0);
+      setSasNote("No answer from the machine.");
+    }, ANSWER_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [sasWaiting]);
+
+  // The machine's answer: pressed, or why not (most often a policy of
+  // Windows that the message says how to change).
+  useEffect(() => {
+    if (sasResult === null) return;
+    setSasNote(
+      sasResult.sent
+        ? "Pressed Ctrl+Alt+Del: the machine shows its sign-in or security screen."
+        : `Ctrl+Alt+Del wasn't pressed. ${sasResult.error}`,
+    );
+    setSasWaiting(0);
+    // Shown once: a view opened later doesn't bring it back.
+    clearSasResult();
+  }, [sasResult, clearSasResult]);
 
   // Text from the machine: straight onto this computer's clipboard where
   // the browser allows it, otherwise shown to copy by hand.
@@ -855,7 +897,13 @@ function Viewer({
     }
     return sendClipboard(text);
   };
-  const input = useRemoteInput(canvasRef, canControl, sendInput, canPaste ? pasteOnKey : null);
+  const input = useRemoteInput(
+    canvasRef,
+    canControl,
+    sendInput,
+    canPaste ? pasteOnKey : null,
+    canSas ? pressSas : null,
+  );
 
   const getClipboard = (): void => {
     if (sendClipboard(null)) setClipNote(null);
@@ -1020,6 +1068,11 @@ function Viewer({
               }}
             >
               Power ▾
+            </button>
+          )}
+          {canSas && (
+            <button type="button" title="Or press Ctrl+Alt+End on the screen" onClick={pressSas}>
+              Ctrl+Alt+Del
             </button>
           )}
           {onScreen && sound.supported && (
@@ -1249,6 +1302,7 @@ function Viewer({
           )}
           {clipNote !== null && <span>{clipNote}</span>}
           {powerNote !== null && <span>{powerNote}</span>}
+          {sasNote !== null && <span>{sasNote}</span>}
           {input.active && (
             <span>
               The machine's own pointer isn't in the picture; yours stands in for it.{" "}
@@ -1260,6 +1314,12 @@ function Viewer({
                 <>
                   <kbd>Ctrl+W</kbd> <kbd>Alt+Tab</kbd> and <kbd>Ctrl+Alt+Del</kbd> stay on this computer; full
                   screen forwards most of them.
+                </>
+              )}
+              {canSas && (
+                <>
+                  {" "}
+                  <kbd>Ctrl+Alt+End</kbd> presses Ctrl+Alt+Del on the machine.
                 </>
               )}
             </span>

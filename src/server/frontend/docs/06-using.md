@@ -29,8 +29,10 @@ control**, enter a code from your authenticator first (see
 - **Full screen** also captures the shortcuts the browser normally keeps,
   such as `Alt+Tab`, `Ctrl+W` and `Esc`, in Chromium-based browsers
   (Chrome, Edge). **Hold `Esc`** to leave full screen.
-- **`Ctrl+Alt+Del` can't be sent.** Windows reserves it for the real
-  keyboard.
+- **`Ctrl+Alt+Del` stays on your computer.** To press it on the machine,
+  use the **Ctrl+Alt+Del** button above the screen, or press
+  `Ctrl+Alt+End` on the screen, as in Remote Desktop. See
+  [Ctrl+Alt+Del](#ctrl-alt-del).
 - Your own mouse pointer stands in for the machine's. People only
   watching see no pointer.
 
@@ -115,12 +117,25 @@ When nobody is signed in, after a restart, a crash or a sign-out, the
 screen shows the Windows sign-in screen. Click it and type the password
 as you would at the PC. When the session opens, the view follows it.
 
-This works unless the PC asks for `Ctrl+Alt+Del` before signing in,
-because the dashboard can't send it. Turning that requirement off is a
-trade-off you have to choose yourself. The requirement protects against
-fake sign-in screens from someone at the PC. To turn it off, open
-`secpol.msc` > Local Policies > Security Options and enable
-**Interactive logon: Do not require CTRL+ALT+DEL**.
+If the PC asks for `Ctrl+Alt+Del` before signing in, press the
+**Ctrl+Alt+Del** button above the screen (or `Ctrl+Alt+End`): the
+machine has Windows press it, and the password box comes up. Leave that
+requirement on: it protects against fake sign-in screens.
+
+## Ctrl+Alt+Del
+
+**Ctrl+Alt+Del** above the screen (needs control, like the mouse and
+keyboard) has Windows press `Ctrl+Alt+Del` on the machine, the way the
+real keyboard would: the password box at a sign-in screen that asks for
+it, or the security options (Lock, Switch user, Sign out, Task Manager)
+while someone is signed in. With the screen clicked, `Ctrl+Alt+End` does
+the same. A message under the screen says whether it was pressed.
+
+Windows only lets a service press it when its policy allows that, and
+`hawk-setup install machine` turns it on. If the message says the machine
+doesn't allow it, see
+[troubleshooting](/docs/troubleshooting#ctrl-alt-del-does-nothing). A
+machine older than this dashboard has no button until it's updated.
 
 ## Power
 

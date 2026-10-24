@@ -514,6 +514,111 @@ fn unregister_uninstall() {
     let _ = RegKey::predef(HKEY_LOCAL_MACHINE).delete_subkey_all(UNINSTALL_KEY);
 }
 
+/// Windows' "Disable or enable software Secure Attention Sequence" policy.
+/// The service's SendSAS (Ctrl+Alt+Del from the live view) does nothing
+/// unless it's 1 (services) or 3 (services and ease of access apps); unset
+/// is 0 (none), and 2 is ease of access apps alone.
+const SAS_POLICY_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+const SAS_POLICY_VALUE: &str = "SoftwareSASGeneration";
+/// In the uninstall key, only once hawk-setup changed the policy: what it
+/// was before ("" for unset), so uninstalling can put it back.
+const SAS_BEFORE_VALUE: &str = "SoftwareSASGenerationBefore";
+
+/// What the policy has to become for services to send Ctrl+Alt+Del, giving
+/// nothing else: None when they already may, ease of access apps kept when
+/// they had it.
+fn sas_policy_needed(current: Option<u32>) -> Option<u32> {
+    match current {
+        Some(1 | 3) => None,
+        Some(2) => Some(3),
+        _ => Some(1),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SasRestore {
+    Leave,
+    Remove,
+    Set(u32),
+}
+
+/// What uninstalling does to the policy hawk-setup changed from `before`:
+/// put it back, unless it isn't what hawk-setup set any more, in which case
+/// someone changed it since and meant to.
+fn sas_policy_restore(before: Option<u32>, current: Option<u32>) -> SasRestore {
+    if sas_policy_needed(before).is_none_or(|set| current != Some(set)) {
+        return SasRestore::Leave;
+    }
+    before.map_or(SasRestore::Remove, SasRestore::Set)
+}
+
+fn read_sas_policy(key: &winreg::RegKey) -> Option<u32> {
+    key.get_value::<u32, _>(SAS_POLICY_VALUE).ok()
+}
+
+/// Lets services send Ctrl+Alt+Del, and remembers what the policy was. Only
+/// warns on failure: the rest of Hawk works without it, and the live view
+/// says why Ctrl+Alt+Del didn't happen.
+fn allow_software_sas(report: &Report) {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    let changed = allow_software_sas_at(&RegKey::predef(HKEY_LOCAL_MACHINE), SAS_POLICY_KEY, UNINSTALL_KEY);
+    match changed {
+        Ok(Some(value)) => report.detail(format!(
+            "Let services send Ctrl+Alt+Del ({SAS_POLICY_VALUE} = {value}), for Ctrl+Alt+Del from the live view"
+        )),
+        Ok(None) => {}
+        Err(error) => report.warn(format!(
+            "Couldn't let services send Ctrl+Alt+Del ({error}); Ctrl+Alt+Del from the live view won't work"
+        )),
+    }
+}
+
+/// Puts the policy back as it was before hawk-setup changed it, if it did
+/// and nobody has changed it since. Before the uninstall key goes.
+fn restore_software_sas(report: &Report) {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    match restore_software_sas_at(&RegKey::predef(HKEY_LOCAL_MACHINE), SAS_POLICY_KEY, UNINSTALL_KEY) {
+        None => {}
+        Some(Ok(())) => report.detail("Put the Ctrl+Alt+Del policy back as it was"),
+        Some(Err(error)) => {
+            report.warn(format!("Couldn't put the Ctrl+Alt+Del policy back ({SAS_POLICY_VALUE}): {error}"))
+        }
+    }
+}
+
+/// allow_software_sas under `root` (HKLM, or a scratch key in tests): the
+/// value it set, or None when the policy already allowed services.
+fn allow_software_sas_at(root: &winreg::RegKey, policy_key: &str, uninstall_key: &str) -> Result<Option<u32>, String> {
+    use winreg::enums::{KEY_READ, KEY_WRITE};
+    let (policy, _) =
+        root.create_subkey_with_flags(policy_key, KEY_READ | KEY_WRITE).map_err(|error| error.to_string())?;
+    let before = read_sas_policy(&policy);
+    let Some(value) = sas_policy_needed(before) else { return Ok(None) };
+    let (uninstall, _) = root.create_subkey(uninstall_key).map_err(|error| error.to_string())?;
+    uninstall
+        .set_value(SAS_BEFORE_VALUE, &before.map(|before| before.to_string()).unwrap_or_default())
+        .map_err(|error| error.to_string())?;
+    policy.set_value(SAS_POLICY_VALUE, &value).map_err(|error| error.to_string())?;
+    Ok(Some(value))
+}
+
+/// restore_software_sas under `root`: None when there was nothing to put
+/// back (no or unreadable record, or the policy changed since).
+fn restore_software_sas_at(root: &winreg::RegKey, policy_key: &str, uninstall_key: &str) -> Option<std::io::Result<()>> {
+    use winreg::enums::{KEY_READ, KEY_WRITE};
+    let uninstall = root.open_subkey(uninstall_key).ok()?;
+    let before = uninstall.get_value::<String, _>(SAS_BEFORE_VALUE).ok()?;
+    let before = if before.is_empty() { None } else { Some(before.parse().ok()?) };
+    let policy = root.open_subkey_with_flags(policy_key, KEY_READ | KEY_WRITE).ok()?;
+    Some(match sas_policy_restore(before, read_sas_policy(&policy)) {
+        SasRestore::Leave => return None,
+        SasRestore::Remove => policy.delete_value(SAS_POLICY_VALUE),
+        SasRestore::Set(value) => policy.set_value(SAS_POLICY_VALUE, &value),
+    })
+}
+
 /// Refused when someone other than SYSTEM or the administrators owns it:
 /// its update feed and key decide what runs as SYSTEM.
 fn read_config() -> Result<toml_edit::DocumentMut, String> {
@@ -696,6 +801,7 @@ pub fn install(options: InstallOptions, report: &Report) -> Result<(), String> {
     register_service(report)?;
     save_installed(&version)?;
     register_uninstall(&version)?;
+    allow_software_sas(report);
     // Whatever status a previous install left would read as this one's.
     let _ = fs::remove_file(data_dir().join("status.json"));
     start_service()?;
@@ -895,6 +1001,7 @@ pub fn uninstall(keep_data: bool, report: &Report) -> Result<(), String> {
             report.detail(format!("Removed {}", data.display()));
         }
     }
+    restore_software_sas(report);
     unregister_uninstall();
     remove_program_files(report)?;
     report.ok(if keep_data {
@@ -1011,6 +1118,166 @@ mod tests {
             assert_eq!(windows::other_trustees(&file).unwrap(), Vec::<String>::new(), "{}", path.display());
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Services get Ctrl+Alt+Del and nothing more: a policy that already
+    /// allows it is left as it is, and ease of access apps keep theirs.
+    #[test]
+    fn sas_policy_changes_as_little_as_it_can() {
+        assert_eq!(sas_policy_needed(None), Some(1));
+        assert_eq!(sas_policy_needed(Some(0)), Some(1));
+        assert_eq!(sas_policy_needed(Some(1)), None);
+        assert_eq!(sas_policy_needed(Some(2)), Some(3));
+        assert_eq!(sas_policy_needed(Some(3)), None);
+    }
+
+    /// Uninstalling undoes hawk-setup's change, and only while it's still
+    /// there to undo.
+    #[test]
+    fn sas_policy_is_put_back_unless_changed_since() {
+        assert_eq!(sas_policy_restore(None, Some(1)), SasRestore::Remove);
+        assert_eq!(sas_policy_restore(Some(0), Some(1)), SasRestore::Set(0));
+        assert_eq!(sas_policy_restore(Some(2), Some(3)), SasRestore::Set(2));
+        // Someone set it since: theirs stays.
+        assert_eq!(sas_policy_restore(None, Some(3)), SasRestore::Leave);
+        assert_eq!(sas_policy_restore(None, None), SasRestore::Leave);
+        assert_eq!(sas_policy_restore(Some(2), Some(1)), SasRestore::Leave);
+        // hawk-setup never changes a policy that already allowed services.
+        assert_eq!(sas_policy_restore(Some(1), Some(1)), SasRestore::Leave);
+        // A value Windows doesn't define is treated as "none" and put back.
+        assert_eq!(sas_policy_needed(Some(7)), Some(1));
+        assert_eq!(sas_policy_restore(Some(7), Some(1)), SasRestore::Set(7));
+        assert_eq!(sas_policy_restore(Some(7), Some(3)), SasRestore::Leave);
+    }
+
+    /// A scratch key under HKCU standing in for HKLM, removed on drop.
+    struct ScratchKey(String);
+
+    impl ScratchKey {
+        fn new(name: &str) -> Self {
+            let path = format!(r"Software\HawkSetupTest-{}-{name}", std::process::id());
+            let _ = Self::hkcu().delete_subkey_all(&path);
+            Self(path)
+        }
+
+        fn hkcu() -> winreg::RegKey {
+            winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        }
+
+        fn root(&self) -> winreg::RegKey {
+            Self::hkcu().create_subkey(&self.0).unwrap().0
+        }
+    }
+
+    impl Drop for ScratchKey {
+        fn drop(&mut self) {
+            let _ = Self::hkcu().delete_subkey_all(&self.0);
+        }
+    }
+
+    const TEST_POLICY: &str = "Policy";
+    const TEST_UNINSTALL: &str = "Uninstall";
+
+    fn policy_of(root: &winreg::RegKey) -> Option<u32> {
+        read_sas_policy(&root.open_subkey(TEST_POLICY).unwrap())
+    }
+
+    fn before_of(root: &winreg::RegKey) -> Option<String> {
+        root.open_subkey(TEST_UNINSTALL).ok()?.get_value::<String, _>(SAS_BEFORE_VALUE).ok()
+    }
+
+    /// Installing twice keeps the original that the first install saved,
+    /// and uninstalling then puts that original back.
+    #[test]
+    fn sas_policy_install_twice_keeps_the_original() {
+        let scratch = ScratchKey::new("twice");
+        let root = scratch.root();
+        root.create_subkey(TEST_POLICY).unwrap().0.set_value(SAS_POLICY_VALUE, &0u32).unwrap();
+        assert_eq!(allow_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Ok(Some(1)));
+        assert_eq!(before_of(&root).as_deref(), Some("0"));
+        assert_eq!(allow_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Ok(None));
+        assert_eq!(before_of(&root).as_deref(), Some("0"), "the second install overwrote the original");
+        assert_eq!(policy_of(&root), Some(1));
+        assert!(matches!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Some(Ok(()))));
+        assert_eq!(policy_of(&root), Some(0));
+    }
+
+    /// Unset before: set to 1, removed again on uninstall. 2 becomes 3 and
+    /// back. Already 1 or 3: untouched, nothing recorded, nothing restored.
+    #[test]
+    fn sas_policy_round_trips_through_the_registry() {
+        let scratch = ScratchKey::new("round");
+        let root = scratch.root();
+        assert_eq!(allow_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Ok(Some(1)));
+        assert_eq!(before_of(&root).as_deref(), Some(""));
+        assert!(matches!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Some(Ok(()))));
+        assert_eq!(policy_of(&root), None);
+
+        let scratch = ScratchKey::new("two");
+        let root = scratch.root();
+        root.create_subkey(TEST_POLICY).unwrap().0.set_value(SAS_POLICY_VALUE, &2u32).unwrap();
+        assert_eq!(allow_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Ok(Some(3)));
+        assert!(matches!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Some(Ok(()))));
+        assert_eq!(policy_of(&root), Some(2));
+
+        for already in [1u32, 3] {
+            let scratch = ScratchKey::new(&format!("already{already}"));
+            let root = scratch.root();
+            root.create_subkey(TEST_POLICY).unwrap().0.set_value(SAS_POLICY_VALUE, &already).unwrap();
+            assert_eq!(allow_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Ok(None));
+            assert_eq!(before_of(&root), None);
+            assert!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL).is_none());
+            assert_eq!(policy_of(&root), Some(already));
+        }
+    }
+
+    /// A policy that isn't a DWORD reads as unset: hawk-setup replaces it
+    /// with a DWORD 1, and uninstalling removes it (the original string
+    /// isn't kept, which Windows ignored anyway).
+    #[test]
+    fn sas_policy_of_the_wrong_type_reads_as_unset() {
+        let scratch = ScratchKey::new("sz");
+        let root = scratch.root();
+        root.create_subkey(TEST_POLICY).unwrap().0.set_value(SAS_POLICY_VALUE, &"1").unwrap();
+        assert_eq!(policy_of(&root), None);
+        assert_eq!(allow_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Ok(Some(1)));
+        assert_eq!(before_of(&root).as_deref(), Some(""));
+        assert_eq!(policy_of(&root), Some(1));
+        assert!(matches!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Some(Ok(()))));
+        assert!(root.open_subkey(TEST_POLICY).unwrap().get_raw_value(SAS_POLICY_VALUE).is_err());
+
+        // 7 isn't a value Windows defines: replaced, and put back.
+        let scratch = ScratchKey::new("seven");
+        let root = scratch.root();
+        root.create_subkey(TEST_POLICY).unwrap().0.set_value(SAS_POLICY_VALUE, &7u32).unwrap();
+        assert_eq!(allow_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Ok(Some(1)));
+        assert!(matches!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL), Some(Ok(()))));
+        assert_eq!(policy_of(&root), Some(7));
+    }
+
+    /// Uninstalling with no record of the original, or one it can't read,
+    /// leaves the policy alone.
+    #[test]
+    fn sas_policy_without_a_usable_record_is_left_alone() {
+        let scratch = ScratchKey::new("missing");
+        let root = scratch.root();
+        root.create_subkey(TEST_POLICY).unwrap().0.set_value(SAS_POLICY_VALUE, &1u32).unwrap();
+        assert!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL).is_none());
+        root.create_subkey(TEST_UNINSTALL).unwrap();
+        assert!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL).is_none());
+        let (uninstall, _) = root.create_subkey(TEST_UNINSTALL).unwrap();
+        for corrupt in ["abc", "-1", "1 "] {
+            uninstall.set_value(SAS_BEFORE_VALUE, &corrupt).unwrap();
+            assert!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL).is_none(), "{corrupt:?}");
+        }
+        // A DWORD where a string was written.
+        uninstall.set_value(SAS_BEFORE_VALUE, &0u32).unwrap();
+        assert!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL).is_none());
+        assert_eq!(policy_of(&root), Some(1));
+        // And no policy key at all.
+        uninstall.set_value(SAS_BEFORE_VALUE, &"").unwrap();
+        root.delete_subkey_all(TEST_POLICY).unwrap();
+        assert!(restore_software_sas_at(&root, TEST_POLICY, TEST_UNINSTALL).is_none());
     }
 
     /// The scripts that clean up after this process quote paths with

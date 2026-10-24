@@ -69,7 +69,8 @@ Mouse and keyboard from the browser are replayed inside the interactive session 
 * **Physical keys, not characters:** keys travel as the browser's `KeyboardEvent.code` (the key's position) and are injected as PS/2 set-1 **scancodes** (`KEYEVENTF_SCANCODE`). The machine then applies its own keyboard layout, exactly as it would to a keyboard plugged into it, and games that read scancodes see what they expect.
 * **Resolution-independent pointer:** positions travel as a fraction of the captured monitor and are injected as absolute virtual-desktop coordinates (`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`), so neither side needs the other's resolution and a mode change can't put the pointer somewhere else.
 * **Nothing stays pressed:** the relay tells the machine to let go when a viewer stops watching or loses the right to control it, the browser releases what it is holding when the screen loses focus, and the helper releases everything it pressed when the pipe closes or it exits.
-* **What can't be forwarded:** `Ctrl+Alt+Del` is the secure attention sequence, which only Windows itself can generate; and shortcuts the browser keeps for itself (`Ctrl+W`, `Alt+Tab`) stay on the viewer's own machine, unless the viewer is in full screen on a Chromium browser, where the dashboard takes a keyboard lock and forwards them too.
+* **Ctrl+Alt+Del is asked for, not typed:** it's the secure attention sequence, which Winlogon only takes from the keyboard driver or from `SendSAS`, never from `SendInput`. The live view's **Ctrl+Alt+Del** button (or `Ctrl+Alt+End` on the screen, as in Remote Desktop) sends a sealed request, and the SYSTEM service calls `SendSAS(FALSE)`, which Windows only honours when the `SoftwareSASGeneration` policy allows services; `hawk-setup install machine` turns that on and puts it back on uninstall. Updates leave the policy alone, so a machine that updates into this needs `hawk-setup install machine` run once.
+* **What can't be forwarded:** shortcuts the browser keeps for itself (`Ctrl+W`, `Alt+Tab`) stay on the viewer's own machine, unless the viewer is in full screen on a Chromium browser, where the dashboard takes a keyboard lock and forwards them too.
 
 ### 4. Outbound-Only Networking
 Instead of opening firewall ports or port-forwarding a home router, both the browser and the target PC initiate outbound WebSocket connections to the self-hosted relay server. The relay handles session handshakes and pairs the two connections.
@@ -187,6 +188,7 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
 - [x] File transfer into and out of one drop folder, resumable and hash-checked, off unless the machine's config turns it on
 - [x] Remote power actions (lock, sign out, restart, shut down), reboot-and-reconnect, remote sign-in at the sign-in screen
+- [x] Ctrl+Alt+Del from the live view (`SendSAS` from the service), including at a sign-in screen that asks for it
 - [ ] Wake-on-LAN via a LAN peer, sleep and hibernate
 - [ ] Relay operations: container image, health endpoints, metrics, backups
 - [ ] Trusted devices (remember a browser after MFA)
@@ -682,11 +684,11 @@ needs a restart, or it's off.
 * **What you come back to is the sign-in screen.** That's capturable:
   Winlogon's session exists before any user logs on and the helper can be
   launched into it as SYSTEM, exactly as it already is for the lock screen.
-  Signing in remotely then works **unless the machine requires
-  `Ctrl+Alt+Del`**, which only Windows itself can generate (see *Input
-  Injection*). Turning that requirement off is the operator's decision with
-  a real trade-off, so it belongs in the docs as a documented choice, not
-  in an installer default.
+  Signing in remotely works even where the machine requires
+  `Ctrl+Alt+Del` first: the live view's **Ctrl+Alt+Del** has the service
+  call `SendSAS` (see *Input Injection*), so the requirement stays on.
+  (Originally: unless the machine requires it, which only Windows itself
+  can generate; turning the requirement off was left to the operator.)
 * **Confirmation and role.** Never offered to a **view** share; owner or
   **control** with an MFA step-up, an explicit confirm naming the machine,
   and a warning that unsaved work on the machine is the user's, not the

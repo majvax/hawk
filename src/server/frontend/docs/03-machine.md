@@ -36,8 +36,10 @@ it changes anything:
 - that the relay answers, **with the key you pinned**.
 
 Then it installs to `C:\Program Files\Hawk\Service`, registers `HawkService`
-(LocalSystem, starts at boot, restarts if it ever fails), and shows the
-machine enrolling. The service:
+(LocalSystem, starts at boot, restarts if it ever fails), lets services
+press `Ctrl+Alt+Del` (Windows' `SoftwareSASGeneration` policy, for
+[Ctrl+Alt+Del](/docs/using#ctrl-alt-del) from the live view; left alone if
+it already allows that), and shows the machine enrolling. The service:
 
 - creates the machine's key **inside the TPM**, where it can't be copied
   off the PC. Without a usable TPM, it uses the Windows software key store
@@ -107,7 +109,8 @@ the PC can change what the machine allows.
   or run hawk-setup again and choose **Uninstall**, or from an elevated
   terminal `hawk-setup uninstall machine`. It deletes the machine's key
   from the TPM too; `--keep-data` keeps the key and settings for a
-  reinstall.
+  reinstall. The `Ctrl+Alt+Del` policy goes back to what it was, unless
+  it was changed since.
 
 - **Move it to another account:** remove it in the dashboard, then enroll
   it again with a code made by the new owner. The old key is deleted from

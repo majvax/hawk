@@ -55,6 +55,8 @@ export interface RemoteInput {
 // has a keyboard lock, which the dashboard takes in full screen), and
 // Ctrl+Alt+Del is the secure attention sequence, which nothing but Windows
 // itself can send.
+// With `onSas`, Ctrl+Alt+End stands in for it, as in Remote Desktop: the
+// machine has Windows press Ctrl+Alt+Del instead (and End isn't sent).
 //
 // With `onPaste`, Ctrl+V pastes this computer's clipboard: the browser hands
 // the page its text with the paste the viewer just pressed for, `onPaste`
@@ -66,12 +68,15 @@ export function useRemoteInput(
   enabled: boolean,
   sendInput: (event: InputEvent) => void,
   onPaste: ((text: string) => boolean) | null = null,
+  onSas: (() => void) | null = null,
 ): RemoteInput {
   const [active, setActive] = useState(false);
   const sendInputRef = useRef(sendInput);
   sendInputRef.current = sendInput;
   const onPasteRef = useRef(onPaste);
   onPasteRef.current = onPaste;
+  const onSasRef = useRef(onSas);
+  onSasRef.current = onSas;
   const pasting = onPaste !== null;
 
   const release = useCallback((): void => canvasRef.current?.blur(), [canvasRef]);
@@ -206,6 +211,11 @@ export function useRemoteInput(
     };
 
     const onKeyDown = (event: KeyboardEvent): void => {
+      if (onSasRef.current !== null && isSasShortcut(event)) {
+        event.preventDefault();
+        if (!event.repeat) onSasRef.current();
+        return;
+      }
       const isPaste = event.code === "KeyV" && event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey;
       if (pasting && isPaste) {
         // Left to the browser, which answers with a paste event (above)
@@ -234,6 +244,8 @@ export function useRemoteInput(
       if (!KEY_CODE.test(event.code)) return;
       // A pasting V was tapped on its own; this one was never sent down.
       if (pasting && event.code === "KeyV" && !keysHeld.has("KeyV")) return;
+      // Nor was the End of a Ctrl+Alt+End.
+      if (event.code === "End" && !keysHeld.has("End")) return;
       keysHeld.delete(event.code);
       send({ kind: "key", code: event.code, down: false });
     };
@@ -289,6 +301,13 @@ export function useRemoteInput(
   }, [canvasRef, enabled, pasting]);
 
   return { active, release };
+}
+
+// Ctrl+Alt+End, the stand-in for Ctrl+Alt+Del.
+export function isSasShortcut(
+  event: Pick<KeyboardEvent, "code" | "ctrlKey" | "altKey" | "shiftKey" | "metaKey">,
+): boolean {
+  return event.code === "End" && event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey;
 }
 
 function preventDefault(event: Event): void {
