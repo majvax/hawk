@@ -3,13 +3,16 @@
 // and scheduled back to back on a WebAudio clock. Without a WebCodecs
 // AudioDecoder (Firefox for Android) it goes through MSE instead (MseAudio).
 //
-// It favours latency: a packet plays as soon as a small cushion allows, and
-// if the queue grows past MAX_LATENCY_S (a stall, a tab in the background)
-// the late ones are dropped to catch up. Silence on the machine sends
-// nothing, so a gap simply starts the next sound afresh.
+// A packet plays as soon as the mode's cushion allows (soundMode.ts), and
+// if the queue grows past its cap (a stall, a tab in the background) the
+// late ones are dropped to catch up. Silence on the machine sends nothing,
+// so a gap simply starts the next sound afresh. What is heard, mapped back
+// to the machine's timestamps, is the clock the picture follows in sync
+// mode (audibleStreamUs).
 
 import { MseAudio, mseSoundSupported } from "./mseAudio.js";
 import type { ParsedVideoFrame } from "./protocol.js";
+import { BUFFERING, CLOCK_IDLE_S, type SoundMode } from "./soundMode.js";
 
 export interface SoundState {
   // This browser can decode and play the sound.
@@ -21,10 +24,16 @@ export interface SoundState {
 
 const SAMPLE_RATE = 48_000;
 const CHANNELS = 2;
-// Held before the first packet after a gap, to absorb network jitter.
-const CUSHION_S = 0.08;
-// Queued further ahead than this, packets are dropped until it's caught up.
-const MAX_LATENCY_S = 0.4;
+// Scheduled sounds remembered for the clock: a second's worth.
+const MAX_ANCHORS = 50;
+
+// One scheduled sound: when it starts on the context's clock, and the
+// machine timestamp of its first sample.
+interface Anchor {
+  at: number;
+  streamUs: number;
+  duration: number;
+}
 
 type SoundBackend = "webcodecs" | "mse" | "none";
 
@@ -48,6 +57,9 @@ export class AudioPlayer {
   private readonly supported = this.backend !== "none";
   // The MSE path, in place of the context and decoder above.
   private mse: MseAudio | null = null;
+  private mode: SoundMode = "latency";
+  // Oldest first.
+  private readonly anchors: Anchor[] = [];
 
   constructor(private readonly onChange: (state: SoundState) => void) {}
 
@@ -75,12 +87,38 @@ export class AudioPlayer {
     this.publish();
   }
 
+  setMode(mode: SoundMode): void {
+    this.mode = mode;
+    this.mse?.setMode(mode);
+  }
+
+  // The machine timestamp (µs) of the sound coming out of the speakers
+  // now, or null when nothing is heard (quiet, muted here or by the
+  // browser, not started): then there's nothing for the picture to wait for.
+  audibleStreamUs(): number | null {
+    if (this.muted) return null;
+    if (this.backend === "mse") return this.mse?.audibleStreamUs() ?? null;
+    const context = this.context;
+    const last = this.anchors.at(-1);
+    if (context === null || context.state !== "running" || last === undefined) return null;
+    const heard = context.currentTime - (context.outputLatency ?? context.baseLatency ?? 0);
+    if (heard > last.at + last.duration + CLOCK_IDLE_S) return null;
+    // The sound playing now, or else the nearest one.
+    let anchor = this.anchors[0] ?? last;
+    for (const candidate of this.anchors) {
+      if (candidate.at > heard) break;
+      anchor = candidate;
+    }
+    const into = Math.min(heard - anchor.at, anchor.duration);
+    return anchor.streamUs + into * 1_000_000;
+  }
+
   // One packet, as it came off the stream.
   play(frame: ParsedVideoFrame): void {
     if (!this.supported) return;
     if (this.backend === "mse") {
-      this.mse ??= new MseAudio(this.muted, () => this.publish());
-      this.mse.push(frame.data);
+      this.mse ??= new MseAudio(this.muted, this.mode, () => this.publish());
+      this.mse.push(frame.data, frame.timestamp);
       return;
     }
     const context = this.ensureContext();
@@ -99,6 +137,7 @@ export class AudioPlayer {
   reset(): void {
     this.resetDecoder();
     this.nextTime = 0;
+    this.anchors.length = 0;
     this.closeMse();
   }
 
@@ -170,6 +209,7 @@ export class AudioPlayer {
       data.close();
       return;
     }
+    const timestamp = data.timestamp;
     const buffer = context.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
     for (let channel = 0; channel < data.numberOfChannels; channel += 1) {
       const plane = new Float32Array(data.numberOfFrames);
@@ -178,16 +218,19 @@ export class AudioPlayer {
     }
     data.close();
 
+    const { cushionS, maxLatencyS } = BUFFERING[this.mode];
     const now = context.currentTime;
     if (this.nextTime < now) {
-      this.nextTime = now + CUSHION_S; // after a gap, or running late: start afresh
-    } else if (this.nextTime - now > MAX_LATENCY_S) {
+      this.nextTime = now + cushionS; // after a gap, or running late: start afresh
+    } else if (this.nextTime - now > maxLatencyS) {
       return; // fallen behind: skip this one to catch up
     }
     const source = context.createBufferSource();
     source.buffer = buffer;
     source.connect(gain);
     source.start(this.nextTime);
+    this.anchors.push({ at: this.nextTime, streamUs: timestamp, duration: buffer.duration });
+    if (this.anchors.length > MAX_ANCHORS) this.anchors.shift();
     this.nextTime += buffer.duration;
   }
 }

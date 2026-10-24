@@ -1,4 +1,5 @@
 import { OPUS_SAMPLE_RATE, audioSegment, opusInitSegment } from "./fmp4.js";
+import { BUFFERING, CLOCK_IDLE_S, type SoundMode } from "./soundMode.js";
 
 // Plays the sound through Media Source Extensions: Opus packets muxed into
 // fragmented MP4 and fed to an <audio> element. The fallback for browsers
@@ -19,11 +20,9 @@ export function mseSoundSupported(): boolean {
 
 // 20 ms packets, as the machine encodes them.
 const PACKET_SAMPLES = OPUS_SAMPLE_RATE / 50;
-// Where playback lands after a jump to the live edge.
-const CUSHION_S = 0.08;
-// Further behind the newest packet than this, playback jumps forward. Every
-// Opus packet decodes on its own, so a seek costs nothing but the skip.
-const MAX_LATENCY_S = 0.4;
+const PACKET_S = PACKET_SAMPLES / OPUS_SAMPLE_RATE;
+// Packets remembered for the clock: a few seconds, what the buffer keeps.
+const MAX_ANCHORS = 200;
 // Played sound older than this is dropped from the buffer.
 const KEEP_BEHIND_S = 3;
 // Packets waiting this long for the source buffer means appends can't keep
@@ -35,7 +34,11 @@ export class MseAudio {
   private readonly mediaSource = new MediaSource();
   private readonly url: string;
   private sourceBuffer: SourceBuffer | null = null;
-  private readonly pending: Uint8Array[] = [];
+  private readonly pending: Array<{ packet: Uint8Array; streamUs: number }> = [];
+  // Where each appended packet starts on the media timeline, and its
+  // machine timestamp; oldest first. Quiet spells vanish from the media
+  // timeline, so every packet keeps its own.
+  private readonly anchors: Array<{ mediaS: number; streamUs: number }> = [];
   private initialised = false;
   private sequence = 0;
   private decodeTime = 0;
@@ -44,6 +47,7 @@ export class MseAudio {
 
   constructor(
     muted: boolean,
+    private mode: SoundMode,
     // Heard when `blocked` changes.
     private readonly onChange: () => void,
   ) {
@@ -63,15 +67,34 @@ export class MseAudio {
     this.audio.muted = muted;
   }
 
+  setMode(mode: SoundMode): void {
+    this.mode = mode;
+  }
+
+  // The machine timestamp (µs) of what the element plays now, or null when
+  // it isn't playing anything.
+  audibleStreamUs(): number | null {
+    const last = this.anchors.at(-1);
+    if (this.closed || this.blockedNow || this.audio.paused || last === undefined) return null;
+    const time = this.audio.currentTime;
+    if (time > last.mediaS + PACKET_S + CLOCK_IDLE_S) return null;
+    let anchor = this.anchors[0] ?? last;
+    for (const candidate of this.anchors) {
+      if (candidate.mediaS > time) break;
+      anchor = candidate;
+    }
+    return anchor.streamUs + Math.min(time - anchor.mediaS, PACKET_S) * 1_000_000;
+  }
+
   // Call from a click or a key, the only place browsers let sound start.
   unlock(): void {
     if (this.blockedNow || this.audio.paused) this.play();
   }
 
-  push(packet: Uint8Array): void {
+  push(packet: Uint8Array, streamUs: number): void {
     // Held back, it would only pile up; play() catches up when it's let go.
     if (this.closed || this.blockedNow) return;
-    this.pending.push(packet);
+    this.pending.push({ packet, streamUs });
     if (this.pending.length > MAX_PENDING) this.pending.splice(0, this.pending.length - MAX_PENDING);
     this.pump();
   }
@@ -141,7 +164,11 @@ export class MseAudio {
     } else if (this.pending.length > 0) {
       const packets = this.pending.splice(0);
       this.sequence += 1;
-      segment = audioSegment(this.sequence, this.decodeTime, PACKET_SAMPLES, packets);
+      segment = audioSegment(this.sequence, this.decodeTime, PACKET_SAMPLES, packets.map((entry) => entry.packet));
+      for (const [index, entry] of packets.entries()) {
+        this.anchors.push({ mediaS: (this.decodeTime + index * PACKET_SAMPLES) / OPUS_SAMPLE_RATE, streamUs: entry.streamUs });
+      }
+      if (this.anchors.length > MAX_ANCHORS) this.anchors.splice(0, this.anchors.length - MAX_ANCHORS);
       this.decodeTime += PACKET_SAMPLES * packets.length;
     } else {
       return;
@@ -153,14 +180,17 @@ export class MseAudio {
     }
   }
 
-  // Live sound, not a recording: never fall more than a moment behind.
+  // Live sound, not a recording: further behind the newest packet than
+  // the mode's cap, playback jumps forward to its cushion. Every Opus packet
+  // decodes on its own, so a seek costs nothing but the skip.
   private chaseLiveEdge(): void {
     const buffered = this.audio.buffered;
     if (buffered.length === 0) return;
     const end = buffered.end(buffered.length - 1);
     const start = buffered.start(buffered.length - 1);
-    if (end - this.audio.currentTime > MAX_LATENCY_S || this.audio.currentTime < start) {
-      this.audio.currentTime = Math.max(start, end - CUSHION_S);
+    const { cushionS, maxLatencyS } = BUFFERING[this.mode];
+    if (end - this.audio.currentTime > maxLatencyS || this.audio.currentTime < start) {
+      this.audio.currentTime = Math.max(start, end - cushionS);
     }
     if (this.audio.paused && !this.blockedNow) this.play();
   }

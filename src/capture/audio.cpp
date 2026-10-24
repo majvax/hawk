@@ -194,6 +194,26 @@ struct OpusEncoderDeleter {
     return id.get();
 }
 
+// A WASAPI QPC position (performance counter time in 100 ns units) on
+// steady_clock, which the stream's timestamps count on. Measured against
+// the counter rather than assumed: steady_clock reads the same counter on
+// Windows, but nothing promises the same epoch or unit.
+std::chrono::steady_clock::time_point from_qpc(UINT64 position) {
+    static const auto offset = [] {
+        LARGE_INTEGER frequency{};
+        LARGE_INTEGER counter{};
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&counter);
+        const auto steady = std::chrono::steady_clock::now();
+        const auto ticks = std::chrono::nanoseconds(static_cast<std::int64_t>(
+            static_cast<long double>(counter.QuadPart) * 1'000'000'000.0L / static_cast<long double>(frequency.QuadPart)));
+        return steady.time_since_epoch() - ticks;
+    }();
+    const auto since_counter_zero = std::chrono::nanoseconds(static_cast<std::int64_t>(position) * 100);
+    return std::chrono::steady_clock::time_point(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(since_counter_zero + offset));
+}
+
 }  // namespace
 
 struct AudioCapture::Impl {
@@ -324,6 +344,9 @@ struct AudioCapture::Impl {
         std::array<unsigned char, kMaxPacket> packet{};
         auto                              next_device_check = std::chrono::steady_clock::now() + kDeviceCheckInterval;
         Ended                             ended = Ended::stopped;
+        // When the sample just past the end of `pending` played, from the
+        // device's own timestamps where it gives them.
+        std::optional<std::chrono::steady_clock::time_point> pending_end;
 
         while (!stop.stop_requested()) {
             std::this_thread::sleep_for(kPollInterval);
@@ -334,9 +357,16 @@ struct AudioCapture::Impl {
                 BYTE*  data = nullptr;
                 UINT32 frames = 0;
                 DWORD  flags = 0;
-                status = capture_client->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
+                UINT64 qpc_position = 0;
+                status = capture_client->GetBuffer(&data, &frames, &flags, nullptr, &qpc_position);
                 if (FAILED(status)) {
                     break;
+                }
+                if ((flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0 && qpc_position != 0) {
+                    pending_end = from_qpc(qpc_position) +
+                                  std::chrono::microseconds(static_cast<std::int64_t>(frames) * 1'000'000 / format->rate);
+                } else {
+                    pending_end.reset();
                 }
                 if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0) {
                     // The buffer's contents are to be ignored: read zeros
@@ -363,8 +393,10 @@ struct AudioCapture::Impl {
 
             // Whole 20 ms frames, oldest first. What's left is the start of
             // the next one; each frame is stamped with when its first sample
-            // played, counting back from now.
+            // played, counting back from the end of what's pending: the
+            // device's timestamp of it, or now when it gave none.
             const auto   now = std::chrono::steady_clock::now();
+            const auto   end = pending_end.value_or(now);
             std::size_t  offset = 0;
             const auto   frame_values = kFrameSamples * kChannels;
             const auto   queued_frames = pending.size() / frame_values;
@@ -386,7 +418,7 @@ struct AudioCapture::Impl {
                 EncodedPacket out;
                 out.data.resize(static_cast<std::size_t>(encoded));
                 std::memcpy(out.data.data(), packet.data(), out.data.size());
-                out.timestamp = std::chrono::duration_cast<std::chrono::microseconds>(now - stream_start) - behind;
+                out.timestamp = std::chrono::duration_cast<std::chrono::microseconds>(end - stream_start) - behind;
                 if (!sink(out)) {
                     client->Stop();
                     return Ended::sink_closed;

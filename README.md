@@ -180,7 +180,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [ ] Multiple display support (per-display capture, display-aware input)
 - [x] Audio (WASAPI loopback, Opus) alongside the video stream
 - [x] Audio on the MSE fallback (Firefox for Android): Opus muxed into fragmented MP4
-- [ ] Audio follow-ups: video slewed to the audio clock, a device picker
+- [x] A/V sync: video slewed to the audio clock, a prefer latency / prefer sync toggle
+- [ ] Audio follow-up: an output device picker
 - [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
 - [x] File transfer into and out of one drop folder, resumable and hash-checked, off unless the machine's config turns it on
 - [x] Remote power actions (lock, sign out, restart, shut down), reboot-and-reconnect, remote sign-in at the sign-in screen
@@ -458,7 +459,7 @@ let the viewer choose, or see them all.
 * `displays.shareable` in the config keeps a screen private — a second
   monitor that never leaves the room even when the machine is shared.
 
-### Audio (built, except A/V sync and a device picker)
+### Audio (built, except a device picker)
 
 Built: hawk-capture captures the default render endpoint with WASAPI
 loopback on a thread of its own. It asks Windows to convert to 48 kHz
@@ -476,8 +477,14 @@ MP4 (an `Opus` track with its `dOps`) and played by an `<audio>` element
 through a MediaSource of its own, not a second track beside the video's,
 so a quiet spell can't stall the picture; it jumps forward when it falls
 400 ms behind. A default device change is followed, silence isn't sent,
-and `[[audio]] enabled` turns it off. Not yet: slewing video to the audio
-clock, the latency/sync toggle and a device picker. The original plan:
+and `[[audio]] enabled` turns it off. Packets are stamped from WASAPI's
+own QPC position, so the stamp is when the sound played, not when it was
+read. **Sync to sound** in the live view trades latency for sync: a 150 ms
+cushion, and each picture held (300 ms at most) until the sound of the
+same instant is heard; on MSE the `<video>`'s rate is steered toward the
+sound's clock instead. With no sound heard (quiet, muted) the picture runs
+free. `?debug` shows the gap as `a/v`. Not yet: a device picker. The
+original plan:
 
 * **Capture:** WASAPI loopback (`IAudioClient` with
   `AUDCLNT_STREAMFLAGS_LOOPBACK`) on the default render endpoint, encoded as

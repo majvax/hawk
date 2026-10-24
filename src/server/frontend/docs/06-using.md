@@ -44,6 +44,12 @@ off** above the screen mutes it on your side, and is remembered in this
 browser. If it says **Click for sound**, your browser is holding the sound
 back until you click the page. A quiet machine sends no sound at all.
 
+Picture and sound each play as soon as they arrive, which is what
+controlling the machine wants, so they can be a little apart. For
+watching something, turn on **Sync to sound**: the sound gets a slightly
+deeper buffer and the picture waits for it, at the cost of a little delay.
+It's remembered in this browser.
+
 Sound needs a browser that can decode it (Chrome, Edge, Firefox, on a
 phone too, recent Safari). Where it can't, the button doesn't show, and the
 picture plays as before. The machine's owner can turn sound off in the

@@ -24,6 +24,7 @@ import { EMPTY_METRICS, MetricsManager, type MetricsRange, type MetricsSender, t
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
 import { AudioPlayer, type SoundState, soundSupported } from "./audio.js";
+import type { SoundMode } from "./soundMode.js";
 import type {
   ClipboardAccess,
   DashboardCommand,
@@ -107,6 +108,13 @@ function sortByName(machines: Machine[]): Machine[] {
 // fixed clock, so an idle screen still sends frames.
 const STALL_MS = 3000;
 
+// Sync mode on the WebCodecs path: a decoded picture is shown once the
+// sound has reached it (within the tolerance), and held otherwise, but
+// never longer than the hold cap, so a clock that's off can't freeze it.
+const SYNC_TOLERANCE_US = 10_000;
+const MAX_HOLD_MS = 300;
+const MAX_HELD_FRAMES = 8;
+
 // Frames waiting to be decrypted before new deltas are dropped (until the
 // next keyframe): a device too slow to keep up shouldn't build a backlog.
 const MAX_PENDING_FRAMES = 30;
@@ -187,7 +195,7 @@ export interface ShellActions {
 export interface StreamStats {
   fps: number; // frames shown over the last second
   received: number; // frames that arrived over the last second
-  dropped: number; // decoded but not shown over the last second (MSE only)
+  dropped: number; // decoded but not shown over the last second
   debug: string | null; // the decoder's own readout, with ?debug in the URL
   kbps: number; // video received over the last second
   receiving: boolean; // frames are arriving
@@ -254,9 +262,21 @@ export interface Dashboard {
   setMuted: (muted: boolean) => void;
   // Call from a click or key press: lets the browser start the sound.
   unlockSound: () => void;
+  // Prefer sync over latency: the picture waits for the sound (soundMode.ts).
+  sync: boolean;
+  setSync: (sync: boolean) => void;
 }
 
 const MUTED_KEY = "hawk.sound.muted";
+const SYNC_KEY = "hawk.sound.sync";
+
+function loadSync(): boolean {
+  try {
+    return window.localStorage.getItem(SYNC_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 function loadMuted(): boolean {
   try {
@@ -365,6 +385,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   }).current;
   // Counted per frame, read and reset by the once-a-second stats sample.
   const framesRef = useRef(0);
+  const droppedRef = useRef(0);
   const bytesRef = useRef(0);
   const receivedRef = useRef(0);
   const lastFrameAtRef = useRef(0);
@@ -418,22 +439,44 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     muted: loadMuted(),
   }));
   const audioRef = useRef<AudioPlayer | null>(null);
+  const [sync, setSyncState] = useState(loadSync);
+  const syncRef = useRef(sync);
+  // The sound's clock, while sync mode has the picture follow it.
+  const syncClock = useCallback(
+    (): number | null => (syncRef.current ? (audioRef.current?.audibleStreamUs() ?? null) : null),
+    [],
+  );
   const audioPlayer = useCallback((): AudioPlayer => {
     if (audioRef.current === null) {
       audioRef.current = new AudioPlayer(setSound);
       audioRef.current.setMuted(loadMuted());
+      audioRef.current.setMode(syncRef.current ? "sync" : "latency");
     }
     return audioRef.current;
   }, []);
   useEffect(() => () => audioRef.current?.close(), []);
 
+  // WebCodecs pictures held for the sound in sync mode, oldest first.
+  const heldRef = useRef<Array<{ frame: VideoFrame; heldAt: number }>>([]);
+  const presentFrameRef = useRef<number | null>(null);
+  // The picture's lead over the sound when last shown, for ?debug.
+  const skewMsRef = useRef<number | null>(null);
+
+  const dropHeld = useCallback((): void => {
+    for (const { frame } of heldRef.current) frame.close();
+    heldRef.current = [];
+    if (presentFrameRef.current !== null) cancelAnimationFrame(presentFrameRef.current);
+    presentFrameRef.current = null;
+  }, []);
+
   const teardownDecoder = useCallback((): void => {
+    dropHeld();
     sawKeyframeRef.current = false;
     const decoder = decoderRef.current;
     decoderRef.current = null;
     decoder?.close();
     audioRef.current?.reset();
-  }, []);
+  }, [dropHeld]);
 
   // Sizes the canvas to the picture, lets `draw` paint it, and counts it.
   const paint = useCallback(
@@ -454,12 +497,64 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [],
   );
 
-  const drawFrame = useCallback(
+  const showFrame = useCallback(
     (frame: VideoFrame): void => {
       paint(frame.displayWidth, frame.displayHeight, (context) => context.drawImage(frame, 0, 0));
       frame.close();
     },
     [paint],
+  );
+
+  // Once a display frame: shows the newest held picture the sound has
+  // reached, and drops the older ones.
+  const presentHeld = useCallback((): void => {
+    presentFrameRef.current = null;
+    const held = heldRef.current;
+    if (held.length === 0) return;
+    const clock = syncClock();
+    let index = held.length - 1;
+    if (clock !== null) {
+      index = -1;
+      for (const [i, { frame }] of held.entries()) {
+        if (frame.timestamp <= clock + SYNC_TOLERANCE_US) index = i;
+      }
+      const overdue = performance.now() - (held[0]?.heldAt ?? 0) > MAX_HOLD_MS || held.length > MAX_HELD_FRAMES;
+      if (index < 0 && overdue) index = 0;
+    }
+    if (index >= 0) {
+      const shown = held.splice(0, index + 1);
+      for (const { frame } of shown.slice(0, -1)) {
+        frame.close();
+        droppedRef.current += 1;
+      }
+      const frame = shown[shown.length - 1]?.frame;
+      if (frame !== undefined) {
+        skewMsRef.current = clock === null ? null : (frame.timestamp - clock) / 1000;
+        showFrame(frame);
+      }
+    }
+    if (held.length > 0) presentFrameRef.current = requestAnimationFrame(presentHeld);
+  }, [showFrame, syncClock]);
+
+  // The decoder's output. Shown at once, unless sync mode has it wait for
+  // the sound.
+  const drawFrame = useCallback(
+    (frame: VideoFrame): void => {
+      if (!syncRef.current && heldRef.current.length === 0) {
+        skewMsRef.current = null;
+        showFrame(frame);
+        return;
+      }
+      const held = heldRef.current;
+      held.push({ frame, heldAt: performance.now() });
+      // A tab in the background runs no display frames: don't pile up.
+      while (held.length > MAX_HELD_FRAMES * 2) {
+        held.shift()?.frame.close();
+        droppedRef.current += 1;
+      }
+      presentFrameRef.current ??= requestAnimationFrame(presentHeld);
+    },
+    [presentHeld, showFrame],
   );
 
   // The <video> shows the picture itself, under the canvas; the canvas is
@@ -525,13 +620,22 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
           close: () => {
             if (videoDecoder.state !== "closed") videoDecoder.close();
           },
+          debugInfo: () => {
+            const skew = skewMsRef.current;
+            return skew === null ? "a/v free" : `a/v ${skew >= 0 ? "+" : ""}${Math.round(skew)}ms`;
+          },
         };
         break;
       }
       case "mse": {
         const canvas = canvasRef.current;
         if (canvas === null) return null;
-        const mse: StreamDecoder = new MseDecoder(canvas, sizeToVideo, (message) => onDecodeError(mse, message));
+        const mse: StreamDecoder = new MseDecoder(
+          canvas,
+          sizeToVideo,
+          (message) => onDecodeError(mse, message),
+          syncClock,
+        );
         decoder = mse;
         break;
       }
@@ -540,7 +644,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     }
     decoderRef.current = decoder;
     return decoder;
-  }, [drawFrame, sizeToVideo, onDecodeError]);
+  }, [drawFrame, sizeToVideo, onDecodeError, syncClock]);
 
   const decodeFrame = useCallback(
     (frame: ParsedVideoFrame): void => {
@@ -978,6 +1082,20 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [audioPlayer],
   );
   const unlockSound = useCallback((): void => audioPlayer().unlock(), [audioPlayer]);
+  const setSync = useCallback(
+    (next: boolean): void => {
+      try {
+        window.localStorage.setItem(SYNC_KEY, next ? "1" : "0");
+      } catch {
+        // Not remembered, then; it still applies now.
+      }
+      syncRef.current = next;
+      setSyncState(next);
+      const mode: SoundMode = next ? "sync" : "latency";
+      audioPlayer().setMode(mode);
+    },
+    [audioPlayer],
+  );
 
   useEffect(() => {
     if (viewingId === null) {
@@ -1001,7 +1119,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       const decoder = decoderRef.current;
       const quality = decoder?.playbackQuality?.() ?? null;
       let shown = framesRef.current;
-      let dropped = 0;
+      let dropped = droppedRef.current;
       if (quality !== null) {
         if (decoder === lastDecoder) {
           shown = Math.max(0, quality.shown - lastQuality.shown);
@@ -1019,6 +1137,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
         receiving: now - lastFrameAtRef.current < STALL_MS,
       });
       framesRef.current = 0;
+      droppedRef.current = 0;
       bytesRef.current = 0;
       receivedRef.current = 0;
     }, 1000);
@@ -1165,5 +1284,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     sound,
     setMuted,
     unlockSound,
+    sync,
+    setSync,
   };
 }

@@ -5,6 +5,7 @@
 // here. Not a complete or authoritative typing.
 
 interface VideoFrame {
+  readonly timestamp: number; // microseconds, from the chunk it was decoded from
   readonly displayWidth: number;
   readonly displayHeight: number;
   close(): void;

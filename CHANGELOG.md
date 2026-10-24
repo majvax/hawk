@@ -22,6 +22,9 @@ Each release's section becomes its release notes (see
   = false` in the machine's config keeps it in the room. Firefox for
   Android, which has no WebCodecs, plays it through MSE as Opus in
   fragmented MP4, like its picture.
+- **Sync to sound** in the live view: the picture waits for the sound of
+  the same instant, for watching rather than controlling. Off by default,
+  remembered in the browser.
 - Protocol version 4.
 
 ## 1.0.0

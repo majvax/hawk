@@ -652,6 +652,8 @@ function Viewer({
     sound,
     setMuted,
     unlockSound,
+    sync,
+    setSync,
   } = dashboard;
   const requestStepUp = useStepUp();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -971,6 +973,16 @@ function Viewer({
               onClick={() => (sound.blocked ? unlockSound() : setMuted(!sound.muted))}
             >
               {sound.blocked ? "Click for sound" : sound.muted ? "Sound off" : "Sound on"}
+            </button>
+          )}
+          {onScreen && sound.supported && !sound.muted && (
+            <button
+              type="button"
+              aria-pressed={sync}
+              title={sync ? "The picture waits for the sound" : "Picture and sound each as soon as they arrive"}
+              onClick={() => setSync(!sync)}
+            >
+              Sync to sound
             </button>
           )}
           {onScreen && (

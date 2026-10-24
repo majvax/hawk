@@ -1,4 +1,12 @@
-import { codecString, findParameterSets, initSegment, mediaSegment, splitNalUnits, toAvcSample } from "./fmp4.js";
+import {
+  TIMESCALE,
+  codecString,
+  findParameterSets,
+  initSegment,
+  mediaSegment,
+  splitNalUnits,
+  toAvcSample,
+} from "./fmp4.js";
 import type { ParsedVideoFrame } from "./protocol.js";
 
 // Plays the stream through Media Source Extensions: each access unit is
@@ -28,6 +36,16 @@ const KEEP_BEHIND_S = 3;
 const MAX_QUEUED = 60;
 // The frame interval assumed until two timestamps give the real one.
 const DEFAULT_DURATION_US = 16_667;
+// Following the sound's clock (sync mode): the picture this far ahead of
+// it slows down, this far behind speeds up, and settles back to normal
+// speed within half of it. Further behind the live edge than the cap, the
+// sound is ignored and the live edge chased as usual.
+const SYNC_BAND_MS = 40;
+const SYNC_SLOW_RATE = 0.95;
+const SYNC_MAX_LATENCY_S = 1;
+// Frames remembered for mapping playback back to machine time: a few
+// seconds, what the buffer keeps.
+const MAX_ANCHORS = 300;
 
 export class MseDecoder {
   private readonly video: HTMLVideoElement;
@@ -50,6 +68,10 @@ export class MseDecoder {
   private lastMediaTime = -1;
 
   private resizeObserver: ResizeObserver | null = null;
+  // Where each frame starts on the media timeline, and its machine
+  // timestamp; oldest first.
+  private readonly anchors: Array<{ mediaS: number; streamUs: number }> = [];
+  private skewMs: number | null = null;
 
   // For the ?debug readout.
   private stalls = 0;
@@ -66,6 +88,9 @@ export class MseDecoder {
     canvas: HTMLCanvasElement,
     private readonly onPicture: (video: HTMLVideoElement) => void,
     private readonly onError: (message: string) => void,
+    // The sound's clock to follow (AudioPlayer.audibleStreamUs), or null to
+    // chase the live edge alone.
+    private readonly syncClock: () => number | null = () => null,
   ) {
     const video = document.createElement("video");
     video.muted = true;
@@ -140,6 +165,8 @@ export class MseDecoder {
     }
     this.lastTimestamp = frame.timestamp;
 
+    this.anchors.push({ mediaS: this.decodeTime / TIMESCALE, streamUs: frame.timestamp });
+    if (this.anchors.length > MAX_ANCHORS) this.anchors.shift();
     this.sequence += 1;
     this.queue.push({
       data: mediaSegment(this.sequence, this.decodeTime, duration, frame.isKeyframe, toAvcSample(units)),
@@ -178,6 +205,7 @@ export class MseDecoder {
       `seeks ${this.seeks}`,
       `reordered ${this.reordered}`,
       `gop ${(this.keyframeInterval / 1_000_000).toFixed(1)}s`,
+      ...(this.skewMs === null ? [] : [`a/v ${this.skewMs >= 0 ? "+" : ""}${Math.round(this.skewMs)}ms`]),
     ].join(" · ");
   }
 
@@ -253,11 +281,44 @@ export class MseDecoder {
       this.video.currentTime = Math.max(buffered.start(buffered.length - 1), end - TARGET_LATENCY_S);
       this.seeks += 1;
     }
-    // Speed up while behind, back to normal once within the target. The
-    // band between the two keeps it from flapping on every frame.
-    const rate = latency > CATCH_UP_LATENCY_S ? CATCH_UP_RATE : latency <= TARGET_LATENCY_S ? 1 : this.video.playbackRate;
+    const rate = this.syncRate(latency) ?? this.liveEdgeRate(latency);
     if (this.video.playbackRate !== rate) this.video.playbackRate = rate;
     if (this.video.paused) void this.video.play().catch(() => {});
+  }
+
+  // Speed up while behind, back to normal once within the target. The
+  // band between the two keeps it from flapping on every frame.
+  private liveEdgeRate(latency: number): number {
+    return latency > CATCH_UP_LATENCY_S ? CATCH_UP_RATE : latency <= TARGET_LATENCY_S ? 1 : this.video.playbackRate;
+  }
+
+  // In sync mode, with sound playing: steer the picture toward the sound's
+  // clock instead. Null when there is nothing to follow.
+  private syncRate(latency: number): number | null {
+    const clock = this.syncClock();
+    const shown = this.shownStreamUs();
+    if (clock === null || shown === null || latency > SYNC_MAX_LATENCY_S) {
+      this.skewMs = null;
+      return null;
+    }
+    const skew = (shown - clock) / 1000; // ms; positive is the picture ahead
+    this.skewMs = skew;
+    if (skew > SYNC_BAND_MS) return SYNC_SLOW_RATE;
+    // Only while there's buffer to spend: speeding up an empty one stalls.
+    if (skew < -SYNC_BAND_MS && latency > TARGET_LATENCY_S) return CATCH_UP_RATE;
+    if (Math.abs(skew) <= SYNC_BAND_MS / 2) return 1;
+    return this.video.playbackRate;
+  }
+
+  // The machine timestamp (µs) of the picture on screen now.
+  private shownStreamUs(): number | null {
+    const time = this.video.currentTime;
+    let anchor: { mediaS: number; streamUs: number } | undefined;
+    for (const candidate of this.anchors) {
+      if (candidate.mediaS > time) break;
+      anchor = candidate;
+    }
+    return anchor === undefined ? null : anchor.streamUs + (time - anchor.mediaS) * 1_000_000;
   }
 
   // Hands every new picture to onPicture: on each presented frame where the
