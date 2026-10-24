@@ -12,8 +12,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <thread>
@@ -200,6 +202,33 @@ constexpr auto key_mappings = std::to_array<KeyMapping>({
     return nullptr;
 }
 
+// When SendInput took only the first `sent` of `inputs` (key events): the
+// ups still owed, one for each key that went down there and wasn't let go
+// there, in the order `inputs` had them.
+[[nodiscard]] std::vector<INPUT> unreleased(std::span<const INPUT> inputs, std::size_t sent) {
+    sent = std::min(sent, inputs.size());
+    const auto same_key = [](const INPUT& a, const INPUT& b) {
+        return a.ki.wScan == b.ki.wScan && (a.ki.dwFlags | KEYEVENTF_KEYUP) == (b.ki.dwFlags | KEYEVENTF_KEYUP);
+    };
+    std::vector<INPUT> owed;
+    for (const INPUT& up : inputs.subspan(sent)) {
+        if ((up.ki.dwFlags & KEYEVENTF_KEYUP) == 0) {
+            continue;
+        }
+        std::ptrdiff_t down = 0;
+        for (const INPUT& before : inputs.first(sent)) {
+            if (same_key(before, up)) {
+                down += (before.ki.dwFlags & KEYEVENTF_KEYUP) == 0 ? 1 : -1;
+            }
+        }
+        down -= std::ranges::count_if(owed, [&](const INPUT& other) { return same_key(other, up); });
+        if (down > 0) {
+            owed.push_back(up);
+        }
+    }
+    return owed;
+}
+
 // Indexed by the order of ipc::InputButton.
 constexpr std::array<DWORD, 3> button_down_flags{MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_MIDDLEDOWN};
 constexpr std::array<DWORD, 3> button_up_flags{MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP};
@@ -281,6 +310,12 @@ public:
             case ipc::InputKind::key:
                 press_key(packet);
                 break;
+            case ipc::InputKind::text:
+                type_text(packet);
+                break;
+            case ipc::InputKind::chord:
+                press_chord(packet);
+                break;
             case ipc::InputKind::release_all:
                 release_all();
                 break;
@@ -313,6 +348,25 @@ private:
             // capture/input.hpp); a lock screen or the secure desktop
             // refuses it either way.
             spdlog::warn("input: SendInput failed: Win32 error {}", GetLastError());
+        }
+    }
+
+    // Several key events in one SendInput, so nothing else gets in between.
+    // Should only the first few go in, the ups for any key among those that
+    // went down are sent on their own: a Ctrl left down with nobody holding
+    // it would turn the viewer's next click into Ctrl+click.
+    static void send_keys(std::span<INPUT> inputs, std::string_view what) {
+        const auto count = static_cast<UINT>(inputs.size());
+        if (count == 0) {
+            return;
+        }
+        const UINT sent = SendInput(count, inputs.data(), sizeof(INPUT));
+        if (sent == count) {
+            return;
+        }
+        spdlog::warn("input: SendInput failed {} ({} of {} sent): Win32 error {}", what, sent, count, GetLastError());
+        for (INPUT& up : unreleased(inputs, std::min(sent, count))) {
+            send(up);
         }
     }
 
@@ -402,6 +456,103 @@ private:
         if (dx != 0) {
             send_mouse(MOUSEEVENTF_HWHEEL, static_cast<DWORD>(dx));
         }
+    }
+
+    // Characters, not keys: each UTF-16 unit pressed and let go as itself
+    // (a surrogate pair as its two halves, which Windows puts together),
+    // so they come out the same whatever the keyboard layout. Held
+    // modifiers still apply, as they would to a key.
+    static void type_text(const ipc::InputPacket& packet) {
+        std::array<char16_t, ipc::max_text_units> units{};
+        const std::size_t count = std::min<std::size_t>(packet.length, units.size());
+        std::memcpy(units.data(), packet.code.data(), count * sizeof(char16_t));
+        std::array<INPUT, 2 * ipc::max_text_units> inputs{};
+        for (std::size_t i = 0; i < count; ++i) {
+            for (std::size_t up = 0; up < 2; ++up) {
+                INPUT& input = inputs.at(2 * i + up);
+                input.type = INPUT_KEYBOARD;
+                input.ki.wScan = static_cast<WORD>(units.at(i));
+                input.ki.dwFlags = KEYEVENTF_UNICODE | (up == 1 ? KEYEVENTF_KEYUP : 0);
+            }
+        }
+        // One call, so nothing else gets in between the halves of a pair.
+        send_keys(std::span(inputs).first(2 * count), "typing text");
+    }
+
+    // A shortcut by character: the key that types it is looked up in the
+    // layout of the window in front (the lock screen has none: then this
+    // thread's), so Ctrl+A is Ctrl+Q's key on AZERTY. Modifiers the viewer
+    // already holds as keys are left as they are, so none of their state
+    // changes; the rest go down and up around the key in one SendInput, and
+    // can't stay stuck.
+    void press_chord(const ipc::InputPacket& packet) const {
+        if (packet.length != 1) {
+            return;
+        }
+        char16_t unit = 0;
+        std::memcpy(&unit, packet.code.data(), sizeof(unit));
+        const HWND foreground = GetForegroundWindow();
+        const HKL  layout = GetKeyboardLayout(foreground == nullptr ? 0 : GetWindowThreadProcessId(foreground, nullptr));
+        const SHORT found = VkKeyScanExW(static_cast<WCHAR>(unit), layout);
+        if (found == -1) {
+            spdlog::debug("input: no key types U+{:04X} in the current layout; shortcut dropped",
+                          static_cast<unsigned>(unit));
+            return;
+        }
+        const auto vk = static_cast<UINT>(LOBYTE(found));
+        // What the layout needs held for the character (Shift for a capital,
+        // Ctrl+Alt for AltGr), on top of what the viewer asked for.
+        const unsigned needs = HIBYTE(found);
+        unsigned bits = packet.button;
+        bits |= (needs & 1U) != 0 ? unsigned{ipc::modifier_shift} : 0U;
+        bits |= (needs & 2U) != 0 ? unsigned{ipc::modifier_ctrl} : 0U;
+        bits |= (needs & 4U) != 0 ? unsigned{ipc::modifier_alt} : 0U;
+
+        struct Modifier {
+            unsigned         bit;
+            std::string_view left;
+            std::string_view right;
+        };
+        constexpr std::array<Modifier, 4> kModifiers{{
+            {ipc::modifier_ctrl, "ControlLeft", "ControlRight"},
+            {ipc::modifier_alt, "AltLeft", "AltRight"},
+            {ipc::modifier_shift, "ShiftLeft", "ShiftRight"},
+            {ipc::modifier_win, "MetaLeft", "MetaRight"},
+        }};
+        std::vector<const KeyMapping*> pressed;
+        for (const auto& modifier : kModifiers) {
+            const bool held = std::ranges::any_of(keys_held_, [&](const KeyMapping* key) {
+                return key->code == modifier.left || key->code == modifier.right;
+            });
+            const KeyMapping* mapping = find_key(modifier.left);
+            if ((bits & modifier.bit) != 0 && !held && mapping != nullptr) {
+                pressed.push_back(mapping);
+            }
+        }
+
+        const UINT scan = MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, layout);
+        if (scan == 0) {
+            spdlog::debug("input: no scancode for virtual key {:#x}; shortcut dropped", vk);
+            return;
+        }
+        std::vector<INPUT> inputs;
+        const auto add = [&](std::uint16_t scancode, bool extended, bool down) {
+            INPUT input{};
+            input.type = INPUT_KEYBOARD;
+            input.ki.wScan = scancode;
+            input.ki.dwFlags = KEYEVENTF_SCANCODE | (extended ? KEYEVENTF_EXTENDEDKEY : 0) | (down ? 0 : KEYEVENTF_KEYUP);
+            inputs.push_back(input);
+        };
+        for (const KeyMapping* mapping : pressed) {
+            add(mapping->scancode, mapping->extended, true);
+        }
+        const bool extended = (scan & 0xFF00U) == 0xE000U;
+        add(static_cast<std::uint16_t>(scan & 0xFFU), extended, true);
+        add(static_cast<std::uint16_t>(scan & 0xFFU), extended, false);
+        for (const KeyMapping* mapping : std::views::reverse(pressed)) {
+            add(mapping->scancode, mapping->extended, false);
+        }
+        send_keys(inputs, "pressing a shortcut");
     }
 
     void press_key(const ipc::InputPacket& packet) {

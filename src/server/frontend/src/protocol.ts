@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -96,6 +96,9 @@ export interface Machine {
   // While online: the machine presses Ctrl+Alt+Del for this user's role
   // (control or owner).
   sas?: boolean;
+  // While online: the machine types `text` input events as characters, for
+  // this user's role (control or owner).
+  text?: boolean;
 }
 
 // What a viewer with control can ask the machine to do with itself.
@@ -169,7 +172,24 @@ export type InputEvent =
   | { kind: "mouse_button"; button: MouseButton; down: boolean }
   // In WHEEL_DELTA units (120 per notch); positive is up / right.
   | { kind: "wheel"; dx: number; dy: number }
-  | { kind: "key"; code: string; down: boolean };
+  | { kind: "key"; code: string; down: boolean }
+  // Characters to type as themselves, whatever the machine's layout: at
+  // most MAX_TEXT_UNITS UTF-16 units, no controls (Enter and Tab are keys).
+  | { kind: "text"; text: string }
+  // A shortcut by character: the modifiers (MODIFIER_* bits, Ctrl, Alt or
+  // Win among them) held while the machine presses whichever key types
+  // `text` (one UTF-16 unit) in its own layout, so Ctrl+A is Ctrl+A on
+  // AZERTY too.
+  | { kind: "chord"; text: string; modifiers: number };
+
+export const MODIFIER_CTRL = 1;
+export const MODIFIER_ALT = 2;
+export const MODIFIER_SHIFT = 4;
+export const MODIFIER_WIN = 8;
+
+// The most UTF-16 units one text event carries (common/input_pipe.hpp
+// max_text_units); longer text goes as several.
+export const MAX_TEXT_UNITS = 16;
 
 // What Windows counts as one notch of the wheel.
 export const WHEEL_DELTA = 120;

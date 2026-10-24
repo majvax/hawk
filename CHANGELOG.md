@@ -5,6 +5,28 @@ Each release's section becomes its release notes (see
 
 ## Unreleased
 
+- **Touch and phones.** Fingers on the live view have a mapping of their
+  own. **Trackpad** (the default on a phone): drag to move the pointer,
+  faster for a quick flick, tap to click, two-finger tap to right-click,
+  hold then drag to drag, two fingers to scroll; the machine's pointer is
+  drawn over the picture. **Touch** (the default on a tablet): tap where
+  you click, drag to drag, hold to right-click, two fingers to scroll.
+  Remembered in the browser. **Pinch** zooms the picture on your screen
+  (not the machine's), clicks still land where they should, and in
+  trackpad mode the picture follows the pointer; **Fit** or a two-finger
+  double tap goes back. Watching only, you can still zoom. **Keyboard**
+  brings up the phone's keyboard, with a row of Esc, Tab, arrows and Ctrl,
+  Alt, Shift and Win held for the next key. The mouse and keyboard work as
+  before.
+- **Typed text arrives as characters.** What a phone's keyboard types
+  reaches the machine as the characters themselves (a new `text` input
+  event, sealed like the rest, typed with `KEYEVENTF_UNICODE`), so accents,
+  emoji and other scripts come out right whatever the machine's keyboard
+  layout. Enter, Tab and Backspace are still real keys. A shortcut made
+  with the sticky Ctrl, Alt or Win goes as the modifiers and the
+  character, and the machine presses the key that types it in its own
+  layout, so `Ctrl` then `a` is `Ctrl+A` on AZERTY too. A machine older
+  than this release gets US keys instead, without what no US key types.
 - **Sign in remotely.** With nobody signed in, after a restart, a crash
   or a sign-out, the view shows the Windows sign-in screen instead of
   nothing. When the session opens, the view follows it on its own.
@@ -88,7 +110,7 @@ Each release's section becomes its release notes (see
   (older Firefox) shows the picture to save or copy by hand; one that won't
   hand them over still sends one with `Ctrl+V` on the screen. Older machines
   and dashboards stay text-only.
-- Protocol version 9.
+- Protocol version 10.
 
 ## 1.0.0
 

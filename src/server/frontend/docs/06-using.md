@@ -35,11 +35,52 @@ control**, enter a code from your authenticator first (see
   [Ctrl+Alt+Del](#ctrl-alt-del).
 - Your own mouse pointer stands in for the machine's. People only
   watching see no pointer.
+- On a phone or tablet, see [Phones and tablets](#phones-and-tablets).
 
 If your connection drops, the dashboard reconnects on its own and the
 view picks up where it was.
 
-## Stream stats
+## Phones and tablets
+
+On a touchscreen, a row of buttons under the screen sets how your fingers
+drive the machine. Your choice is remembered in this browser.
+
+**Trackpad** (the default on a phone) uses the screen like a laptop's
+touchpad, and draws the machine's pointer over the picture:
+
+- **Drag** to move the pointer. A quick flick takes it further.
+- **Tap** to click where the pointer is.
+- **Tap with two fingers** to right-click.
+- **Hold**, then drag, to drag (select text, move a window).
+- **Drag two fingers** to scroll.
+
+**Touch** (the default on a tablet) clicks where you touch:
+
+- **Tap** to click there, **drag** to drag.
+- **Hold** to right-click.
+- **Drag two fingers** to scroll.
+
+**Pinch** to zoom into the picture. It only zooms your view, not the
+machine's screen, and taps still land where you see them. In trackpad mode
+the picture follows the pointer to the edges. **Fit**, or a double tap
+with two fingers, zooms back out. People watching only can zoom too.
+
+**Keyboard** brings up your phone's keyboard, and adds a row of the keys
+it lacks: `Esc`, `Tab`, the arrows, and `Ctrl`, `Alt`, `Shift` and `Win`.
+A modifier stays held for the next key you press, from the row or the
+keyboard: `Ctrl` then `c` is `Ctrl+C`. Tap a modifier twice to press it
+on its own, such as `Win` to open Start.
+
+What you type arrives as the characters themselves, accents, emoji and
+other scripts included, whatever keyboard layout the machine uses. Enter,
+Backspace and the extra keys are real key presses, and a shortcut made with
+a held modifier is pressed with whichever key types that letter on the
+machine: `Ctrl` then `a` is `Ctrl+A` on an AZERTY machine too.
+
+A machine older than this dashboard only takes keys: there, typed text and
+shortcuts are sent as the keys that type them on a US keyboard, and
+characters no US key types are left out. Update the machine to fix that.
+
 
 **Stats** above the screen lays the stream's numbers over the top-left
 corner of the picture, each over the last second:

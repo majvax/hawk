@@ -20,7 +20,7 @@ use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::protocol::{
     AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, IMAGE_CLIPBOARD_PROTOCOL, MachineView,
-    PING_PROTOCOL, POWER_PROTOCOL, QUALITY_PROTOCOL, SAS_PROTOCOL, SignedView, is_audio, is_keyframe, timestamp_us,
+    PING_PROTOCOL, POWER_PROTOCOL, QUALITY_PROTOCOL, SAS_PROTOCOL, SignedView, TEXT_INPUT_PROTOCOL, is_audio, is_keyframe, timestamp_us,
 };
 use crate::quality::{Meter, Preset, RateController, TICK_US};
 
@@ -253,6 +253,7 @@ impl Inner {
             config: row.role.can_control() && device.is_some_and(|device| device.protocol >= CONFIG_PROTOCOL),
             quality: row.role.can_control() && device.is_some_and(|device| device.protocol >= QUALITY_PROTOCOL),
             sas: row.role.can_control() && device.is_some_and(|device| device.protocol >= SAS_PROTOCOL),
+            text: row.role.can_control() && device.is_some_and(|device| device.protocol >= TEXT_INPUT_PROTOCOL),
         }
     }
 
@@ -1325,6 +1326,25 @@ mod tests {
         while next(&mut device_rx).is_some() {}
         assert!(!registry.power(dashboard, MACHINE, "sealed".to_owned()));
         assert!(next(&mut device_rx).is_none());
+    }
+
+    /// Text input is offered to control (and the owner) on a machine new
+    /// enough to type it; older machines get keys instead.
+    #[test]
+    fn text_input_follows_the_role_and_the_protocol() {
+        for (role, protocol, offered) in [
+            (Role::Owner, TEXT_INPUT_PROTOCOL, true),
+            (Role::Control, TEXT_INPUT_PROTOCOL, true),
+            (Role::View, TEXT_INPUT_PROTOCOL, false),
+            (Role::Control, TEXT_INPUT_PROTOCOL - 1, false),
+        ] {
+            let registry = Registry::default();
+            let (user, mut events) = handle(1);
+            registry.add_dashboard(user, vec![row(role)]);
+            let (outbound, _device_rx) = mpsc::unbounded_channel();
+            registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol }, outbound);
+            assert_eq!(last_view(&mut events).map(|view| view.text), Some(offered), "{role:?} on {protocol}");
+        }
     }
 
     /// Ctrl+Alt+Del has input's gate: control (or the owner), watching,

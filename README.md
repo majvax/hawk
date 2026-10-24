@@ -179,6 +179,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [ ] Installer pre-stamped by the dashboard with relay URL, pin and enroll code; Authenticode signing
 - [x] Machine config file, schema-described and synced to the dashboard: control reads it, the owner edits it
 - [ ] Multiple display support (per-display capture, display-aware input)
+- [x] Touch input: trackpad and direct modes, pinch-zoom of the picture on the viewer's side, the phone's keyboard and a row of extra keys
+- [x] Text input as characters (`KEYEVENTF_UNICODE`), independent of the machine's keyboard layout
 - [x] Audio (WASAPI loopback, Opus) alongside the video stream
 - [x] Audio on the MSE fallback (Firefox for Android): Opus muxed into fragmented MP4
 - [x] A/V sync: video slewed to the audio clock, a prefer latency / prefer sync toggle
@@ -1042,26 +1044,27 @@ automatic step down.
 
 ### Touch and mobile input
 
-The dashboard renders on a phone and the MSE fallback keeps Firefox for
-Android working, but *using* a machine from a phone is still poor. A
-pointer-based desktop assumes hover, precise positioning, right-click and a
-keyboard, and a touchscreen has none of those. What it needs is a mapping
-decided on purpose rather than inherited from the mouse handler: tap =
-left click, long-press = right click, two-finger drag = scroll,
-pinch = zoom into a region of the screen (client-side, so no extra
-bandwidth) with a pan that doesn't move the remote cursor, and an explicit
-trackpad mode where dragging moves the pointer relatively instead of
-teleporting it — which is the only workable way to hit a small target on a
-1440p screen through a 6-inch window.
+Done for the browser: fingers on the live view have their own mapping
+(`touchGestures.ts`) instead of the mouse handler's, in two modes. In
+*trackpad* mode a drag moves the pointer relatively, with acceleration,
+which is what makes a small target on a 1440p screen hittable through a
+6-inch window; in *direct* mode the finger is the pointer. A pinch zooms
+the picture client-side (no extra bandwidth), and the phone's keyboard
+types through a hidden text box whose changes are replayed on the
+machine, with a sticky row for `Esc`, `Tab`, the arrows and the
+modifiers.
 
-Plus the keyboard problem: the on-screen keyboard needs a text input to
-appear at all, it covers half the screen when it does, and it sends
-*characters* while the input path deliberately sends physical
-`KeyboardEvent.code` scancodes. So modifier keys (`Ctrl`, `Alt`, `Tab`,
-`Esc`, function keys) need their own sticky on-screen row, and typed text
-has to be translated back into scancodes for the machine's layout — which
-is exactly the ambiguity the scancode design was chosen to avoid, and the
-question that keeps this out of the planned list.
+The layout question that kept this out of the plan is answered by not
+asking it: typed text travels as characters (a `text` input event) and the
+machine types them with `KEYEVENTF_UNICODE`, so AZERTY, QWERTZ or any IME
+comes out as typed. Named keys (Enter, Tab, Backspace, the arrows) are
+sent as physical keys. A shortcut made with the sticky modifiers goes as a
+*chord* (modifiers and one character), and the machine presses the key
+that types that character in the layout of the window in front
+(`VkKeyScanEx`), since an app reacts to `Ctrl+C` as a key, not as a
+character: `Ctrl` then `a` is `Ctrl+A` on AZERTY too. A Tauri build for iOS
+and Android is a separate decision again (store review, background
+limits).
 
 ### Non-Windows hosts
 

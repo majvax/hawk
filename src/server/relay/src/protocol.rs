@@ -12,7 +12,7 @@ use crate::quality::Preset;
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The first protocol whose machines take power actions.
 pub const POWER_PROTOCOL: u32 = 3;
@@ -38,6 +38,10 @@ pub const SAS_PROTOCOL: u32 = 8;
 /// The first protocol whose machines put pictures on their clipboard and
 /// send the ones copied there, in chunks over an image channel of their own.
 pub const IMAGE_CLIPBOARD_PROTOCOL: u32 = 9;
+
+/// The first protocol whose machines type text as characters, whatever
+/// their keyboard layout (a `text` input event, sealed like the rest).
+pub const TEXT_INPUT_PROTOCOL: u32 = 10;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -490,6 +494,9 @@ pub struct MachineView {
     /// While online: the machine presses Ctrl+Alt+Del for this user's role
     /// (control or owner).
     pub sas: bool,
+    /// While online: the machine types text sent as characters, for this
+    /// user's role (control or owner).
+    pub text: bool,
 }
 
 /// Messages pushed to connected dashboards.
@@ -830,6 +837,14 @@ mod tests {
             serde_json::to_value(event).unwrap(),
             serde_json::json!({"type":"quality","deviceId":"m1","preset":"low","bitrate":1_000_000,"fps":30})
         );
+    }
+
+    #[test]
+    fn the_longest_text_input_fits() {
+        // 16 UTF-16 units of three-byte characters, the most a machine
+        // takes in one event, with the counter and the tag.
+        let json = format!(r#"{{"kind":"text","text":"{}"}}"#, "€".repeat(16));
+        assert!(BASE64.encode(vec![0u8; 8 + json.len() + 16]).len() <= MAX_SEALED_INPUT_LEN);
     }
 
     #[test]

@@ -145,7 +145,10 @@ export function useRemoteInput(
       };
     };
 
+    // Touches are useTouchInput's: a finger isn't a mouse (a drag there may
+    // be a scroll, a pinch or a trackpad), so only mouse and pen go here.
     const onPointerMove = (event: PointerEvent): void => {
+      if (event.pointerType === "touch") return;
       pendingMove = position(event);
       if (buttonsDiffer(event.buttons)) {
         // A chorded press or release: it has to land where the pointer is.
@@ -157,6 +160,7 @@ export function useRemoteInput(
     };
 
     const onPointerDown = (event: PointerEvent): void => {
+      if (event.pointerType === "touch") return;
       // preventDefault keeps the click from selecting or dragging the
       // canvas, but it also stops the browser focusing it, so focus here.
       event.preventDefault();
@@ -171,6 +175,7 @@ export function useRemoteInput(
     };
 
     const onPointerUp = (event: PointerEvent): void => {
+      if (event.pointerType === "touch") return;
       event.preventDefault();
       pendingMove = position(event);
       flushMove();
@@ -181,7 +186,9 @@ export function useRemoteInput(
     // The browser took the pointer away (pointercancel, e.g. a touch it
     // decided was a scroll) or capture was lost without a pointerup: no
     // release is coming for whatever is down, so let go of it now.
-    const onPointerLost = (): void => syncButtons(0);
+    const onPointerLost = (event: PointerEvent): void => {
+      if (event.pointerType !== "touch") syncButtons(0);
+    };
 
     const onWheel = (event: WheelEvent): void => {
       event.preventDefault(); // don't scroll the dashboard behind the screen

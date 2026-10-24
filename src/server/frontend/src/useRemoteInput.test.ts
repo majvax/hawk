@@ -217,3 +217,48 @@ describe("Ctrl+Alt+End", () => {
     ]);
   });
 });
+
+describe("touch", () => {
+  const saved = { window: globalThis.window, document: globalThis.document };
+  beforeEach(() => {
+    (globalThis as Record<string, unknown>).window = fakeWindow;
+    (globalThis as Record<string, unknown>).document = fakeDocument;
+  });
+  afterEach(() => {
+    for (const cleanup of cleanups) cleanup();
+    cleanups = [];
+    (globalThis as Record<string, unknown>).window = saved.window;
+    (globalThis as Record<string, unknown>).document = saved.document;
+  });
+
+  // Fingers are useTouchInput's; the mouse still goes through here.
+  test("leaves touches alone and still takes the mouse", () => {
+    const { canvas, sent } = rig(false);
+    Object.assign(canvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }),
+      setPointerCapture: () => {},
+      hasPointerCapture: () => false,
+    });
+    const pointer = (pointerType: string, buttons: number) => ({
+      pointerType,
+      pointerId: 1,
+      clientX: 50,
+      clientY: 25,
+      buttons,
+      preventDefault: () => {},
+    });
+    canvas.fire("pointerdown", pointer("touch", 1));
+    canvas.fire("pointermove", pointer("touch", 1));
+    canvas.fire("pointerup", pointer("touch", 0));
+    canvas.fire("pointercancel", pointer("touch", 0));
+    expect(sent).toEqual([]);
+    canvas.fire("pointerdown", pointer("mouse", 1));
+    canvas.fire("pointerup", pointer("mouse", 0));
+    expect(sent).toEqual([
+      { kind: "mouse_move", x: 0.5, y: 0.25 },
+      { kind: "mouse_button", button: "left", down: true },
+      { kind: "mouse_move", x: 0.5, y: 0.25 },
+      { kind: "mouse_button", button: "left", down: false },
+    ]);
+  });
+});

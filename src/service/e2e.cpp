@@ -11,6 +11,7 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -269,7 +270,7 @@ struct AccessState {
 
 // One input event as the dashboard seals it (protocol.ts InputEvent).
 struct InputMessage {
-    std::string  kind;  // "mouse_move", "mouse_button", "wheel", "key"
+    std::string  kind;  // "mouse_move", "mouse_button", "wheel", "key", "text", "chord"
     double       x = 0.0;
     double       y = 0.0;
     std::string  button;
@@ -277,6 +278,8 @@ struct InputMessage {
     std::int32_t dx = 0;
     std::int32_t dy = 0;
     std::string  code;
+    std::string  text;
+    std::uint32_t modifiers = 0;  // chord: ipc::modifier_* bits
 };
 
 struct AcceptMessage {
@@ -332,7 +335,8 @@ template <>
 struct glz::meta<hawk::service::InputMessage> {
     using T                     = hawk::service::InputMessage;
     static constexpr auto value = object("kind", &T::kind, "x", &T::x, "y", &T::y, "button", &T::button, "down",
-                                         &T::down, "dx", &T::dx, "dy", &T::dy, "code", &T::code);
+                                         &T::down, "dx", &T::dx, "dy", &T::dy, "code", &T::code,
+                                         "text", &T::text, "modifiers", &T::modifiers);
 };
 
 template <>
@@ -406,6 +410,115 @@ template <typename Message>
     return packet;
 }
 
+// The character at `i` in `text` and how many bytes it takes; nullopt
+// unless it's well-formed UTF-8, without overlongs, surrogates or anything
+// past U+10FFFF.
+[[nodiscard]] std::optional<std::pair<char32_t, std::size_t>> next_code_point(std::string_view text, std::size_t i) {
+    constexpr std::array<std::uint32_t, 5> kSmallest{0, 0, 0x80, 0x800, 0x10000};
+    const auto                             lead = static_cast<unsigned char>(text[i]);
+    std::size_t                            length = 0;
+    std::uint32_t                          point = 0;
+    if (lead < 0x80U) {
+        return std::pair{static_cast<char32_t>(lead), std::size_t{1}};
+    }
+    if ((lead & 0xE0U) == 0xC0U) {
+        length = 2;
+        point = lead & 0x1FU;
+    } else if ((lead & 0xF0U) == 0xE0U) {
+        length = 3;
+        point = lead & 0x0FU;
+    } else if ((lead & 0xF8U) == 0xF0U) {
+        length = 4;
+        point = lead & 0x07U;
+    } else {
+        return std::nullopt;
+    }
+    if (i + length > text.size()) {
+        return std::nullopt;
+    }
+    for (std::size_t k = 1; k < length; ++k) {
+        const auto next = static_cast<unsigned char>(text[i + k]);
+        if ((next & 0xC0U) != 0x80U) {
+            return std::nullopt;
+        }
+        point = (point << 6U) | (next & 0x3FU);
+    }
+    if (point < kSmallest[length] || point > 0x10FFFFU || (point >= 0xD800U && point <= 0xDFFFU)) {
+        return std::nullopt;
+    }
+    return std::pair{static_cast<char32_t>(point), length};
+}
+
+// True for well-formed UTF-8: what the clipboard is handed is text the
+// machine can convert.
+[[nodiscard]] bool is_utf8(std::string_view text) {
+    for (std::size_t i = 0; i < text.size();) {
+        const auto point = next_code_point(text, i);
+        if (!point.has_value()) {
+            return false;
+        }
+        i += point->second;
+    }
+    return true;
+}
+
+// Typed text as one packet: well-formed UTF-8 of at most max_text_units
+// UTF-16 units, and characters only. A line break, a tab, Backspace and
+// every other control are keys, sent as keys; text that holds one is
+// refused rather than typed as something it isn't.
+[[nodiscard]] std::optional<ipc::InputPacket> to_text_packet(std::string_view text) {
+    ipc::InputPacket packet{};
+    packet.kind = static_cast<std::uint8_t>(ipc::InputKind::text);
+    std::array<char16_t, ipc::max_text_units> units{};
+    std::size_t                               count = 0;
+    for (std::size_t i = 0; i < text.size();) {
+        const auto decoded = next_code_point(text, i);
+        if (!decoded.has_value()) {
+            return std::nullopt;
+        }
+        const auto [point, length] = *decoded;
+        i += length;
+        if (point < 0x20 || (point >= 0x7F && point <= 0x9F)) {
+            return std::nullopt;
+        }
+        const std::size_t needed = point >= 0x10000 ? 2 : 1;
+        if (count + needed > units.size()) {
+            return std::nullopt;
+        }
+        if (needed == 2) {
+            const char32_t offset = point - 0x10000;
+            units.at(count++) = static_cast<char16_t>(0xD800 + (offset >> 10U));
+            units.at(count++) = static_cast<char16_t>(0xDC00 + (offset & 0x3FFU));
+        } else {
+            units.at(count++) = static_cast<char16_t>(point);
+        }
+    }
+    if (count == 0) {
+        return std::nullopt;
+    }
+    packet.length = static_cast<std::uint8_t>(count);
+    std::memcpy(packet.code.data(), units.data(), count * sizeof(char16_t));
+    return packet;
+}
+
+// A shortcut by character: one character with a single UTF-16 unit (the
+// machine looks up the key that types it), and modifiers that make it a
+// shortcut, Ctrl, Alt or Win among them. Shift alone is just typing.
+[[nodiscard]] std::optional<ipc::InputPacket> to_chord_packet(std::string_view text, std::uint32_t modifiers) {
+    constexpr std::uint32_t kAll = 0U | ipc::modifier_ctrl | ipc::modifier_alt | ipc::modifier_shift | ipc::modifier_win;
+    constexpr std::uint32_t kShortcut = 0U | ipc::modifier_ctrl | ipc::modifier_alt | ipc::modifier_win;
+    if ((modifiers & ~kAll) != 0 || (modifiers & kShortcut) == 0) {
+        return std::nullopt;
+    }
+    auto packet = to_text_packet(text);
+    if (!packet.has_value() || packet->length != 1) {
+        return std::nullopt;
+    }
+    packet->kind = static_cast<std::uint8_t>(ipc::InputKind::chord);
+    packet->button = static_cast<std::uint8_t>(modifiers);
+    return packet;
+}
+
 // A viewer's event, brought into range, as hawk-capture takes it; nullopt
 // for anything that can't be made sense of.
 [[nodiscard]] std::optional<ipc::InputPacket> to_packet(const InputMessage& event) {
@@ -447,6 +560,10 @@ template <typename Message>
         packet.kind = static_cast<std::uint8_t>(ipc::InputKind::key);
         packet.down = event.down ? 1 : 0;
         std::ranges::copy(event.code, packet.code.begin());
+    } else if (event.kind == "text") {
+        return to_text_packet(event.text);
+    } else if (event.kind == "chord") {
+        return to_chord_packet(event.text, event.modifiers);
     } else {
         return std::nullopt;
     }
@@ -473,48 +590,6 @@ void put_u64_be(crypto::Bytes& out, std::uint64_t value) {
     return nonce;
 }
 
-// True for well-formed UTF-8 without overlongs, surrogates or anything past
-// U+10FFFF: what the clipboard is handed is text the machine can convert.
-[[nodiscard]] bool is_utf8(std::string_view text) {
-    constexpr std::array<std::uint32_t, 5> kSmallest{0, 0, 0x80, 0x800, 0x10000};
-    std::size_t                            i = 0;
-    while (i < text.size()) {
-        const auto    lead = static_cast<unsigned char>(text[i]);
-        std::size_t   length = 0;
-        std::uint32_t point = 0;
-        if (lead < 0x80U) {
-            ++i;
-            continue;
-        }
-        if ((lead & 0xE0U) == 0xC0U) {
-            length = 2;
-            point = lead & 0x1FU;
-        } else if ((lead & 0xF0U) == 0xE0U) {
-            length = 3;
-            point = lead & 0x0FU;
-        } else if ((lead & 0xF8U) == 0xF0U) {
-            length = 4;
-            point = lead & 0x07U;
-        } else {
-            return false;
-        }
-        if (i + length > text.size()) {
-            return false;
-        }
-        for (std::size_t k = 1; k < length; ++k) {
-            const auto next = static_cast<unsigned char>(text[i + k]);
-            if ((next & 0xC0U) != 0x80U) {
-                return false;
-            }
-            point = (point << 6U) | (next & 0x3FU);
-        }
-        if (point < kSmallest[length] || point > 0x10FFFFU || (point >= 0xD800U && point <= 0xDFFFU)) {
-            return false;
-        }
-        i += length;
-    }
-    return true;
-}
 
 // The longest prefix of `text` within `limit` bytes that doesn't cut a
 // character in half.

@@ -59,7 +59,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 9;
+constexpr std::uint32_t kProtocolVersion = 10;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};

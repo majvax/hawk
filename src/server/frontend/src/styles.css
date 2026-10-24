@@ -2682,3 +2682,113 @@ a.btn {
     font-size: 18px;
   }
 }
+
+/* --- Touch ------------------------------------------------------------- */
+
+/* Fingers on the screen are the live view's: no page scroll, no browser
+   zoom. The page around it scrolls as usual. */
+.stage-screen.touchable {
+  touch-action: none;
+}
+
+/* On a touch device, the picture: a long press is a right click, not a
+   selection or the browser's image menu. The overlays stay selectable. */
+.stage-screen.touch .stage-view {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* What a pinch zooms: the picture, scaled and moved from its top-left
+   corner, laid out exactly as the screen would lay out the canvas. */
+.stage-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform-origin: 0 0;
+}
+
+/* The machine's pointer in trackpad mode, its tip on the spot. */
+.touch-cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  pointer-events: none;
+  line-height: 0;
+}
+
+.touch-cursor[hidden] {
+  display: none;
+}
+
+.touch-cursor path {
+  fill: #fff;
+  stroke: #000;
+  stroke-width: 1;
+  stroke-linejoin: round;
+}
+
+/* The box the phone's keyboard types into: there, focusable, never seen.
+   16px keeps iOS from zooming the page when it takes the focus. */
+.touch-keyboard {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  font-size: 16px;
+  resize: none;
+  pointer-events: none;
+}
+
+/* Under the picture, finger-sized, scrolling sideways when it doesn't fit. */
+.touch-bar {
+  display: flex;
+  flex: none;
+  height: 40px;
+  border-top: 1px solid var(--line);
+  background: var(--rail);
+  overflow-x: auto;
+  touch-action: pan-x;
+  scrollbar-width: none;
+}
+
+.stage.controlling .touch-bar {
+  border-top-color: var(--accent);
+}
+
+.touch-bar button {
+  flex: none;
+  min-width: 44px;
+  padding: 0 12px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.touch-bar button.key {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.touch-bar button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--on-accent);
+}

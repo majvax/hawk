@@ -25,6 +25,8 @@ import { canReadImages, canWriteImages, formatBytes, imageProblem } from "../cli
 import { Alert, CodeBlock, CopyButton, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
 import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
+import { useTouchInput, useTouchKeyboard } from "../useTouchInput.js";
+import type { Modifier } from "../touchKeyboard.js";
 import { useStepUp } from "../stepUp.js";
 import { AnalyticsPanel, ProcessesPanel } from "./AnalyticsPanel.js";
 import { ANSWER_TIMEOUT_MS, ConfigPanel } from "./ConfigPanel.js";
@@ -631,6 +633,58 @@ const POWER_ITEMS: { action: PowerAction; label: string; warning: string | null;
   },
 ];
 
+// How fingers drive the machine: as a laptop's touchpad (the default on a
+// phone, where targets are too small to hit with a finger), or where they
+// touch (the default on a tablet). Remembered in this browser.
+type TouchControl = "trackpad" | "direct";
+const TOUCH_KEY = "hawk.view.touch";
+
+function coarsePointer(): boolean {
+  try {
+    return window.matchMedia("(pointer: coarse)").matches;
+  } catch {
+    return false;
+  }
+}
+
+function loadTouchControl(): TouchControl {
+  try {
+    const stored = window.localStorage.getItem(TOUCH_KEY);
+    if (stored === "trackpad" || stored === "direct") return stored;
+  } catch {
+    // Storage blocked: the default it is.
+  }
+  return Math.min(window.screen.width, window.screen.height) < 600 ? "trackpad" : "direct";
+}
+
+function saveTouchControl(control: TouchControl): void {
+  try {
+    window.localStorage.setItem(TOUCH_KEY, control);
+  } catch {
+    // Not remembered, then.
+  }
+}
+
+// The extra keys under the screen, for what a phone's keyboard lacks.
+const EXTRA_KEYS: { label: string; code: string; modifier?: Modifier }[] = [
+  { label: "Esc", code: "Escape" },
+  { label: "Tab", code: "Tab" },
+  { label: "Ctrl", code: "ControlLeft", modifier: "ControlLeft" },
+  { label: "Alt", code: "AltLeft", modifier: "AltLeft" },
+  { label: "Shift", code: "ShiftLeft", modifier: "ShiftLeft" },
+  { label: "Win", code: "MetaLeft", modifier: "MetaLeft" },
+  { label: "←", code: "ArrowLeft" },
+  { label: "↑", code: "ArrowUp" },
+  { label: "↓", code: "ArrowDown" },
+  { label: "→", code: "ArrowRight" },
+];
+
+// Keeps a button from taking the focus as it's tapped, so the phone's
+// keyboard stays up while the extra keys are used.
+function keepFocus(event: { preventDefault: () => void }): void {
+  event.preventDefault();
+}
+
 function Viewer({
   dashboard,
   shown,
@@ -997,6 +1051,41 @@ function Viewer({
     canPaste && clipboard.images ? pastePicture : null,
   );
 
+  // Touch: fingers on the screen, a pinch zooming the picture here, and the
+  // phone's keyboard. Shown once this looks like a touch device.
+  const screenRef = useRef<HTMLDivElement>(null);
+  const viewRef = useRef<HTMLDivElement>(null);
+  const cursorRef = useRef<HTMLDivElement>(null);
+  const keyboardRef = useRef<HTMLTextAreaElement>(null);
+  const [coarse] = useState(coarsePointer);
+  const [touchControl, setTouchControl] = useState(loadTouchControl);
+  const watching = onScreen && picture !== null;
+  const touch = useTouchInput(
+    screenRef,
+    viewRef,
+    canvasRef,
+    cursorRef,
+    watching,
+    canControl ? touchControl : "view",
+    sendInput,
+    // A finger on the screen takes control as a click does, unless the
+    // keyboard is up: taking the focus from it would put it away.
+    () => {
+      if (document.activeElement !== keyboardRef.current) canvasRef.current?.focus({ preventScroll: true });
+    },
+  );
+  const touchShown = watching && (coarse || touch.touched);
+  const keyboard = useTouchKeyboard(keyboardRef, canControl && touchShown, sendInput, viewing?.text === true);
+  const controlling = input.active || keyboard.typing;
+  const chooseTouchControl = (control: TouchControl): void => {
+    setTouchControl(control);
+    saveTouchControl(control);
+  };
+  const releaseControl = (): void => {
+    keyboard.close();
+    input.release();
+  };
+
   const getClipboard = (): void => {
     if (sendClipboard(null)) setClipNote(null);
   };
@@ -1087,7 +1176,7 @@ function Viewer({
   return (
     <div className="stage-wrap" hidden={!shown}>
       {/* Any click on the stage lets the browser start the sound. */}
-      <div ref={stageRef} className={input.active ? "stage controlling" : "stage"} onPointerDown={unlockSound}>
+      <div ref={stageRef} className={controlling ? "stage controlling" : "stage"} onPointerDown={unlockSound}>
         <div className="stage-bar">
           {onScreen ? (
             <span className="live">
@@ -1122,12 +1211,18 @@ function Viewer({
             </button>
           )}
           {canControl && (
-            <span className={input.active ? "control live" : "control"}>
-              {input.active ? (keysLocked ? "Input + keyboard lock" : "Input captured") : "Click to control"}
+            <span className={controlling ? "control live" : "control"}>
+              {controlling
+                ? keysLocked
+                  ? "Input + keyboard lock"
+                  : "Input captured"
+                : touchShown
+                  ? "Tap to control"
+                  : "Click to control"}
             </span>
           )}
-          {input.active && (
-            <button type="button" onClick={input.release}>
+          {controlling && (
+            <button type="button" onClick={releaseControl}>
               Release
             </button>
           )}
@@ -1349,31 +1444,117 @@ function Viewer({
           </div>
         )}
         <div
-          className={dropping ? "stage-screen dropping" : "stage-screen"}
+          ref={screenRef}
+          className={["stage-screen", dropping && "dropping", watching && "touchable", touchShown && "touch"]
+            .filter(Boolean)
+            .join(" ")}
           onDragOver={onDragOver}
           onDragLeave={() => setDropping(false)}
           onDrop={onDrop}
         >
           <Corners />
-          <canvas
-            ref={canvasRef}
-            className={[
-              (!onScreen || picture === null) && "hidden",
-              canControl && "controllable",
-              input.active && "controlling",
-            ]
-              .filter(Boolean)
-              .join(" ")}
-            // Focusable only when it can be controlled: focusing it is what
-            // starts sending input, and Tab shouldn't land on a dead screen.
-            tabIndex={canControl ? 0 : -1}
-            aria-label={onScreen ? `${name} screen` : undefined}
-          />
+          {/* What a pinch zooms: the picture (and the <video> the MSE
+              fallback lays under it), not the marks or the overlays. */}
+          <div ref={viewRef} className="stage-view">
+            <canvas
+              ref={canvasRef}
+              className={[
+                (!onScreen || picture === null) && "hidden",
+                canControl && "controllable",
+                input.active && "controlling",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              // Focusable only when it can be controlled: focusing it is what
+              // starts sending input, and Tab shouldn't land on a dead screen.
+              tabIndex={canControl ? 0 : -1}
+              aria-label={onScreen ? `${name} screen` : undefined}
+            />
+          </div>
+          <div
+            ref={cursorRef}
+            className="touch-cursor"
+            hidden={!(canControl && touchControl === "trackpad" && touch.touched)}
+          >
+            <svg viewBox="0 0 12 18" width="12" height="18" aria-hidden="true">
+              <path d="M0.5 0.5 L0.5 14.5 L4 11.2 L6.4 16.8 L8.6 15.9 L6.3 10.4 L11 10.4 Z" />
+            </svg>
+          </div>
+          {canControl && touchShown && (
+            <textarea
+              ref={keyboardRef}
+              className="touch-keyboard"
+              aria-label={`Type on ${name}`}
+              autoCapitalize="off"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+              tabIndex={-1}
+            />
+          )}
           {onScreen && statsShown && (
             <StatsOverlay stats={stats} picture={picture} pings={viewing.ping === true} quality={streamQuality} />
           )}
           {signal}
         </div>
+        {touchShown && (
+          <div className="touch-bar" role="toolbar" aria-label="Touch controls">
+            {canControl && (
+              <>
+                <button
+                  type="button"
+                  aria-pressed={touchControl === "trackpad"}
+                  title="Drag to move the pointer, tap to click"
+                  onClick={() => chooseTouchControl("trackpad")}
+                >
+                  Trackpad
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={touchControl === "direct"}
+                  title="Tap where you want to click"
+                  onClick={() => chooseTouchControl("direct")}
+                >
+                  Touch
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={keyboard.open}
+                  onMouseDown={keepFocus}
+                  onClick={keyboard.toggle}
+                >
+                  Keyboard
+                </button>
+              </>
+            )}
+            {touch.zoomed && (
+              <button type="button" title="Or tap twice with two fingers" onClick={touch.resetZoom}>
+                Fit
+              </button>
+            )}
+            {canControl &&
+              keyboard.open &&
+              EXTRA_KEYS.map((key) => (
+                <button
+                  key={key.code}
+                  type="button"
+                  className="key"
+                  aria-pressed={key.modifier === undefined ? undefined : keyboard.latched.has(key.modifier)}
+                  title={
+                    key.modifier === undefined ? undefined : `${key.label} for the next key; twice for ${key.label} alone`
+                  }
+                  onPointerDown={keepFocus}
+                  onMouseDown={keepFocus}
+                  onClick={() => {
+                    if (key.modifier === undefined) keyboard.press(key.code);
+                    else keyboard.latch(key.modifier);
+                  }}
+                >
+                  {key.label}
+                </button>
+              ))}
+          </div>
+        )}
       </div>
       {onScreen && (
         <div className="stage-foot">
@@ -1383,7 +1564,19 @@ function Viewer({
             </span>
           )}
           {viewing.role === "view" && <span>View only: you can watch this screen but not send it input.</span>}
-          {canControl && !input.active && <span>Click the screen to send it your mouse and keyboard.</span>}
+          {canControl && !controlling && !touchShown && (
+            <span>Click the screen to send it your mouse and keyboard.</span>
+          )}
+          {canControl && touchShown && (
+            <span>
+              {touchControl === "trackpad"
+                ? "Drag to move the pointer, tap to click, tap with two fingers to right-click, " +
+                  "hold then drag to drag, drag two fingers to scroll."
+                : "Tap to click, drag to drag, hold to right-click, drag two fingers to scroll."}{" "}
+              Pinch to zoom.
+            </span>
+          )}
+          {!canControl && touchShown && <span>Pinch to zoom.</span>}
           {dropNote !== null ? (
             <span>{dropNote}</span>
           ) : (
@@ -1398,7 +1591,7 @@ function Viewer({
           {clipNote !== null && <span>{clipNote}</span>}
           {powerNote !== null && <span>{powerNote}</span>}
           {sasNote !== null && <span>{sasNote}</span>}
-          {input.active && (
+          {input.active && !touchShown && (
             <span>
               The machine's own pointer isn't in the picture; yours stands in for it.{" "}
               {keysLocked ? (
