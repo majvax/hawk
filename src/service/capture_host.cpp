@@ -193,7 +193,8 @@ private:
                                                                             const std::wstring& pipe_name,
                                                                             const std::wstring& input_pipe_name,
                                                                             const std::wstring& clipboard_pipe_name,
-                                                                            bool                clipboard_listen) {
+                                                                            bool                clipboard_listen,
+                                                                            bool                audio) {
     auto directory = service_directory();
     if (!directory.has_value()) {
         return std::unexpected(directory.error());
@@ -206,6 +207,9 @@ private:
         if (clipboard_listen) {
             command_line += L" --clipboard-listen";
         }
+    }
+    if (audio) {
+        command_line += L" --audio";
     }
     std::wstring desktop = L"winsta0\\default";
 
@@ -566,6 +570,7 @@ struct CaptureHost::Impl {
             on_packet(CapturePacket{
                 .data = payload,
                 .is_keyframe = (header.flags & ipc::capture_flag_keyframe) != 0,
+                .is_audio = (header.flags & ipc::capture_flag_audio) != 0,
                 .timestamp = std::chrono::microseconds{header.timestamp_us},
             });
         }
@@ -651,7 +656,8 @@ std::expected<void, CaptureHostError> CaptureHost::start(PacketHandler on_packet
     }
 
     auto process =
-        launch_capture(session, pipe_name, input_pipe_name, clipboard_pipe_name, options.clipboard_listen);
+        launch_capture(session, pipe_name, input_pipe_name, clipboard_pipe_name, options.clipboard_listen,
+                       options.audio);
     if (!process.has_value()) {
         return std::unexpected(process.error());
     }

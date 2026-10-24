@@ -36,6 +36,19 @@ control**, enter a code from your authenticator first (see
 If your connection drops, the dashboard reconnects on its own and the
 view picks up where it was.
 
+## Sound
+
+What the machine plays comes with the picture, from its default output
+device, on the lock screen and the sign-in screen too. **Sound on / Sound
+off** above the screen mutes it on your side, and is remembered in this
+browser. If it says **Click for sound**, your browser is holding the sound
+back until you click the page. A quiet machine sends no sound at all.
+
+Sound needs a browser that can decode it (Chrome, Edge, Firefox on a
+computer, recent Safari). Where it can't, the button doesn't show, and the
+picture plays as before. The machine's owner can turn sound off in the
+[config file](/docs/machine-config#audio).
+
 ## Signing in remotely
 
 When nobody is signed in, after a restart, a crash or a sign-out, the

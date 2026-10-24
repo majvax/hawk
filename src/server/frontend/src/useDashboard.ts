@@ -3,7 +3,14 @@ import { type RefObject, useCallback, useEffect, useRef, useState } from "react"
 import { getSession } from "./api.js";
 import { IN_APP } from "./desktop.js";
 import { socketProtocols, socketUrl } from "./relay.js";
-import { type EnrollmentCheck, type MachineTrust, ViewSession, checkEnrollment, trustMachine } from "./e2e.js";
+import {
+  type EnrollmentCheck,
+  FRAME_AUDIO_FLAG,
+  type MachineTrust,
+  ViewSession,
+  checkEnrollment,
+  trustMachine,
+} from "./e2e.js";
 import {
   FileManager,
   type FileSender,
@@ -16,6 +23,7 @@ import { type OutputSink, type ShellInfo, ShellManager, type ShellSender } from 
 import { EMPTY_METRICS, MetricsManager, type MetricsRange, type MetricsSender, type MetricsState } from "./metrics.js";
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
+import { AudioPlayer, type SoundState, soundSupported } from "./audio.js";
 import type {
   ClipboardAccess,
   DashboardCommand,
@@ -240,6 +248,22 @@ export interface Dashboard {
   sendClipboard: (text: string | null) => boolean;
   // Skip the rest of the backoff and try now.
   reconnectNow: () => void;
+  // The machine's sound: whether it can play here, whether the browser is
+  // holding it back until a click, and whether it's muted.
+  sound: SoundState;
+  setMuted: (muted: boolean) => void;
+  // Call from a click or key press: lets the browser start the sound.
+  unlockSound: () => void;
+}
+
+const MUTED_KEY = "hawk.sound.muted";
+
+function loadMuted(): boolean {
+  try {
+    return window.localStorage.getItem(MUTED_KEY) === "1";
+  } catch {
+    return false;
+  }
 }
 
 // Keeps a socket to the relay open for as long as the session lasts. When
@@ -386,11 +410,29 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [identity, send],
   );
 
+  // One player for as long as the dashboard is open; each new stream
+  // starts it over.
+  const [sound, setSound] = useState<SoundState>(() => ({
+    supported: soundSupported(),
+    blocked: false,
+    muted: loadMuted(),
+  }));
+  const audioRef = useRef<AudioPlayer | null>(null);
+  const audioPlayer = useCallback((): AudioPlayer => {
+    if (audioRef.current === null) {
+      audioRef.current = new AudioPlayer(setSound);
+      audioRef.current.setMuted(loadMuted());
+    }
+    return audioRef.current;
+  }, []);
+  useEffect(() => () => audioRef.current?.close(), []);
+
   const teardownDecoder = useCallback((): void => {
     sawKeyframeRef.current = false;
     const decoder = decoderRef.current;
     decoderRef.current = null;
     decoder?.close();
+    audioRef.current?.reset();
   }, []);
 
   // Sizes the canvas to the picture, lets `draw` paint it, and counts it.
@@ -520,8 +562,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       const session = sessionRef.current;
       if (session === null) return;
       bytesRef.current += buffer.byteLength;
-      receivedRef.current += 1;
-      const keyframe = buffer.byteLength > 1 && (new Uint8Array(buffer, 1, 1)[0] ?? 0) & 0x01;
+      const flags = buffer.byteLength > 1 ? (new Uint8Array(buffer, 1, 1)[0] ?? 0) : 0;
+      const keyframe = flags & 0x01;
+      if ((flags & FRAME_AUDIO_FLAG) === 0) receivedRef.current += 1; // the stats count pictures
       if (pendingFramesRef.current >= MAX_PENDING_FRAMES && !keyframe) {
         sawKeyframeRef.current = false; // a gap: start again at a keyframe
         return;
@@ -530,15 +573,19 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       frameChainRef.current = frameChainRef.current
         .then(async () => {
           const frame = await session.openFrame(buffer);
-          if (frame !== null && sessionRef.current === session) decodeFrame(frame);
-          else if (frame === null) sawKeyframeRef.current = false;
+          if (frame !== null && sessionRef.current === session) {
+            if (frame.isAudio) audioPlayer().play(frame);
+            else decodeFrame(frame);
+          } else if (frame === null && (flags & FRAME_AUDIO_FLAG) === 0) {
+            sawKeyframeRef.current = false;
+          }
         })
         .catch((error: unknown) => console.error("frame:", error))
         .finally(() => {
           pendingFramesRef.current -= 1;
         });
     },
-    [decodeFrame],
+    [audioPlayer, decodeFrame],
   );
 
   // A new view starts with a clean slate, unless the browser can't decode
@@ -911,12 +958,26 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
 
       viewingRef.current = deviceId;
       resetTools(deviceId);
+      audioPlayer().unlock(); // a click asked for this view: sound may start
       blockedRef.current = null; // asked for by hand: try again
       setViewingId(deviceId);
       requestStream(deviceId); // while disconnected, the snapshot resumes it
     },
-    [clearPicture, requestStream, resetDecodeError, resetTools, send, teardownDecoder],
+    [audioPlayer, clearPicture, requestStream, resetDecodeError, resetTools, send, teardownDecoder],
   );
+
+  const setMuted = useCallback(
+    (muted: boolean): void => {
+      try {
+        window.localStorage.setItem(MUTED_KEY, muted ? "1" : "0");
+      } catch {
+        // Not remembered, then; it still applies now.
+      }
+      audioPlayer().setMuted(muted);
+    },
+    [audioPlayer],
+  );
+  const unlockSound = useCallback((): void => audioPlayer().unlock(), [audioPlayer]);
 
   useEffect(() => {
     if (viewingId === null) {
@@ -1101,5 +1162,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     sendInput,
     sendClipboard,
     reconnectNow,
+    sound,
+    setMuted,
+    unlockSound,
   };
 }

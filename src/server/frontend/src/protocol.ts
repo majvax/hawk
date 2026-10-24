@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -160,6 +160,8 @@ export type DashboardCommand =
 // (ViewSession.openFrame has the frame layout).
 export interface ParsedVideoFrame {
   isKeyframe: boolean;
+  // An Opus packet of the machine's sound, not video.
+  isAudio: boolean;
   timestamp: number; // microseconds
-  data: Uint8Array<ArrayBuffer>; // the H.264 access unit
+  data: Uint8Array<ArrayBuffer>; // the H.264 access unit, or the Opus packet
 }

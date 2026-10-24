@@ -54,6 +54,10 @@ struct MetricsTable {
     std::optional<std::uint32_t> history_days;
 };
 
+struct AudioTable {
+    std::optional<bool> enabled;
+};
+
 struct ConfigFile {
     std::vector<ClipboardTable> clipboard;
     std::vector<FilesTable>     files;
@@ -61,6 +65,7 @@ struct ConfigFile {
     std::vector<RelayTable>     relay;
     std::vector<UpdateTable>    update;
     std::vector<MetricsTable>   metrics;
+    std::vector<AudioTable>     audio;
 };
 
 }  // namespace
@@ -259,6 +264,19 @@ namespace {
     return config;
 }
 
+[[nodiscard]] std::optional<AudioConfig> audio_config(const std::vector<AudioTable>& tables) {
+    AudioConfig config;
+    if (tables.empty()) {
+        return config;
+    }
+    if (tables.size() > 1) {
+        spdlog::error("config: {} has more than one [[audio]] table", kConfigPath.string());
+        return std::nullopt;
+    }
+    config.enabled = tables.front().enabled.value_or(config.enabled);
+    return config;
+}
+
 [[nodiscard]] std::optional<MetricsConfig> metrics_config(const std::vector<MetricsTable>& tables) {
     MetricsConfig config;
     if (tables.empty()) {
@@ -349,6 +367,12 @@ MachineConfig load_machine_config() {
         config.metrics = *metrics;
     } else {
         spdlog::error("config: analytics use the defaults until {} is fixed", kConfigPath.string());
+    }
+    if (auto audio = audio_config(parsed.audio); audio.has_value()) {
+        config.audio = *audio;
+    } else {
+        spdlog::error("config: sound is off until {} is fixed", kConfigPath.string());
+        config.audio.enabled = false;
     }
     return config;
 }

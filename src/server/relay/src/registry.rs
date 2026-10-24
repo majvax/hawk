@@ -17,7 +17,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
-use crate::protocol::{DashboardEvent, DeviceCommand, MachineView, POWER_PROTOCOL, SignedView, is_keyframe};
+use crate::protocol::{DashboardEvent, DeviceCommand, MachineView, POWER_PROTOCOL, SignedView, is_audio, is_keyframe};
 
 pub type DashboardId = u64;
 
@@ -358,9 +358,16 @@ impl Registry {
     /// viewer whose queue is full loses frames until the next keyframe.
     pub fn forward_frame(&self, machine_id: &str, frame: Bytes) {
         let keyframe = is_keyframe(&frame);
+        let audio = is_audio(&frame);
         let mut inner = self.lock();
         let Some(device) = inner.devices.get_mut(machine_id) else { return };
         for viewer in device.viewers.values_mut().filter(|viewer| viewer.video) {
+            if audio {
+                // Each packet stands alone: a lost one is a click, not a
+                // broken picture, so it never waits for a keyframe.
+                let _ = viewer.frames.try_send(frame.clone());
+                continue;
+            }
             if viewer.awaiting_keyframe && !keyframe {
                 continue;
             }
@@ -453,7 +460,7 @@ impl Registry {
             })
             .or_insert(viewer);
         if was_idle {
-            device.send(DeviceCommand::StartCapture);
+            device.send(DeviceCommand::StartCapture { audio: true });
         }
         device.send(DeviceCommand::ViewerJoin {
             viewer: dashboard_id,
@@ -842,7 +849,7 @@ mod tests {
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
         registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
-        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture)));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture { .. })));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
         (registry, dashboard, device_rx, events_rx)
     }
@@ -855,7 +862,7 @@ mod tests {
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
         registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
-        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture)));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture { .. })));
         let Some(DeviceCommand::ViewerJoin { viewer, grant, .. }) = next(&mut device_rx) else { panic!("no join") };
         assert_eq!(viewer, dashboard);
         assert_eq!(grant.map(|grant| grant.statement), Some("hawk-grant-v1".to_owned()));
@@ -981,6 +988,29 @@ mod tests {
         registry.going_down(MACHINE, connection, false);
         registry.remove_device(MACHINE, connection, auth::now());
         assert!(last_view(&mut events).is_some_and(|view| !view.restarting));
+    }
+
+    /// Sound gets through while the picture waits for its next keyframe.
+    #[test]
+    fn audio_never_waits_for_a_keyframe() {
+        let registry = Registry::default();
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let (frames, mut frames_rx) = mpsc::channel(8);
+        let (bulk, _) = mpsc::channel(1);
+        let handle =
+            DashboardHandle { events, frames, bulk, user_id: 1, session_id: 1, email: "o@example.com".to_owned(), step_up: StepUp::default() };
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::Owner)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture { audio: true })));
+
+        registry.forward_frame(MACHINE, Bytes::from_static(&[2, 0, 1])); // a delta: dropped
+        registry.forward_frame(MACHINE, Bytes::from_static(&[2, 2, 2])); // audio: through
+        registry.forward_frame(MACHINE, Bytes::from_static(&[2, 1, 3])); // a keyframe: through
+        assert_eq!(frames_rx.try_recv().ok().as_deref(), Some([2, 2, 2].as_slice()));
+        assert_eq!(frames_rx.try_recv().ok().as_deref(), Some([2, 1, 3].as_slice()));
+        assert!(frames_rx.try_recv().is_err());
     }
 
     #[test]

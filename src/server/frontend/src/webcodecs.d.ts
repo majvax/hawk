@@ -37,3 +37,42 @@ declare class VideoDecoder {
   close(): void;
   static isConfigSupported(config: VideoDecoderConfig): Promise<{ supported: boolean }>;
 }
+
+// The audio side: Opus packets from the machine (see audio.ts).
+interface EncodedAudioChunkInit {
+  type: "key" | "delta";
+  timestamp: number; // microseconds
+  data: BufferSource;
+}
+declare class EncodedAudioChunk {
+  constructor(init: EncodedAudioChunkInit);
+}
+
+interface AudioData {
+  readonly sampleRate: number;
+  readonly numberOfFrames: number;
+  readonly numberOfChannels: number;
+  readonly timestamp: number; // microseconds
+  copyTo(destination: BufferSource, options: { planeIndex: number; format?: "f32-planar" }): void;
+  close(): void;
+}
+
+interface AudioDecoderConfig {
+  codec: string;
+  sampleRate: number;
+  numberOfChannels: number;
+}
+
+interface AudioDecoderInit {
+  output: (data: AudioData) => void;
+  error: (error: DOMException) => void;
+}
+
+declare class AudioDecoder {
+  constructor(init: AudioDecoderInit);
+  readonly state: "unconfigured" | "configured" | "closed";
+  configure(config: AudioDecoderConfig): void;
+  decode(chunk: EncodedAudioChunk): void;
+  close(): void;
+  static isConfigSupported(config: AudioDecoderConfig): Promise<{ supported: boolean }>;
+}

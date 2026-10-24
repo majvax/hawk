@@ -85,7 +85,14 @@ struct MetricsConfig {
     std::uint32_t history_days = default_metrics_history_days;
 };
 
+// [[audio]]: what the machine plays goes to its viewers with the picture,
+// for anyone who may watch. On by default; off keeps the room's sound in it.
+struct AudioConfig {
+    bool enabled = true;
+};
+
 struct MachineConfig {
+    AudioConfig     audio;
     ClipboardConfig clipboard;
     FilesConfig     files;
     ShellConfig     shell;
@@ -98,6 +105,9 @@ struct MachineConfig {
 // A file that doesn't parse, or says something that makes no sense, is
 // logged and turns the clipboard off: a typo should never open up more
 // than the defaults would.
+//
+//   [[audio]]
+//   enabled = true
 //
 //   [[clipboard]]
 //   mode = "pull"        # off | pull | sync

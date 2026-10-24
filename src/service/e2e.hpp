@@ -150,10 +150,10 @@ public:
     // Refuses viewers whose grant has run out. Cheap; call it often.
     void check_expiry();
 
-    // One encoded frame, sealed under the current stream key, in the
-    // binary layout the relay forwards.
+    // One encoded frame (or with `audio`, one Opus packet), sealed under
+    // the current stream key, in the binary layout the relay forwards.
     [[nodiscard]] crypto::Bytes seal_frame(std::span<const std::byte> access_unit, bool keyframe,
-                                           std::chrono::microseconds timestamp);
+                                           std::chrono::microseconds timestamp, bool audio = false);
 
 private:
     struct Impl;

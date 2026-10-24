@@ -649,6 +649,9 @@ function Viewer({
     sendClipboard,
     sendPower,
     elevated,
+    sound,
+    setMuted,
+    unlockSound,
   } = dashboard;
   const requestStepUp = useStepUp();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -888,7 +891,8 @@ function Viewer({
 
   return (
     <div className="stage-wrap" hidden={!shown}>
-      <div ref={stageRef} className={input.active ? "stage controlling" : "stage"}>
+      {/* Any click on the stage lets the browser start the sound. */}
+      <div ref={stageRef} className={input.active ? "stage controlling" : "stage"} onPointerDown={unlockSound}>
         <div className="stage-bar">
           {onScreen ? (
             <span className="live">
@@ -957,6 +961,16 @@ function Viewer({
               }}
             >
               Power ▾
+            </button>
+          )}
+          {onScreen && sound.supported && (
+            <button
+              type="button"
+              aria-pressed={!sound.muted && !sound.blocked}
+              title={sound.blocked ? "Your browser holds sound back until you click" : undefined}
+              onClick={() => (sound.blocked ? unlockSound() : setMuted(!sound.muted))}
+            >
+              {sound.blocked ? "Click for sound" : sound.muted ? "Sound off" : "Sound on"}
             </button>
           )}
           {onScreen && (

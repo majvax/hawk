@@ -54,7 +54,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 3;
+constexpr std::uint32_t kProtocolVersion = 4;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -121,6 +121,7 @@ struct RelayCommand {
     std::optional<svc::SignedStatement>          grant;          // viewer_join
     std::string                                  sealed;         // input, clipboard, file, shell, metrics, power
     std::vector<svc::SignedStatement>            revocations;    // revocations
+    bool                                         audio = false;  // start_capture: the relay passes sound on
 };
 
 }  // namespace
@@ -158,7 +159,8 @@ struct glz::meta<RelayCommand> {
     static constexpr auto value =
         object("type", &T::type, "nonce", &T::nonce, "machine_id", &T::machine_id, "owner_key", &T::owner_key,
                "owner_binding", &T::owner_binding, "viewer", &T::viewer, "statement", &T::statement, "signature",
-               &T::signature, "grant", &T::grant, "sealed", &T::sealed, "revocations", &T::revocations);
+               &T::signature, "grant", &T::grant, "sealed", &T::sealed, "revocations", &T::revocations, "audio",
+               &T::audio);
 };
 
 template <>
@@ -359,14 +361,15 @@ bool DiscardFailedEnrollment(std::expected<Session, SessionProblem>& session) {
 // the clipboard allowed, what hawk-capture reads off it goes to the viewers
 // that asked (or, in sync mode, everyone who may read it).
 void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::ViewerHub& hub,
-                  const svc::ClipboardConfig& clipboard) {
+                  const svc::ClipboardConfig& clipboard, bool audio) {
     if (capture.is_running()) {
         spdlog::info("relay: start_capture ignored, capture already running");
         return;
     }
 
     const svc::CaptureOptions options{.clipboard = clipboard.mode != svc::ClipboardMode::off,
-                                      .clipboard_listen = clipboard.mode == svc::ClipboardMode::sync};
+                                      .clipboard_listen = clipboard.mode == svc::ClipboardMode::sync,
+                                      .audio = audio};
     auto on_clipboard = [&hub](ipc::ClipboardKind kind, std::string_view text) {
         hub.deliver_clipboard(text, kind == ipc::ClipboardKind::changed);
     };
@@ -374,7 +377,7 @@ void StartCapture(net::WebSocketClient& client, svc::CaptureHost& capture, svc::
         // Frames come steadily, so this is where shares that ran out are
         // noticed and their viewers cut off.
         hub.check_expiry();
-        const auto frame = hub.seal_frame(packet.data, packet.is_keyframe, packet.timestamp);
+        const auto frame = hub.seal_frame(packet.data, packet.is_keyframe, packet.timestamp, packet.is_audio);
         if (frame.empty()) {
             return;
         }
@@ -453,6 +456,9 @@ struct Connection {
     // A viewer asked for the stream (start_capture) and hasn't stopped it:
     // CaptureSupervisor keeps hawk-capture running until then.
     bool capture_wanted = false;
+    // And the machine's sound with it: the relay passes it on, and the
+    // config allows it.
+    bool capture_audio = false;
 };
 
 // Carries out a power action a viewer asked for, and for a restart or shut
@@ -510,8 +516,8 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
-    auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater, capture_wanted] =
-        connection;
+    auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater, capture_wanted,
+           capture_audio] = connection;
 
     if (command.type == "challenge") {
         if (auto sent = client.send_text(BuildProofMessage(session, command.nonce)); !sent.has_value()) {
@@ -533,7 +539,9 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::debug("relay: ignoring \"{}\" before enrollment", command.type);
     } else if (command.type == "start_capture") {
         capture_wanted = true;
-        StartCapture(client, capture, *hub, config.clipboard);
+        // A relay too old to pass sound on doesn't ask for it.
+        capture_audio = command.audio && config.audio.enabled;
+        StartCapture(client, capture, *hub, config.clipboard, capture_audio);
     } else if (command.type == "stop_capture") {
         capture_wanted = false;
         capture.stop();
@@ -651,7 +659,8 @@ void CaptureSupervisor(const std::stop_token& stop_token, std::mutex& lock, Conn
             spdlog::info("capture: hawk-capture isn't running, starting it again");
         }
         capture.stop();
-        StartCapture(connection.client, capture, *connection.hub, connection.config.clipboard);
+        StartCapture(connection.client, capture, *connection.hub, connection.config.clipboard,
+                     connection.capture_audio);
         started_at = now;
         next_attempt = now + retry_delay;
         retry_delay = std::min(retry_delay * 2, kCaptureRetryMax);
@@ -860,6 +869,7 @@ void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* ar
                  config.clipboard.view_pull ? ", view shares may read it" : "");
     spdlog::info("config: file transfer {}", config.files.enabled ? "on" : "off");
     spdlog::info("config: shell {}", config.shell.enabled ? std::format("on (\"{}\")", config.shell.command) : "off");
+    spdlog::info("config: sound {}", config.audio.enabled ? "on" : "off");
 
     ServiceContext service;
     service.status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;

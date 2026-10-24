@@ -74,6 +74,7 @@ add_executable(hawk-capture
     capture/input.cpp
     capture/desktop.cpp
     capture/clipboard.cpp
+    capture/audio.cpp
     capture/capture.rc  # embeds capture.manifest (DPI awareness, asInvoker)
     ${HAWK_VERSION_RC}
 )
@@ -91,6 +92,7 @@ target_include_directories(hawk-capture PRIVATE
 target_link_libraries(hawk-capture PRIVATE
     fmt::fmt
     spdlog::spdlog
+    opus
     user32
     d3d11
     dxgi

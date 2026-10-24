@@ -1,3 +1,4 @@
+#include "audio.hpp"
 #include "clipboard.hpp"
 #include "common/capture_pipe.hpp"
 #include "desktop.hpp"
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -103,13 +105,19 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return pipe_ != INVALID_HANDLE_VALUE; }
 
-    // Returns false once hawk-service has closed its end.
-    [[nodiscard]] bool write(const capture::EncodedPacket& packet) {
+    // Returns false once hawk-service has closed its end. Video and audio
+    // write from their own threads; a packet goes out whole either way.
+    [[nodiscard]] bool write(const capture::EncodedPacket& packet, bool audio = false) {
+        std::uint8_t flags = packet.is_keyframe ? hawk::ipc::capture_flag_keyframe : std::uint8_t{0};
+        if (audio) {
+            flags |= hawk::ipc::capture_flag_audio;
+        }
         const hawk::ipc::CapturePacketHeader header{
             .size = static_cast<std::uint32_t>(packet.data.size()),
             .timestamp_us = packet.timestamp.count(),
-            .flags = packet.is_keyframe ? hawk::ipc::capture_flag_keyframe : std::uint8_t{0},
+            .flags = flags,
         };
+        const std::scoped_lock lock(mutex_);
         return write_all(std::as_bytes(std::span(&header, 1))) && write_all(packet.data);
     }
 
@@ -125,12 +133,13 @@ private:
         return true;
     }
 
-    HANDLE pipe_ = INVALID_HANDLE_VALUE;
+    HANDLE     pipe_ = INVALID_HANDLE_VALUE;
+    std::mutex mutex_;
 };
 
-// hawk-service launches us with `--pipe <name> --input-pipe <name>`, and
+// hawk-service launches us with `--pipe <name> --input-pipe <name>`,
 // `--clipboard-pipe <name>` (plus `--clipboard-listen`) when its config
-// allows the clipboard.
+// allows the clipboard, and `--audio` when the machine's sound goes too.
 [[nodiscard]] std::optional<std::string> option_value(std::span<char* const> args, std::string_view option) {
     for (std::size_t i = 1; i + 1 < args.size(); ++i) {
         if (std::string_view(args[i]) == option) {
@@ -237,6 +246,23 @@ int main(int argc, char* argv[]) {
     std::size_t   bytes_this_window = 0;
     auto          window_start = std::chrono::steady_clock::now();
     const auto    stream_start = window_start;
+
+    // What the machine plays, on the same clock as the frames. Its own
+    // thread, stopped before the pipe closes on any return below.
+    // Run on its own, it only counts the packets.
+    capture::AudioCapture audio;
+    if (has_flag(args, "--audio")) {
+        audio.start(stream_start, [&pipe, count = std::uint64_t{0}](const capture::EncodedPacket& packet) mutable {
+            if (pipe.is_open()) {
+                return pipe.write(packet, true);
+            }
+            if (++count % 50 == 0) {
+                spdlog::info("audio: {} packets, the last {} bytes at {} ms", count, packet.data.size(),
+                             packet.timestamp.count() / 1000);
+            }
+            return true;
+        });
+    }
 
     // Encode on a fixed frame clock at the encoder's frame rate. Desktop
     // Duplication only produces a frame when the screen changes, at up to the

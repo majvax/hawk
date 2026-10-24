@@ -178,7 +178,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [ ] Installer pre-stamped by the dashboard with relay URL, pin and enroll code; Authenticode signing
 - [ ] Machine config file, schema-described and synced to the dashboard
 - [ ] Multiple display support (per-display capture, display-aware input)
-- [ ] Audio (WASAPI loopback, Opus) alongside the video stream
+- [x] Audio (WASAPI loopback, Opus) alongside the video stream
+- [ ] Audio follow-ups: playback on the MSE fallback (Firefox for Android), video slewed to the audio clock, a device picker
 - [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
 - [x] File transfer into and out of one drop folder, resumable and hash-checked, off unless the machine's config turns it on
 - [x] Remote power actions (lock, sign out, restart, shut down), reboot-and-reconnect, remote sign-in at the sign-in screen
@@ -456,10 +457,23 @@ let the viewer choose, or see them all.
 * `displays.shareable` in the config keeps a screen private — a second
   monitor that never leaves the room even when the machine is shared.
 
-### Audio
+### Audio (built, except the MSE fallback, A/V sync and a device picker)
 
-The video stream carries no sound today, which rules out anything with a
-video, a call or an alert in it.
+Built: hawk-capture captures the default render endpoint with WASAPI
+loopback on a thread of its own. It asks Windows to convert to 48 kHz
+stereo float, and converts the device's mix format itself where Windows
+won't. It encodes Opus (libopus, 20 ms frames, 96 kbit/s) and writes the
+packets down the capture pipe with an audio flag, on the video's clock.
+The service seals them into the stream like frames (flag `0x02` in the
+clear). The relay passes them on without waiting for a keyframe, but only
+after it has said `start_capture { audio: true }`, so an older relay's
+dashboards never get them. The dashboard decodes them with a WebCodecs
+`AudioDecoder` and schedules them back to back on an `AudioContext`, with
+an 80 ms cushion. It drops late packets to stay under 400 ms. A default
+device change is followed, silence isn't sent, and `[[audio]] enabled`
+turns it off. Not yet: the MSE fallback path (no `AudioDecoder` there
+means no sound), slewing video to the audio clock, the latency/sync
+toggle and a device picker. The original plan:
 
 * **Capture:** WASAPI loopback (`IAudioClient` with
   `AUDCLNT_STREAMFLAGS_LOOPBACK`) on the default render endpoint, encoded as

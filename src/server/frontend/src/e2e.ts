@@ -212,6 +212,8 @@ export async function trustMachine(identity: Identity, machine: Machine): Promis
 // authenticated as associated data; the relay reads only the flags.
 const FRAME_KIND_ENCRYPTED = 0x02;
 const FRAME_KEYFRAME_FLAG = 0x01;
+// The frame carries an Opus packet of the machine's sound.
+export const FRAME_AUDIO_FLAG = 0x02;
 const FRAME_AAD_SIZE = 14;
 const FRAME_HEADER_SIZE = FRAME_AAD_SIZE + 12;
 
@@ -391,6 +393,7 @@ export class ViewSession {
       );
       return {
         isKeyframe: ((bytes[1] ?? 0) & FRAME_KEYFRAME_FLAG) !== 0,
+        isAudio: ((bytes[1] ?? 0) & FRAME_AUDIO_FLAG) !== 0,
         timestamp: Number(view.getBigInt64(2, true)),
         data,
       };

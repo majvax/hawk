@@ -14,7 +14,13 @@ Each release's section becomes its release notes (see
   encrypted like input, so the relay can neither read nor forge it.
 - A machine restarting from the dashboard shows as **Restarting**, not
   offline, and the view comes back by itself.
-- Protocol version 3.
+- **Sound.** What the machine plays comes with the picture: WASAPI
+  loopback on its default output device, Opus at 96 kbit/s, sealed in the
+  stream like the video. It follows a change of output device, keeps
+  playing on the lock and sign-in screens, and sends nothing while the
+  machine is quiet. **Sound on / off** in the live view; `[[audio]] enabled
+  = false` in the machine's config keeps it in the room.
+- Protocol version 4.
 
 ## 1.0.0
 

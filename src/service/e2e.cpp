@@ -65,6 +65,8 @@ constexpr std::size_t kMaxHeld = 32;
 
 constexpr std::byte   kFrameKindEncrypted{0x02};
 constexpr std::byte   kFrameKeyframeFlag{0x01};
+// The frame is an Opus packet, not video; see frontend/src/e2e.ts.
+constexpr std::byte   kFrameAudioFlag{0x02};
 constexpr std::size_t kFrameAadSize = 14;  // kind, flags, timestamp, key id
 
 [[nodiscard]] std::int64_t unix_seconds() {
@@ -1263,7 +1265,7 @@ void ViewerHub::check_expiry() {
 }
 
 crypto::Bytes ViewerHub::seal_frame(std::span<const std::byte> access_unit, bool keyframe,
-                                    std::chrono::microseconds timestamp) {
+                                    std::chrono::microseconds timestamp, bool audio) {
     auto&                 impl = *impl_;
     const std::lock_guard lock(impl.mutex);
     auto&                 stream = impl.stream;
@@ -1273,7 +1275,7 @@ crypto::Bytes ViewerHub::seal_frame(std::span<const std::byte> access_unit, bool
     crypto::Bytes frame;
     frame.reserve(kFrameAadSize + crypto::gcm_iv_size + access_unit.size() + crypto::gcm_tag_size);
     frame.push_back(kFrameKindEncrypted);
-    frame.push_back(keyframe ? kFrameKeyframeFlag : std::byte{0});
+    frame.push_back((keyframe ? kFrameKeyframeFlag : std::byte{0}) | (audio ? kFrameAudioFlag : std::byte{0}));
     const auto ticks = static_cast<std::uint64_t>(timestamp.count());
     for (std::size_t i = 0; i < sizeof(ticks); ++i) {
         frame.push_back(static_cast<std::byte>((ticks >> (8 * i)) & 0xFFU));

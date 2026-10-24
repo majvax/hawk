@@ -14,12 +14,15 @@ namespace hawk::ipc {
 
 inline constexpr std::uint32_t capture_packet_magic = 0x4B574148;  // "HAWK", little-endian
 inline constexpr std::uint8_t  capture_flag_keyframe = 0x01;
+// The payload is an Opus packet (48 kHz stereo, 20 ms), not video.
+inline constexpr std::uint8_t  capture_flag_audio = 0x02;
 
 // Upper bound on one access unit, so a corrupt header can't make the reader
 // allocate an arbitrary amount of memory.
 inline constexpr std::uint32_t max_capture_packet_size = 16U * 1024U * 1024U;
 
-// Precedes every H.264 access unit (Annex B) on the pipe.
+// Precedes every H.264 access unit (Annex B) or Opus packet on the pipe.
+// Both are timestamped on the same clock.
 struct CapturePacketHeader {
     std::uint32_t               magic = capture_packet_magic;
     std::uint32_t               size = 0;          // payload bytes that follow

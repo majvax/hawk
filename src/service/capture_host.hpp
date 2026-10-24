@@ -30,11 +30,13 @@ struct CaptureHostError {
 [[nodiscard]] std::string_view to_string(CaptureHostError::Code code) noexcept;
 [[nodiscard]] std::string      to_string(const CaptureHostError& error);
 
-// One H.264 access unit (Annex B) received from hawk-capture. `data` is only
-// valid for the duration of the PacketHandler call.
+// One H.264 access unit (Annex B), or with `is_audio` one Opus packet,
+// received from hawk-capture. `data` is only valid for the duration of the
+// PacketHandler call.
 struct CapturePacket {
     std::span<const std::byte> data;
     bool                       is_keyframe = false;
+    bool                       is_audio = false;
     std::chrono::microseconds  timestamp{0};
 };
 
@@ -44,6 +46,8 @@ struct CaptureOptions {
     bool clipboard = false;
     // Have hawk-capture report every copy made on the machine (sync mode).
     bool clipboard_listen = false;
+    // Capture what the machine plays, too.
+    bool audio = false;
 };
 
 // Runs hawk-capture.exe inside the active console session and receives its

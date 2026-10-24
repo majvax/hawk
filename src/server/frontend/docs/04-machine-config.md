@@ -15,8 +15,8 @@ the service, from an elevated PowerShell:
 Restart-Service HawkService
 ```
 
-With no file, every feature has its defaults: clipboard **pull**, file
-transfer **off**, shells **off**.
+With no file, every feature has its defaults: sound **on**, clipboard
+**pull**, file transfer **off**, shells **off**.
 
 **A mistake never opens up more than the defaults.** A file that doesn't
 parse, an unknown value, or the same table written twice turns that
@@ -26,6 +26,9 @@ feature **off**, and the log says why
 ## A full example
 
 ```toml
+[[audio]]
+enabled = true           # what the machine plays goes to its viewers
+
 [[clipboard]]
 mode = "pull"            # off | pull | sync
 max_size = 262144        # bytes of text, at most 262144 (256 KB)
@@ -44,6 +47,13 @@ command = "powershell.exe -NoLogo"   # or pwsh.exe, cmd.exe, ...
 enabled = true           # the Analytics and Processes tabs
 history_days = 7         # how long the machine keeps its history, 1 to 90
 ```
+
+## Audio
+
+What the machine plays (its default output device) goes to everyone
+watching, with the picture. Anyone who may watch hears it, view-only shares
+included. `enabled = false` keeps the room's sound in the room. A config
+that doesn't parse turns sound off too.
 
 ## Clipboard
 

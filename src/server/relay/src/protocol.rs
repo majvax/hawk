@@ -11,7 +11,7 @@ use crate::db::{Role, Signed};
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The first protocol whose machines take power actions.
 pub const POWER_PROTOCOL: u32 = 3;
@@ -129,7 +129,10 @@ pub enum DeviceCommand {
     /// and `owner_binding` its HMAC under the enrollment code, which the
     /// machine checks before pinning the key as its owner's.
     Enrolled { machine_id: String, owner_key: String, owner_binding: String },
-    StartCapture,
+    /// `audio`: this relay passes the machine's sound on, so it may send
+    /// it. A machine never sends it to a relay that didn't say so, whose
+    /// dashboards would take it for video.
+    StartCapture { audio: bool },
     StopCapture,
     /// A viewer asks for the stream: its signed join request, and the grant
     /// the owner signed for it (none when the viewer is the owner). The
@@ -388,6 +391,12 @@ pub enum DashboardEvent {
 /// which stays readable so it can start new viewers on a keyframe.
 pub fn is_keyframe(frame: &[u8]) -> bool {
     frame.get(1).is_some_and(|flags| flags & 0x01 != 0)
+}
+
+/// An Opus packet rather than video: the flag is in the clear, like the
+/// keyframe one, so the relay can treat it apart.
+pub fn is_audio(frame: &[u8]) -> bool {
+    frame.get(1).is_some_and(|flags| flags & 0x02 != 0)
 }
 
 #[cfg(test)]
