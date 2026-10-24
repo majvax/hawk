@@ -225,6 +225,12 @@ const CLIPBOARD_SET = 1;
 const CLIPBOARD_GET = 2;
 const CLIPBOARD_TEXT = 3;
 const CLIPBOARD_PUSH = 4;
+// Clipboard pictures: the image channel either way, and chunks of one to
+// paste, sealed apart so the relay can hold those to control.
+const CLIPBOARD_IMAGE_AAD = utf8("hawk-clipboard-image-v1");
+const CLIPBOARD_IMAGE_PUT_AAD = utf8("hawk-clipboard-image-put-v1");
+// The image channel's answers, sealed on the reply key with clipboard text.
+const CLIPBOARD_IMAGE_REPLY_AAD = utf8("hawk-clipboard-image-reply-v1");
 const FILE_AAD = utf8("hawk-file-v1");
 const SHELL_AAD = utf8("hawk-shell-v1");
 const METRICS_AAD = utf8("hawk-metrics-v1");
@@ -315,6 +321,9 @@ export class ViewSession {
   // And the machine's config, likewise.
   private configKey: CryptoKey | null = null;
   private configCounter = 0n;
+  // And clipboard pictures, likewise.
+  private imageKey: CryptoKey | null = null;
+  private imageCounter = 0n;
   private readonly streamKeys = new Map<number, CryptoKey>();
   // Numbers input events and clipboard requests alike: the machine keeps
   // one counter for both.
@@ -366,7 +375,9 @@ export class ViewSession {
       throw new Error("the machine's answer doesn't match this request");
     }
     const shared = await exchange(this.exchangeKey.privateKey, fromBase64(ephemeral));
-    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 256);
+    // HKDF output is a prefix of any longer output: a machine that derives
+    // fewer keys agrees on the ones it has.
+    const keys = await hkdf(shared, joinHash, "hawk-session-v1", 288);
     this.inputKey = await aesKey(keys.slice(0, 32), ["encrypt"]);
     this.wrapKey = await aesKey(keys.slice(32, 64), ["decrypt"]);
     this.replyKey = await aesKey(keys.slice(64, 96), ["decrypt"]);
@@ -375,6 +386,7 @@ export class ViewSession {
     this.metricsKey = await aesKey(keys.slice(160, 192), ["decrypt"]);
     this.audioKey = await aesKey(keys.slice(192, 224), ["decrypt"]);
     this.configKey = await aesKey(keys.slice(224, 256), ["decrypt"]);
+    this.imageKey = await aesKey(keys.slice(256, 288), ["decrypt"]);
     this.role = role;
     // A dev viewer doesn't watch the screen, and is never given its key.
     if (answer.wrappedKey !== "") await this.addStreamKey(answer.wrappedKey);
@@ -473,6 +485,16 @@ export class ViewSession {
   // The same for the shell channel (dev and owner).
   sealShell(op: number, header: object, data?: Uint8Array): Promise<string> | null {
     return this.sealChannel(op, header, data, SHELL_AAD);
+  }
+
+  // The same for the image channel's requests (hello, ack, cancel).
+  sealClipboardImage(op: number, header: object): Promise<string> | null {
+    return this.sealChannel(op, header, undefined, CLIPBOARD_IMAGE_AAD);
+  }
+
+  // A chunk of a picture to paste, sealed apart from the requests.
+  sealClipboardImagePut(op: number, header: object, data: Uint8Array): Promise<string> | null {
+    return this.sealChannel(op, header, data, CLIPBOARD_IMAGE_PUT_AAD);
   }
 
   // The same for the metrics channel (owner, and shares with analytics).
@@ -589,6 +611,27 @@ export class ViewSession {
     const opened = await openChannel(key, sealed, CONFIG_AAD, this.configCounter);
     if (opened === null || opened.counter <= this.configCounter) return null;
     this.configCounter = opened.counter;
+    return opened.message;
+  }
+
+  // The same for clipboard pictures.
+  async openClipboardImage(sealed: string): Promise<ChannelMessage | null> {
+    const key = this.imageKey;
+    if (key === null) return null;
+    const opened = await openChannel(key, sealed, CLIPBOARD_IMAGE_AAD, this.imageCounter);
+    if (opened === null || opened.counter <= this.imageCounter) return null;
+    this.imageCounter = opened.counter;
+    return opened.message;
+  }
+
+  // The image channel's answers (progress, done, error, skipped): on the
+  // reply key, so numbered with clipboard text and opened in the same order.
+  async openClipboardImageReply(sealed: string): Promise<ChannelMessage | null> {
+    const key = this.replyKey;
+    if (key === null) return null;
+    const opened = await openChannel(key, sealed, CLIPBOARD_IMAGE_REPLY_AAD, this.replyCounter);
+    if (opened === null || opened.counter <= this.replyCounter) return null;
+    this.replyCounter = opened.counter;
     return opened.message;
   }
 

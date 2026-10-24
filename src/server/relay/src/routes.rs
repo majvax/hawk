@@ -22,7 +22,8 @@ use crate::db::{self, EnrollmentOwner, MachineAuth};
 use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
-    DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
+    DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_IMAGE_LEN,
+    MAX_SEALED_CLIPBOARD_IMAGE_REPLY_LEN, MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
     MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_CONFIG_LEN, MAX_SEALED_CONFIG_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_QUALITY_LEN, MAX_SEALED_SAS_LEN, MAX_SEALED_SAS_REPLY_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
@@ -290,6 +291,7 @@ async fn handle_device(socket: WebSocket, state: AppState) {
     });
 
     let mut clipboard_budgets = HashMap::new();
+    let mut image_reply_budgets = HashMap::new();
     while let Some(Ok(message)) = stream.next().await {
         match message {
             Message::Binary(frame) => state.registry.forward_frame(&machine_id, frame),
@@ -320,7 +322,7 @@ async fn handle_device(socket: WebSocket, state: AppState) {
                     }
                     _ => {}
                 }
-                route_device_answer(&state.registry, &machine_id, &text, &mut clipboard_budgets);
+                route_device_answer(&state.registry, &machine_id, &text, &mut clipboard_budgets, &mut image_reply_budgets);
             }
             Message::Close(_) => break,
             _ => {}
@@ -345,6 +347,7 @@ fn route_device_answer(
     machine_id: &str,
     text: &str,
     clipboard_budgets: &mut HashMap<u64, Budget>,
+    image_reply_budgets: &mut HashMap<u64, Budget>,
 ) {
     let (viewer, answer) = match serde_json::from_str::<DeviceMessage>(text) {
         Ok(DeviceMessage::ViewerAccept {
@@ -356,12 +359,18 @@ fn route_device_answer(
             files,
             shell,
             analytics,
+            clipboard_images,
         }) if answer_fits(&[&statement, &signature, &wrapped_key]) => {
             let clipboard = clipboard_access(clipboard.as_deref());
             let files = files.unwrap_or(false);
             let shell = shell.unwrap_or(false);
             let analytics = analytics.unwrap_or(false);
-            (viewer, Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell, analytics })
+            // Pictures ride on the clipboard: none without it.
+            let clipboard_images = clipboard != "off" && clipboard_images.unwrap_or(false);
+            (
+                viewer,
+                Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell, analytics, clipboard_images },
+            )
         }
         Ok(DeviceMessage::ViewerReject { viewer, reason }) => {
             (viewer, Answer::Reject { reason: reason.chars().take(200).collect() })
@@ -384,6 +393,25 @@ fn route_device_answer(
                 return;
             }
             (viewer, Answer::Clipboard { sealed })
+        }
+        // Chunks of a picture: with file data, behind the events and the
+        // stream, and apart from clipboard text and its budget. The machine
+        // keeps only a few unacknowledged, so an honest one never fills it.
+        // A picture's progress and outcome: with the events, so none is lost
+        // (one per chunk of a paste at most, held to a budget per viewer).
+        Ok(DeviceMessage::ClipboardImageReply { viewer, sealed }) if sealed.len() <= MAX_SEALED_CLIPBOARD_IMAGE_REPLY_LEN => {
+            if !image_reply_budgets.entry(viewer).or_insert_with(Budget::clipboard_image_requests).take() {
+                debug!(%machine_id, viewer, "relay: dropping picture replies over the budget");
+                return;
+            }
+            (viewer, Answer::ClipboardImageReply { sealed })
+        }
+        Ok(DeviceMessage::ClipboardImage { viewer, sealed }) if sealed.len() <= MAX_SEALED_CLIPBOARD_IMAGE_LEN => {
+            let event = DashboardEvent::ClipboardImage { device_id: machine_id.to_owned(), sealed };
+            if !registry.forward_bulk(machine_id, viewer, event) {
+                debug!(%machine_id, viewer, "relay: dropping a picture for a viewer that isn't keeping up");
+            }
+            return;
         }
         Ok(DeviceMessage::File { viewer, sealed }) if sealed.len() <= MAX_SEALED_FILE_LEN => {
             let event = DashboardEvent::File { device_id: machine_id.to_owned(), sealed };
@@ -518,6 +546,8 @@ async fn handle_dashboard(
 
     let mut input_budget = Budget::input();
     let mut clipboard_budget = Budget::clipboard();
+    let mut clipboard_image_budget = Budget::clipboard_image_requests();
+    let mut clipboard_image_bytes = Budget::clipboard_image_bytes();
     let mut file_budget = Budget::file_bytes();
     let mut shell_budget = Budget::shell_bytes();
     let mut metrics_budget = Budget::metrics();
@@ -558,6 +588,19 @@ async fn handle_dashboard(
                 // clipboard by hand, a few times a minute at most.
                 if sealed.len() <= MAX_SEALED_CLIPBOARD_LEN && clipboard_budget.take() {
                     registry.clipboard(dashboard_id, &device_id, sealed);
+                }
+            }
+            Ok(DashboardCommand::ClipboardImage { device_id, sealed }) => {
+                // An ack per chunk of a picture coming in, and the odd hello
+                // or cancel: apart from text's budget, which stays for text.
+                if sealed.len() <= MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN && clipboard_image_budget.take() {
+                    registry.clipboard_image(dashboard_id, &device_id, sealed);
+                }
+            }
+            Ok(DashboardCommand::ClipboardImagePut { device_id, sealed }) => {
+                // Budgeted by size, like file chunks: ~87 KB each.
+                if sealed.len() <= MAX_SEALED_CLIPBOARD_IMAGE_LEN && clipboard_image_bytes.take_n(sealed.len() as f64) {
+                    registry.clipboard_image_put(dashboard_id, &device_id, sealed);
                 }
             }
             Ok(DashboardCommand::File { device_id, sealed }) => {
@@ -663,6 +706,21 @@ impl Budget {
         Self::new(2.0, 5.0)
     }
 
+    /// Image-channel requests from one dashboard: an ack for each 64 KB
+    /// chunk of a picture coming in (128 for the largest), and a hello per
+    /// view.
+    fn clipboard_image_requests() -> Self {
+        Self::new(256.0, 512.0)
+    }
+
+    /// Bytes of sealed picture chunks from one dashboard: the largest
+    /// picture (8 MB of PNG, ~11 MB sealed) at once, and a few a second
+    /// after. A chunk over it is dropped, which fails that paste, so it
+    /// stays well above what anyone pastes.
+    fn clipboard_image_bytes() -> Self {
+        Self::new(32.0 * 1024.0 * 1024.0, 16.0 * 1024.0 * 1024.0)
+    }
+
     /// Metrics requests from one dashboard: switching ranges and refreshing
     /// the process list, never anywhere near this.
     fn metrics() -> Self {
@@ -738,6 +796,114 @@ fn close(code: u16, reason: &'static str) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The largest picture goes through at once, sealed, chunk by chunk;
+    /// a second straight after waits for the budget to refill.
+    #[test]
+    fn clipboard_image_budget_takes_the_largest_picture() {
+        let chunk = MAX_SEALED_CLIPBOARD_IMAGE_LEN as f64;
+        let chunks = (8 * 1024 * 1024usize).div_ceil(64 * 1024);
+        let mut budget = Budget::clipboard_image_bytes();
+        for _ in 0..chunks {
+            assert!(budget.take_n(chunk));
+        }
+        let mut drained = 0;
+        while budget.take_n(chunk) {
+            drained += 1;
+        }
+        assert!(drained < chunks, "a second picture got through within the burst");
+        // Acks for the largest picture coming in, at once.
+        let mut acks = Budget::clipboard_image_requests();
+        assert!((0..chunks).all(|_| acks.take()));
+        // And text's budget is untouched by any of it.
+        let mut text = Budget::clipboard();
+        assert!((0..5).all(|_| text.take()));
+    }
+
+    /// Pictures ride on the clipboard: a machine that says pictures but
+    /// no clipboard (or one the relay doesn't know) gives a dashboard
+    /// neither.
+    #[test]
+    fn accepts_give_pictures_only_with_a_clipboard() {
+        use crate::db::{MachineRow, Role};
+        use crate::protocol::{IMAGE_CLIPBOARD_PROTOCOL, SignedView};
+        use crate::registry::{DashboardHandle, DeviceInfo, Outbound, StepUp};
+        use tokio::sync::mpsc;
+
+        for (clipboard, expected) in
+            [(Some("pull"), true), (Some("sync"), true), (Some("off"), false), (Some("everything"), false), (None, false)]
+        {
+            let registry = Registry::default();
+            let (events, mut events_rx) = mpsc::unbounded_channel();
+            let (frames, _f) = mpsc::channel(1);
+            let (bulk, _b) = mpsc::channel(1);
+            let handle = DashboardHandle {
+                events,
+                frames,
+                bulk,
+                user_id: 1,
+                session_id: 1,
+                email: "owner@example.com".to_owned(),
+                step_up: StepUp::default(),
+            };
+            let row = MachineRow {
+                public_id: "m1".to_owned(),
+                owner_id: 1,
+                owner_email: "owner@example.com".to_owned(),
+                name: "desk".to_owned(),
+                hostname: "desk".to_owned(),
+                last_seen_at: None,
+                key_storage: None,
+                role: Role::Owner,
+                share_expires_at: None,
+                single_view: false,
+                analytics: true,
+                public_key: None,
+                owner_public_key: None,
+                endorsement: None,
+                enroll_code_hash: None,
+                enroll_binding: None,
+                grant: None,
+            };
+            let dashboard = registry.add_dashboard(handle, vec![row]);
+            let (outbound, _device_rx) = mpsc::unbounded_channel();
+            registry.add_device("m1", 1, DeviceInfo { version: None, protocol: IMAGE_CLIPBOARD_PROTOCOL }, outbound);
+            assert!(registry.start_view(
+                dashboard,
+                "m1",
+                SignedView { statement: "hawk-join-v1".to_owned(), signature: "c2ln".to_owned() }
+            ));
+            while events_rx.try_recv().is_ok() {}
+            let mut accept = serde_json::json!({
+                "type": "viewer_accept", "viewer": dashboard, "statement": "s", "signature": "g",
+                "wrapped_key": "k", "clipboard_images": true,
+            });
+            if let Some(clipboard) = clipboard {
+                accept["clipboard"] = clipboard.into();
+            }
+            route_device_answer(&registry, "m1", &accept.to_string(), &mut HashMap::new(), &mut HashMap::new());
+            let mut seen = None;
+            while let Ok(event) = events_rx.try_recv() {
+                if let Outbound::Event(event) = event
+                    && let DashboardEvent::ViewAccepted { clipboard_images, .. } = *event
+                {
+                    seen = Some(clipboard_images);
+                }
+            }
+            assert_eq!(seen, Some(expected), "clipboard {clipboard:?}");
+        }
+    }
+
+    /// A request can't carry a chunk; the request budget runs out at its
+    /// burst.
+    #[test]
+    fn clipboard_image_request_cap_and_budget() {
+        const _: () = assert!(MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN < 2048);
+        const _: () = assert!(MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN < MAX_SEALED_CLIPBOARD_IMAGE_LEN / 32);
+        let mut requests = Budget::clipboard_image_requests();
+        let taken = (0..10_000).take_while(|_| requests.take()).count();
+        assert!((512..600).contains(&taken), "{taken}");
+    }
 
     /// Ctrl+Alt+Del: three at once, then one a second.
     #[test]

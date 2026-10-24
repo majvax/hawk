@@ -12,7 +12,7 @@ use crate::quality::Preset;
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The first protocol whose machines take power actions.
 pub const POWER_PROTOCOL: u32 = 3;
@@ -34,6 +34,10 @@ pub const QUALITY_PROTOCOL: u32 = 7;
 
 /// The first protocol whose machines press Ctrl+Alt+Del for a viewer.
 pub const SAS_PROTOCOL: u32 = 8;
+
+/// The first protocol whose machines put pictures on their clipboard and
+/// send the ones copied there, in chunks over an image channel of their own.
+pub const IMAGE_CLIPBOARD_PROTOCOL: u32 = 9;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -110,6 +114,9 @@ pub enum DeviceMessage {
         /// Whether this viewer may read the machine's analytics.
         #[serde(default)]
         analytics: Option<bool>,
+        /// Whether pictures go with this viewer's clipboard.
+        #[serde(default)]
+        clipboard_images: Option<bool>,
     },
     /// The machine refused a viewer (no valid grant, revoked, expired...).
     ViewerReject { viewer: u64, reason: String },
@@ -119,6 +126,15 @@ pub enum DeviceMessage {
     /// Clipboard text sealed for one viewer: the answer to its request, or
     /// a copy made on the machine (sync mode). The relay can't read it.
     Clipboard { viewer: u64, sealed: String },
+    /// An image-channel message sealed for one viewer: a chunk of a picture
+    /// off the clipboard, or how its own paste is going. Queued with file
+    /// data, so a large picture never holds up the events or the stream.
+    ClipboardImage { viewer: u64, sealed: String },
+    /// How a viewer's paste of a picture is going (progress, done, error),
+    /// or word of a picture too large to send, sealed for that viewer on
+    /// its reply key. Small, and passed on with the events, never dropped
+    /// like a chunk could be.
+    ClipboardImageReply { viewer: u64, sealed: String },
     /// A file-channel message sealed for one viewer: a listing, a transfer's
     /// progress, or a chunk of file data. Queued apart from everything else.
     File { viewer: u64, sealed: String },
@@ -190,6 +206,12 @@ pub enum DeviceCommand {
     /// A clipboard request sealed by the viewer (set or get); the machine
     /// decides whether the viewer's role and its config allow it.
     Clipboard { viewer: u64, sealed: String },
+    /// An image-channel request sealed by the viewer (hello, ack, cancel).
+    /// Passed on as clipboard requests are; the machine checks the rest.
+    ClipboardImage { viewer: u64, sealed: String },
+    /// A chunk of a picture the viewer pastes, sealed apart from the
+    /// requests. Only passed on for control; the machine checks again.
+    ClipboardImagePut { viewer: u64, sealed: String },
     /// A file-channel message sealed by the viewer (list, offer, a chunk of
     /// an upload, fetch, ack, cancel). Only passed on for control.
     File { viewer: u64, sealed: String },
@@ -273,6 +295,15 @@ pub const MAX_SEALED_POWER_LEN: usize = (8 + 1 + 16_usize).div_ceil(3) * 4;
 /// A sealed clipboard message, either way: counter, one byte saying what it
 /// is, up to 256 KB of text and the tag, in base64.
 pub const MAX_SEALED_CLIPBOARD_LEN: usize = (8 + 1 + 256 * 1024 + 16_usize).div_ceil(3) * 4;
+/// A sealed image-channel message, either way: counter, op, header length,
+/// a small header, up to 64 KB of PNG, and the tag, in base64. Pictures go
+/// in chunks of these, apart from clipboard text and its budget.
+pub const MAX_SEALED_CLIPBOARD_IMAGE_LEN: usize = (8 + 3 + 1024 + 64 * 1024 + 16_usize).div_ceil(3) * 4;
+/// A viewer's image-channel request (hello, ack, cancel): only a small header.
+pub const MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN: usize = (8 + 3 + 1024 + 16_usize).div_ceil(3) * 4;
+/// The machine's word on a picture (progress, done, error, skipped): the
+/// same small header, with no data.
+pub const MAX_SEALED_CLIPBOARD_IMAGE_REPLY_LEN: usize = MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN;
 /// A sealed file-channel message, either way: counter, op, header length,
 /// a header of up to 64 KB (a listing) and up to 64 KB of file data, and
 /// the tag, in base64.
@@ -350,6 +381,13 @@ pub enum DashboardCommand {
     /// any role: whether a view share may read the clipboard is the
     /// machine's config to say, and the machine checks every request.
     Clipboard { device_id: String, sealed: String },
+    /// A sealed image-channel request: saying the dashboard takes pictures,
+    /// acknowledging a chunk of one, giving up on one. Passed on while
+    /// viewing the machine with any role, as clipboard requests are.
+    ClipboardImage { device_id: String, sealed: String },
+    /// A sealed chunk of a picture to paste. Only passed on while viewing
+    /// the machine with a control (or owner) role, as pasting needs.
+    ClipboardImagePut { device_id: String, sealed: String },
     /// A sealed file-channel message. Only passed on while viewing the
     /// machine with a control (or owner) role.
     File { device_id: String, sealed: String },
@@ -482,6 +520,8 @@ pub enum DashboardEvent {
         shell: bool,
         /// Whether the machine lets this viewer read its analytics.
         analytics: bool,
+        /// Whether pictures go with this viewer's clipboard.
+        clipboard_images: bool,
     },
     /// The machine refused to stream to this viewer.
     ViewRejected { device_id: String, reason: String },
@@ -492,6 +532,10 @@ pub enum DashboardEvent {
     StreamKey { device_id: String, wrapped_key: String },
     /// Clipboard text the machine sealed for this viewer.
     Clipboard { device_id: String, sealed: String },
+    /// An image-channel message the machine sealed for this viewer.
+    ClipboardImage { device_id: String, sealed: String },
+    /// The machine's word on a picture, sealed for this viewer's reply key.
+    ClipboardImageReply { device_id: String, sealed: String },
     /// A file-channel message the machine sealed for this viewer.
     File { device_id: String, sealed: String },
     /// A shell-channel message the machine sealed for this viewer.
@@ -621,6 +665,7 @@ mod tests {
             files: files.unwrap_or(false),
             shell: shell.unwrap_or(false),
             analytics: analytics.unwrap_or(false),
+            clipboard_images: false,
         })
         .unwrap();
         assert_eq!(json["files"], true);
@@ -636,6 +681,84 @@ mod tests {
         assert!(largest.len() <= MAX_SEALED_CLIPBOARD_LEN);
         let over = BASE64.encode(vec![0u8; 8 + 1 + 256 * 1024 + 16 + 3]);
         assert!(over.len() > MAX_SEALED_CLIPBOARD_LEN);
+    }
+
+    #[test]
+    fn clipboard_image_messages_round_trip() {
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"clipboard_image","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::ClipboardImage { .. }));
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"clipboard_image_put","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::ClipboardImagePut { .. }));
+        let json = serde_json::to_value(DeviceCommand::ClipboardImagePut { viewer: 7, sealed: "x".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"clipboard_image_put","viewer":7,"sealed":"x"}));
+        let json = serde_json::to_value(DeviceCommand::ClipboardImage { viewer: 7, sealed: "x".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"clipboard_image","viewer":7,"sealed":"x"}));
+        let message: DeviceMessage =
+            serde_json::from_str(r#"{"type":"clipboard_image","viewer":3,"sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::ClipboardImage { viewer: 3, .. }));
+        let json = serde_json::to_value(DashboardEvent::ClipboardImage { device_id: "m1".into(), sealed: "x".into() })
+            .unwrap();
+        assert_eq!(json, serde_json::json!({"type":"clipboard_image","deviceId":"m1","sealed":"x"}));
+    }
+
+    #[test]
+    fn clipboard_image_replies_round_trip() {
+        let message: DeviceMessage =
+            serde_json::from_str(r#"{"type":"clipboard_image_reply","viewer":3,"sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::ClipboardImageReply { viewer: 3, .. }));
+        let json =
+            serde_json::to_value(DashboardEvent::ClipboardImageReply { device_id: "m1".into(), sealed: "x".into() })
+                .unwrap();
+        assert_eq!(json, serde_json::json!({"type":"clipboard_image_reply","deviceId":"m1","sealed":"x"}));
+        let largest = BASE64.encode(vec![0u8; 8 + 3 + 1024 + 16]);
+        assert!(largest.len() <= MAX_SEALED_CLIPBOARD_IMAGE_REPLY_LEN);
+    }
+
+    /// A chunk with the largest header fits, a byte more doesn't; a request
+    /// can't carry one; and neither touches the text cap.
+    #[test]
+    fn clipboard_image_caps_fit_one_chunk() {
+        let largest = BASE64.encode(vec![0u8; 8 + 3 + 1024 + 64 * 1024 + 16]);
+        assert!(largest.len() <= MAX_SEALED_CLIPBOARD_IMAGE_LEN);
+        let over = BASE64.encode(vec![0u8; 8 + 3 + 1024 + 64 * 1024 + 16 + 3]);
+        assert!(over.len() > MAX_SEALED_CLIPBOARD_IMAGE_LEN);
+        let chunk = BASE64.encode(vec![0u8; 8 + 3 + 64 + 64 * 1024 + 16]);
+        assert!(chunk.len() > MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN);
+        // A whole 8 MB picture never travels as one message.
+        const _: () = assert!(MAX_SEALED_CLIPBOARD_IMAGE_LEN < 8 * 1024 * 1024);
+    }
+
+    /// The machine's word on pictures reaches the dashboard; one that
+    /// predates them says nothing, which is no.
+    #[test]
+    fn accepts_carry_clipboard_images() {
+        let message: DeviceMessage = serde_json::from_str(
+            r#"{"type":"viewer_accept","viewer":1,"statement":"s","signature":"g","wrapped_key":"k","clipboard_images":true}"#,
+        )
+        .unwrap();
+        let DeviceMessage::ViewerAccept { clipboard_images, .. } = message else { panic!("not an accept") };
+        assert_eq!(clipboard_images, Some(true));
+        let message: DeviceMessage = serde_json::from_str(
+            r#"{"type":"viewer_accept","viewer":1,"statement":"s","signature":"g","wrapped_key":"k"}"#,
+        )
+        .unwrap();
+        let DeviceMessage::ViewerAccept { clipboard_images, .. } = message else { panic!("not an accept") };
+        assert_eq!(clipboard_images, None);
+        let json = serde_json::to_value(DashboardEvent::ViewAccepted {
+            device_id: "m1".into(),
+            statement: "s".into(),
+            signature: "g".into(),
+            wrapped_key: "k".into(),
+            clipboard: "pull",
+            files: false,
+            shell: false,
+            analytics: false,
+            clipboard_images: true,
+        })
+        .unwrap();
+        assert_eq!(json["clipboardImages"], true);
     }
 
     #[test]

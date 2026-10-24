@@ -35,6 +35,9 @@ struct ClipboardConfig {
     // Whether view-only shares may read the clipboard too. Pasting into the
     // machine always needs control.
     bool view_pull = false;
+    // Pictures too, as PNG, the same ways text goes; each at most
+    // ipc::max_clipboard_image_size.
+    bool images = true;
 };
 
 // The most a single file may be, either way, unless the config says less.
@@ -136,6 +139,7 @@ struct MachineConfig {
 //   mode = "pull"        # off | pull | sync
 //   max_size = 262144    # bytes, at most 262144
 //   view_pull = false
+//   images = true        # pictures too, as PNG
 //
 //   [[files]]
 //   enabled = false

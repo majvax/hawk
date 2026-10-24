@@ -1653,6 +1653,18 @@ select {
   gap: 6px;
 }
 
+/* A picture from the machine, shrunk to fit; right-click copies it. */
+.clip-panel img.clip-image {
+  min-width: 0;
+  max-width: min(100%, 480px);
+  max-height: 240px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  background: var(--rail);
+}
+
 .stage-bar button:disabled {
   color: var(--fg-3);
   cursor: default;

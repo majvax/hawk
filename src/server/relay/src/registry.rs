@@ -19,8 +19,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::protocol::{
-    AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, PING_PROTOCOL, POWER_PROTOCOL,
-    QUALITY_PROTOCOL, SAS_PROTOCOL, SignedView, is_audio, is_keyframe, timestamp_us,
+    AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, IMAGE_CLIPBOARD_PROTOCOL, MachineView,
+    PING_PROTOCOL, POWER_PROTOCOL, QUALITY_PROTOCOL, SAS_PROTOCOL, SignedView, is_audio, is_keyframe, timestamp_us,
 };
 use crate::quality::{Meter, Preset, RateController, TICK_US};
 
@@ -190,12 +190,14 @@ pub enum Answer {
         files: bool,
         shell: bool,
         analytics: bool,
+        clipboard_images: bool,
     },
     Reject { reason: String },
     StreamKey { wrapped_key: String },
     Clipboard { sealed: String },
     Pong { nonce: String },
     Sas { sealed: String },
+    ClipboardImageReply { sealed: String },
 }
 
 #[derive(Default)]
@@ -658,6 +660,41 @@ impl Registry {
         true
     }
 
+    /// Passes a sealed image-channel request on to the machine if this
+    /// dashboard is watching it, whatever its role, as clipboard requests
+    /// are, and the machine is new enough to have the channel.
+    pub fn clipboard_image(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
+        let has_access =
+            inner.dashboards.get(&dashboard_id).is_some_and(|dashboard| dashboard.access.contains_key(machine_id));
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !has_access || !device.viewers.contains_key(&dashboard_id) || device.protocol < IMAGE_CLIPBOARD_PROTOCOL {
+            return false;
+        }
+        device.send(DeviceCommand::ClipboardImage { viewer: dashboard_id, sealed });
+        true
+    }
+
+    /// Passes a sealed chunk of a picture to paste on if this dashboard may
+    /// control the machine and is watching it: pasting needs control, and
+    /// the chunks are sealed apart from the requests, so a view share can't
+    /// pass one off as an ack. No fresh factor, as with pasting text. The
+    /// machine checks the role again.
+    pub fn clipboard_image_put(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let inner = self.lock();
+        let may = inner
+            .dashboards
+            .get(&dashboard_id)
+            .and_then(|dashboard| dashboard.access.get(machine_id))
+            .is_some_and(|row| row.role.can_control());
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !may || !device.viewers.contains_key(&dashboard_id) || device.protocol < IMAGE_CLIPBOARD_PROTOCOL {
+            return false;
+        }
+        device.send(DeviceCommand::ClipboardImagePut { viewer: dashboard_id, sealed });
+        true
+    }
+
     /// Passes a sealed file-channel message on to the machine if this
     /// dashboard may control it and is watching it. Returns whether it was.
     pub fn file(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
@@ -729,7 +766,7 @@ impl Registry {
         }
         let device_id = machine_id.to_owned();
         let event = match answer {
-            Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell, analytics } => {
+            Answer::Accept { statement, signature, wrapped_key, clipboard, files, shell, analytics, clipboard_images } => {
                 DashboardEvent::ViewAccepted {
                     device_id,
                     statement,
@@ -739,12 +776,14 @@ impl Registry {
                     files,
                     shell,
                     analytics,
+                    clipboard_images,
                 }
             }
             Answer::StreamKey { wrapped_key } => DashboardEvent::StreamKey { device_id, wrapped_key },
             Answer::Clipboard { sealed } => DashboardEvent::Clipboard { device_id, sealed },
             Answer::Pong { nonce } => DashboardEvent::Pong { device_id, nonce },
             Answer::Sas { sealed } => DashboardEvent::Sas { device_id, sealed },
+            Answer::ClipboardImageReply { sealed } => DashboardEvent::ClipboardImageReply { device_id, sealed },
             Answer::Reject { reason } => {
                 inner.detach(viewer, machine_id);
                 DashboardEvent::ViewRejected { device_id, reason }
@@ -1074,12 +1113,20 @@ mod tests {
     fn watching(
         role: Role,
     ) -> (Registry, DashboardId, mpsc::UnboundedReceiver<DeviceOutbound>, mpsc::UnboundedReceiver<Outbound>) {
+        watching_on(role, CONFIG_PROTOCOL)
+    }
+
+    /// The same, with a machine that speaks `protocol`.
+    fn watching_on(
+        role: Role,
+        protocol: u32,
+    ) -> (Registry, DashboardId, mpsc::UnboundedReceiver<DeviceOutbound>, mpsc::UnboundedReceiver<Outbound>) {
         let registry = Registry::default();
         let user_id = if role == Role::Owner { 1 } else { 2 };
         let (handle, events_rx) = handle(user_id);
         let dashboard = registry.add_dashboard(handle, vec![row(role)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: CONFIG_PROTOCOL }, outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol }, outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture { .. })));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
@@ -1640,6 +1687,161 @@ mod tests {
         let Ok(Outbound::Event(event)) = events.try_recv() else { panic!("no clipboard event") };
         assert!(matches!(*event, DashboardEvent::Clipboard { ref sealed, .. } if sealed == "text"));
         assert!(other_events.try_recv().is_err());
+    }
+
+    /// A picture's requests (hello, acks) pass for any role watching, as
+    /// clipboard requests do: whether a view share may read pictures is the
+    /// machine's config to say. Only to a machine that has the channel.
+    #[test]
+    fn clipboard_image_requests_need_an_open_view_and_the_protocol() {
+        let (registry, dashboard, mut device_rx, _events) = watching_on(Role::View, IMAGE_CLIPBOARD_PROTOCOL);
+        assert!(registry.clipboard_image(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(
+            matches!(next(&mut device_rx), Some(DeviceCommand::ClipboardImage { viewer, .. }) if viewer == dashboard)
+        );
+        registry.stop_view(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.clipboard_image(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        // An older machine stays text-only: nothing it wouldn't know is sent.
+        let (registry, dashboard, mut device_rx, _events) = watching_on(Role::Control, SAS_PROTOCOL);
+        assert!(!registry.clipboard_image(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.clipboard_image_put(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+        // Text still goes.
+        assert!(registry.clipboard(dashboard, MACHINE, "sealed".to_owned()));
+    }
+
+    /// Pasting a picture needs control, as pasting text does on the
+    /// machine, and an open view; no fresh factor, as with text.
+    #[test]
+    fn pasting_pictures_needs_control() {
+        let (registry, dashboard, mut device_rx, _events) = watching_on(Role::View, IMAGE_CLIPBOARD_PROTOCOL);
+        assert!(!registry.clipboard_image_put(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        let registry = Registry::default();
+        let (mut owner, _events) = handle(1);
+        owner.step_up = StepUp { mfa: true, at: None };
+        let dashboard = registry.add_dashboard(owner, vec![row(Role::Control)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: IMAGE_CLIPBOARD_PROTOCOL }, outbound);
+        assert!(!registry.clipboard_image_put(dashboard, MACHINE, "sealed".to_owned()), "not watching");
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        while next(&mut device_rx).is_some() {}
+        assert!(registry.clipboard_image_put(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(
+            matches!(next(&mut device_rx), Some(DeviceCommand::ClipboardImagePut { viewer, .. }) if viewer == dashboard)
+        );
+    }
+
+    /// A picture's progress and outcome go with the events, to the viewer
+    /// they're for alone, never on the droppable bulk queue.
+    #[test]
+    fn picture_replies_ride_the_events() {
+        let (registry, dashboard, _device_rx, mut events) = watching_on(Role::Control, IMAGE_CLIPBOARD_PROTOCOL);
+        while events.try_recv().is_ok() {}
+        registry.answer(MACHINE, dashboard, Answer::ClipboardImageReply { sealed: "done".to_owned() });
+        let Ok(Outbound::Event(event)) = events.try_recv() else { panic!("no reply") };
+        assert!(matches!(*event, DashboardEvent::ClipboardImageReply { ref sealed, .. } if sealed == "done"));
+        registry.answer(MACHINE, dashboard + 1, Answer::ClipboardImageReply { sealed: "stray".to_owned() });
+        assert!(events.try_recv().is_err());
+    }
+
+    /// A picture's chunks go on the bounded queue of the viewer they're
+    /// for, as file data does, never with the events text goes with.
+    #[test]
+    fn pictures_reach_only_their_viewer_on_the_bulk_queue() {
+        let registry = Registry::default();
+        let (events, mut events_rx) = mpsc::unbounded_channel();
+        let (frames, _frames_rx) = mpsc::channel(1);
+        let (bulk, mut bulk_rx) = mpsc::channel(4);
+        let handle = DashboardHandle {
+            events,
+            frames,
+            bulk,
+            user_id: 2,
+            session_id: 2,
+            email: "user2@example.com".to_owned(),
+            step_up: StepUp::default(),
+        };
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::View)]);
+        let (other_handle, mut other_events) = self::handle(3);
+        let other = registry.add_dashboard(other_handle, vec![row(Role::Control)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: IMAGE_CLIPBOARD_PROTOCOL }, outbound);
+        let chunk = |sealed: &str| DashboardEvent::ClipboardImage { device_id: MACHINE.to_owned(), sealed: sealed.to_owned() };
+        assert!(!registry.forward_bulk(MACHINE, dashboard, chunk("early")), "not watching");
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        assert!(registry.start_view(other, MACHINE, join()));
+        while events_rx.try_recv().is_ok() {}
+        while other_events.try_recv().is_ok() {}
+
+        assert!(registry.forward_bulk(MACHINE, dashboard, chunk("a")));
+        assert!(matches!(bulk_rx.try_recv(), Ok(DashboardEvent::ClipboardImage { ref sealed, .. }) if sealed == "a"));
+        assert!(events_rx.try_recv().is_err());
+        assert!(other_events.try_recv().is_err());
+    }
+
+    /// The owner pastes pictures too; nothing goes to a machine the
+    /// dashboard has no access to, nor after the view stops, nor to one a
+    /// protocol short of the channel.
+    #[test]
+    fn picture_gating_edges() {
+        let (registry, dashboard, mut device_rx, _events) = watching_on(Role::Owner, IMAGE_CLIPBOARD_PROTOCOL);
+        assert!(registry.clipboard_image_put(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ClipboardImagePut { .. })));
+        assert!(registry.clipboard_image(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ClipboardImage { .. })));
+        assert!(!registry.clipboard_image_put(dashboard, "machine-2", "sealed".to_owned()));
+        assert!(!registry.clipboard_image(dashboard, "machine-2", "sealed".to_owned()));
+        registry.stop_view(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.clipboard_image_put(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.clipboard_image(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+
+        // One protocol short: neither requests nor chunks.
+        let (registry, dashboard, mut device_rx, _events) = watching_on(Role::Owner, IMAGE_CLIPBOARD_PROTOCOL - 1);
+        assert!(!registry.clipboard_image(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(!registry.clipboard_image_put(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// A viewer whose bulk queue is full loses the chunk: it never spills
+    /// into its events, and never reaches another viewer.
+    #[test]
+    fn pictures_for_a_full_bulk_queue_are_dropped() {
+        let registry = Registry::default();
+        let (events, mut events_rx) = mpsc::unbounded_channel();
+        let (frames, _frames_rx) = mpsc::channel(1);
+        let (bulk, mut bulk_rx) = mpsc::channel(1);
+        let handle = DashboardHandle {
+            events,
+            frames,
+            bulk,
+            user_id: 2,
+            session_id: 2,
+            email: "user2@example.com".to_owned(),
+            step_up: StepUp::default(),
+        };
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::Control)]);
+        let (outbound, _device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: IMAGE_CLIPBOARD_PROTOCOL }, outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        while events_rx.try_recv().is_ok() {}
+        let chunk =
+            |sealed: &str| DashboardEvent::ClipboardImage { device_id: MACHINE.to_owned(), sealed: sealed.to_owned() };
+        assert!(registry.forward_bulk(MACHINE, dashboard, chunk("1")));
+        assert!(!registry.forward_bulk(MACHINE, dashboard, chunk("2")), "queue full");
+        assert!(events_rx.try_recv().is_err());
+        assert!(matches!(bulk_rx.try_recv(), Ok(DashboardEvent::ClipboardImage { ref sealed, .. }) if sealed == "1"));
+        assert!(bulk_rx.try_recv().is_err());
+        // To a viewer id that isn't watching: nothing.
+        assert!(!registry.forward_bulk(MACHINE, dashboard + 1000, chunk("3")));
+        // From a machine this dashboard isn't watching: nothing.
+        assert!(!registry.forward_bulk("machine-2", dashboard, chunk("4")));
     }
 
     /// Files need control, and an open view.

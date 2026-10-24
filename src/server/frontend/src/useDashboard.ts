@@ -21,6 +21,7 @@ import {
 } from "./fileTransfers.js";
 import { type OutputSink, type ShellInfo, ShellManager, type ShellSender } from "./shellSessions.js";
 import { type ConfigState, type SettingValue, parseConfig } from "./machineConfig.js";
+import { ClipboardImageManager, type ImageSender, type PasteResult } from "./clipboardImages.js";
 import { EMPTY_METRICS, MetricsManager, type MetricsRange, type MetricsSender, type MetricsState } from "./metrics.js";
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
@@ -139,18 +140,27 @@ export type ViewSecurity =
 // ?debug in the URL adds the decoder's readout to the stream stats.
 const DEBUG = new URLSearchParams(window.location.search).has("debug");
 
+// The latest from the machine's clipboard: text, a picture (PNG), or word
+// of a picture too large to send. The answer to a read, or with `pushed` a
+// copy made there (sync mode). `id` changes with every new one.
+export type ClipboardLatest = { id: number; pushed: boolean } & (
+  | { kind: "text"; text: string }
+  | { kind: "image"; png: Uint8Array<ArrayBuffer>; width: number; height: number }
+  | { kind: "too_large" }
+);
+
 // The open view's clipboard: what the machine lets this viewer do with it,
-// and the latest text it sent.
+// and the latest it sent.
 export interface ClipboardState {
   access: ClipboardAccess;
+  // Whether pictures go with it, both ways, as text does.
+  images: boolean;
   // Set while a read is on its way.
   waiting: boolean;
-  // The latest text from the machine: the answer to a read, or a copy made
-  // there (sync mode). `id` changes with every new one.
-  latest: { id: number; text: string; pushed: boolean } | null;
+  latest: ClipboardLatest | null;
 }
 
-const NO_CLIPBOARD: ClipboardState = { access: "off", waiting: false, latest: null };
+const NO_CLIPBOARD: ClipboardState = { access: "off", images: false, waiting: false, latest: null };
 
 // A read the machine hasn't answered by then (hawk-capture still starting,
 // or the request was dropped) stops showing as underway.
@@ -275,6 +285,9 @@ export interface Dashboard {
   // asks for what's on it; the answer lands in `clipboard.latest`. Returns
   // false when there's no secured view to send it to.
   sendClipboard: (text: string | null) => boolean;
+  // Pastes a PNG into the machine's clipboard (control only, while
+  // `clipboard.images`): settles once it's there, or with why not.
+  pasteImage: (png: Uint8Array) => Promise<PasteResult>;
   // Skip the rest of the backoff and try now.
   reconnectNow: () => void;
   // The machine's sound: whether it can play here, whether the browser is
@@ -408,6 +421,22 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   // so they're opened one at a time, in the order they arrived: otherwise a
   // slow earlier one could be dropped as already seen.
   const replyChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Clipboard pictures, on a channel of their own (clipboardImages.ts).
+  const imageChainRef = useRef<Promise<void>>(Promise.resolve());
+  const imageManagerRef = useRef<ClipboardImageManager | null>(null);
+  imageManagerRef.current ??= new ClipboardImageManager({
+    received: ({ png, width, height, pushed }) => {
+      clipboardIdRef.current += 1;
+      const latest: ClipboardLatest = { id: clipboardIdRef.current, kind: "image", png, width, height, pushed };
+      setClipboard((prev) => ({ ...prev, waiting: false, latest }));
+    },
+    skipped: (pushed) => {
+      clipboardIdRef.current += 1;
+      const latest: ClipboardLatest = { id: clipboardIdRef.current, kind: "too_large", pushed };
+      setClipboard((prev) => ({ ...prev, waiting: false, latest }));
+    },
+  });
+  const imageManager = imageManagerRef.current;
   const fileFrameRef = useRef<number | null>(null);
   const [shells, setShells] = useState<ShellsState>(NO_SHELLS);
   const shellsEnabledRef = useRef(false);
@@ -482,6 +511,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     sessionRef.current?.abandon();
     sessionRef.current = null;
     setClipboard(NO_CLIPBOARD);
+    imageManagerRef.current?.attach(null);
     // Transfers wait for the view to come back rather than fail; shells
     // end, since the machine closes them.
     fileManagerRef.current?.attach(null);
@@ -890,6 +920,31 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     [send],
   );
 
+  // The same for clipboard pictures: requests, and chunks to paste, sealed
+  // apart.
+  const imageSender = useCallback(
+    (session: ViewSession, deviceId: string): ImageSender => {
+      const sendSealedImage = (
+        type: "clipboard_image" | "clipboard_image_put",
+        sealed: Promise<string> | null,
+      ): boolean => {
+        if (sessionRef.current !== session || sealed === null) return false;
+        inputChainRef.current = inputChainRef.current
+          .then(() => sealed)
+          .then((payload) => {
+            if (sessionRef.current === session) send({ type, deviceId, sealed: payload });
+          })
+          .catch((error: unknown) => console.error("sealing clipboard picture:", error));
+        return true;
+      };
+      return {
+        request: (op, header) => sendSealedImage("clipboard_image", session.sealClipboardImage(op, header)),
+        put: (op, header, data) => sendSealedImage("clipboard_image_put", session.sealClipboardImagePut(op, header, data)),
+      };
+    },
+    [send],
+  );
+
   // Seals file-channel messages for `session` and sends them in order with
   // input (they share its counter).
   const fileSender = useCallback(
@@ -966,7 +1021,11 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
               if (sessionRef.current === session && session.role !== null) {
                 setSecurity({ kind: "secured", role: session.role });
                 // A relay from before the clipboard says nothing: none, then.
-                setClipboard({ access: payload.clipboard ?? "off", waiting: false, latest: null });
+                // Likewise pictures, from a machine or relay before them.
+                const access = payload.clipboard ?? "off";
+                const images = access !== "off" && payload.clipboardImages === true;
+                setClipboard({ access, images, waiting: false, latest: null });
+                imageManagerRef.current?.attach(images ? imageSender(session, payload.deviceId) : null);
                 filesEnabledRef.current = payload.files === true;
                 const manager = fileManagerRef.current;
                 if (manager !== null) {
@@ -1013,10 +1072,34 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
             .then((opened) => {
               if (opened === null || sessionRef.current !== session) return;
               clipboardIdRef.current += 1;
-              const latest = { id: clipboardIdRef.current, ...opened };
+              const latest: ClipboardLatest = { id: clipboardIdRef.current, kind: "text", ...opened };
               setClipboard((prev) => ({ ...prev, waiting: false, latest }));
             })
             .catch((error: unknown) => console.error("clipboard message:", error));
+          break;
+        }
+        case "clipboard_image": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          imageChainRef.current = imageChainRef.current
+            .then(() => session.openClipboardImage(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              imageManagerRef.current?.handle(opened.op, opened.header, opened.data);
+            })
+            .catch((error: unknown) => console.error("clipboard picture:", error));
+          break;
+        }
+        case "clipboard_image_reply": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          replyChainRef.current = replyChainRef.current
+            .then(() => session.openClipboardImageReply(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              imageManagerRef.current?.handle(opened.op, opened.header, opened.data);
+            })
+            .catch((error: unknown) => console.error("clipboard picture answer:", error));
           break;
         }
         case "file": {
@@ -1118,7 +1201,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
           break;
       }
     },
-    [clearView, fileSender, metricsSender, requestStream, send, shellSender, teardownDecoder],
+    [clearView, fileSender, imageSender, metricsSender, requestStream, send, shellSender, teardownDecoder],
   );
 
   // Owned machines not vouched for yet: if this browser made the code a
@@ -1387,9 +1470,13 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       if (sealed === null) return false;
       if (text === null) {
         setClipboard((prev) => ({ ...prev, waiting: true }));
-        window.setTimeout(() => {
-          if (sessionRef.current === session) setClipboard((prev) => ({ ...prev, waiting: false }));
-        }, CLIPBOARD_WAIT_MS);
+        // A large picture can take longer than that: wait while it comes.
+        const settle = (): void => {
+          if (sessionRef.current !== session) return;
+          if (imageManagerRef.current?.receiving === true) window.setTimeout(settle, CLIPBOARD_WAIT_MS);
+          else setClipboard((prev) => ({ ...prev, waiting: false }));
+        };
+        window.setTimeout(settle, CLIPBOARD_WAIT_MS);
       }
       // Through the input chain: both are numbered from one counter, so
       // they must reach the machine in the order they were sealed.
@@ -1402,6 +1489,17 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       return true;
     },
     [send],
+  );
+
+  const pasteImage = useCallback(
+    (png: Uint8Array): Promise<PasteResult> => {
+      const role = sessionRef.current?.role;
+      if (role !== "owner" && role !== "control") {
+        return Promise.resolve({ ok: false, message: "pasting needs control" });
+      }
+      return imageManager.paste(png);
+    },
+    [imageManager],
   );
 
   const fileActions = useRef<FileActions>({
@@ -1562,6 +1660,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     stopView,
     sendInput,
     sendClipboard,
+    pasteImage,
     reconnectNow,
     sound,
     setMuted,

@@ -1,5 +1,6 @@
 #include "e2e.hpp"
 
+#include "clipboard_images.hpp"
 #include "win_util.hpp"
 
 #include <glaze/glaze.hpp>
@@ -38,6 +39,12 @@ constexpr std::string_view kAcceptContext = "hawk-accept-v1";
 constexpr std::string_view kStreamKeyAad = "hawk-stream-key-v1";
 constexpr std::string_view kInputAad = "hawk-input-v1";
 constexpr std::string_view kClipboardAad = "hawk-clipboard-v1";
+// Clipboard pictures: the image channel either way, and a viewer's chunks
+// of one to paste, sealed apart so the relay can hold those to control.
+constexpr std::string_view kClipboardImageAad = "hawk-clipboard-image-v1";
+constexpr std::string_view kClipboardImagePutAad = "hawk-clipboard-image-put-v1";
+// The image channel's answers, sealed on the reply key with clipboard text.
+constexpr std::string_view kClipboardImageReplyAad = "hawk-clipboard-image-reply-v1";
 constexpr std::string_view kFileAad = "hawk-file-v1";
 constexpr std::string_view kShellAad = "hawk-shell-v1";
 constexpr std::string_view kMetricsAad = "hawk-metrics-v1";
@@ -288,6 +295,8 @@ struct AcceptMessage {
     bool analytics = false;
     // Whether it may open shells. Likewise.
     bool shell = false;
+    // Whether pictures go with its clipboard. Likewise.
+    bool clipboard_images = false;
 };
 
 struct RejectMessage {
@@ -331,7 +340,8 @@ struct glz::meta<hawk::service::AcceptMessage> {
     using T                     = hawk::service::AcceptMessage;
     static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "statement", &T::statement,
                                          "signature", &T::signature, "wrapped_key", &T::wrapped_key, "clipboard", &T::clipboard,
-                                         "files", &T::files, "shell", &T::shell, "analytics", &T::analytics);
+                                         "files", &T::files, "shell", &T::shell, "analytics", &T::analytics,
+                                         "clipboard_images", &T::clipboard_images);
 };
 
 template <>
@@ -560,6 +570,11 @@ struct Viewer {
     // And the config, likewise.
     crypto::AesGcm               config_key;
     std::uint64_t                config_counter = 0;
+    // And clipboard pictures, likewise.
+    crypto::AesGcm               image_key;
+    std::uint64_t                image_counter = 0;
+    // Its dashboard said it takes pictures (an image-channel hello).
+    bool                         takes_images = false;
     // Whether the owner's grant allows analytics (always, for the owner).
     bool                         analytics = false;
     // Shared by input and clipboard requests, which the dashboard numbers
@@ -647,6 +662,9 @@ struct ViewerHub::Impl {
     // goes up, so they have to leave in the order they were numbered. Not
     // the main lock, so a slow send never holds up sealing frames.
     std::mutex                   shell_send_mutex;
+    // The same for clipboard pictures: the relay thread answers a paste
+    // while ClipboardImages' worker sends chunks.
+    std::mutex                   image_send_mutex;
 
     std::mutex                       mutex;
     AccessState                      state = AccessState::load();
@@ -714,6 +732,11 @@ struct ViewerHub::Impl {
                (can_control(viewer) || (viewer.role == "view" && clipboard.view_pull));
     }
 
+    // Pictures go wherever text may, while the config allows them.
+    [[nodiscard]] bool may_use_images(const Viewer& viewer) const {
+        return clipboard.images && !viewer.refused && may_read_clipboard(viewer);
+    }
+
     // op || u16 header length || header || data.
     [[nodiscard]] static crypto::Bytes channel_plaintext(const ChannelMessage& message) {
         crypto::Bytes plain;
@@ -773,6 +796,10 @@ struct ViewerHub::Impl {
         plain.push_back(op);
         const auto bytes = std::as_bytes(std::span(text));
         plain.insert(plain.end(), bytes.begin(), bytes.end());
+        return seal_reply_bytes(viewer, aad, plain);
+    }
+
+    [[nodiscard]] static std::string seal_reply_bytes(Viewer& viewer, std::string_view aad, const crypto::Bytes& plain) {
         const auto    counter = ++viewer.reply_counter;
         crypto::Bytes out;
         put_u64_be(out, counter);
@@ -972,7 +999,7 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     const auto join_hash = crypto::sha256(crypto::as_bytes(request.statement));
     // HKDF output is a prefix of any longer output: the first 64 bytes are
     // the input and wrap keys whatever length is asked for.
-    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 256);
+    const auto keys = crypto::hkdf_sha256(*shared, join_hash, "hawk-session-v1", 288);
     auto input_key = crypto::AesGcm::create(std::span(keys).first(32));
     auto wrap_key = crypto::AesGcm::create(std::span(keys).subspan(32, 32));
     auto reply_key = crypto::AesGcm::create(std::span(keys).subspan(64, 32));
@@ -981,13 +1008,14 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     auto metrics_key = crypto::AesGcm::create(std::span(keys).subspan(160, 32));
     auto audio_key = crypto::AesGcm::create(std::span(keys).subspan(192, 32));
     auto config_key = crypto::AesGcm::create(std::span(keys).subspan(224, 32));
+    auto image_key = crypto::AesGcm::create(std::span(keys).subspan(256, 32));
     const auto accept = std::format("{}\nmachine={}\njoin={}\nephemeral={}\nrole={}", kAcceptContext, impl.machine_id,
                                     crypto::base64_encode(join_hash), crypto::base64_encode(exchange->public_key()),
                                     admission->role);
     const auto signature = impl.machine_key.sign(crypto::as_bytes(accept));
     if (!input_key.has_value() || !wrap_key.has_value() || !reply_key.has_value() || !file_key.has_value() ||
         !shell_key.has_value() || !metrics_key.has_value() || !audio_key.has_value() || !config_key.has_value() ||
-        !signature.has_value()) {
+        !image_key.has_value() || !signature.has_value()) {
         impl.reject(viewer, "the machine couldn't sign its answer");
         return;
     }
@@ -1005,6 +1033,7 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
         .metrics_key = std::move(*metrics_key),
         .audio_key = std::move(*audio_key),
         .config_key = std::move(*config_key),
+        .image_key = std::move(*image_key),
         .analytics = admission->analytics,
         .grant_issued = admission->grant_issued,
         .not_after = admission->not_after,
@@ -1023,6 +1052,7 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
     const bool files = impl.may_use_files(session);
     const bool shell = impl.may_use_shell(session);
     const bool analytics = impl.may_use_metrics(session);
+    const bool images = impl.may_use_images(session);
     spdlog::info("e2e: viewer {} ({}) admitted as {}", viewer, session.fingerprint, admission->role);
     impl.viewers.insert_or_assign(viewer, std::move(session));
     impl.send(to_json(AcceptMessage{.viewer = viewer,
@@ -1032,7 +1062,8 @@ void ViewerHub::join(std::uint64_t viewer, const SignedStatement& request, const
                                     .clipboard = std::move(clipboard),
                                     .files = files,
                                     .analytics = analytics,
-                                    .shell = shell}));
+                                    .shell = shell,
+                                    .clipboard_images = images}));
 }
 
 std::vector<ipc::InputPacket> ViewerHub::leave(std::uint64_t viewer) {
@@ -1159,6 +1190,104 @@ void ViewerHub::deliver_clipboard(std::string_view text, bool pushed) {
             .viewer = id,
             .sealed = Impl::seal_reply(viewer, kClipboardAad, pushed ? kClipboardPush : kClipboardText, prefix)}));
     }
+}
+
+std::vector<std::uint64_t> ViewerHub::deliver_clipboard_image(bool pushed) {
+    auto&                      impl = *impl_;
+    const std::lock_guard      lock(impl.mutex);
+    std::vector<std::uint64_t> recipients;
+    if (pushed && impl.clipboard.mode != ClipboardMode::sync) {
+        return recipients;
+    }
+    for (auto& [id, viewer] : impl.viewers) {
+        if (viewer.refused || !impl.may_read_clipboard(viewer) || (!pushed && !viewer.awaiting_clipboard)) {
+            continue;
+        }
+        viewer.awaiting_clipboard = false;
+        if (impl.may_use_images(viewer) && viewer.takes_images) {
+            spdlog::info("clipboard: {} viewer {} ({}) the clipboard's picture", pushed ? "pushing to" : "sending",
+                         id, viewer.fingerprint);
+            recipients.push_back(id);
+        } else if (!pushed) {
+            impl.send(to_json(ClipboardMessage{
+                .viewer = id, .sealed = Impl::seal_reply(viewer, kClipboardAad, kClipboardText, {})}));
+        }
+    }
+    return recipients;
+}
+
+std::optional<ChannelMessage> ViewerHub::clipboard_image(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !impl.may_use_images(found->second)) {
+        return std::nullopt;
+    }
+    const auto plain = Impl::open_request(found->second, sealed, kClipboardImageAad);
+    auto       message = plain.has_value() ? Impl::parse_channel(*plain) : std::nullopt;
+    if (message.has_value() && message->op == image_op::hello) {
+        found->second.takes_images = true;
+        return std::nullopt;
+    }
+    return message;
+}
+
+std::optional<ChannelMessage> ViewerHub::clipboard_image_put(std::uint64_t viewer, std::string_view sealed,
+                                                             std::string& refusal) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused) {
+        return std::nullopt;
+    }
+    const auto plain = Impl::open_request(found->second, sealed, kClipboardImagePutAad);
+    auto       message = plain.has_value() ? Impl::parse_channel(*plain) : std::nullopt;
+    if (message.has_value() && !impl.may_set_clipboard(found->second)) {
+        refusal = "pasting into the machine's clipboard needs control, and the clipboard on";
+    } else if (message.has_value() && !impl.may_use_images(found->second)) {
+        refusal = "the machine's config keeps its clipboard to text";
+    }
+    if (!refusal.empty()) {
+        spdlog::warn("clipboard: viewer {} sent a picture its role or the config doesn't allow; refused", viewer);
+    }
+    return message;
+}
+
+bool ViewerHub::send_clipboard_image(std::uint64_t viewer, const ChannelMessage& message) {
+    if (message.header.size() > 0xFFFFU) {
+        return false;
+    }
+    auto&                 impl = *impl_;
+    const std::lock_guard order(impl.image_send_mutex);
+    std::unique_lock      lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !impl.may_use_images(found->second) || !found->second.takes_images) {
+        return false;
+    }
+    Viewer&    session = found->second;
+    const auto json = Impl::seal_channel(viewer, "clipboard_image", session.image_key, session.image_counter,
+                                         kClipboardImageAad, message);
+    // Outside the main lock, as with shells; still inside the ordering one.
+    lock.unlock();
+    impl.send(json);
+    return true;
+}
+
+bool ViewerHub::send_clipboard_image_reply(std::uint64_t viewer, const ChannelMessage& message) {
+    if (message.header.size() > 0xFFFFU) {
+        return false;
+    }
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused) {
+        return false;
+    }
+    // Under the lock, as clipboard text and Ctrl+Alt+Del answers are: they
+    // share the reply key's counter, so they leave in the order numbered.
+    const auto sealed = Impl::seal_reply_bytes(found->second, kClipboardImageReplyAad, Impl::channel_plaintext(message));
+    impl.send(to_json(ChannelOutMessage{.type = "clipboard_image_reply", .viewer = viewer, .sealed = sealed}));
+    return true;
 }
 
 std::optional<ChannelMessage> ViewerHub::file(std::uint64_t viewer, std::string_view sealed) {

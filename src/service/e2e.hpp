@@ -117,6 +117,36 @@ public:
     // sync mode only) everyone allowed to read it. Truncated to max_size.
     void deliver_clipboard(std::string_view text, bool pushed);
 
+    // A picture read off the machine's clipboard: the viewers it's for
+    // (those waiting on a get, or with `pushed` everyone allowed to read
+    // it, sync mode only) whose dashboard said it takes pictures, for
+    // ClipboardImages to send it to. One waiting that doesn't is answered
+    // with no text, as before pictures. None with `clipboard.images` off.
+    [[nodiscard]] std::vector<std::uint64_t> deliver_clipboard_image(bool pushed);
+
+    // Opens one sealed image-channel request (clipboard_images.hpp): a
+    // hello, taken here, or an ack or cancel, returned. For viewers that may
+    // read the clipboard, while `clipboard.images` is on.
+    [[nodiscard]] std::optional<ChannelMessage> clipboard_image(std::uint64_t viewer, std::string_view sealed);
+
+    // Opens one sealed chunk of a picture to paste, sealed apart from the
+    // requests. For a viewer that may not set the clipboard's pictures it's
+    // still opened (to say which paste is refused), and `refusal` says why.
+    [[nodiscard]] std::optional<ChannelMessage> clipboard_image_put(std::uint64_t viewer, std::string_view sealed,
+                                                                    std::string& refusal);
+
+    // Seals an image-channel message for one viewer and sends it. False
+    // when that viewer is gone, may no longer read the clipboard's
+    // pictures, or never said it takes them.
+    bool send_clipboard_image(std::uint64_t viewer, const ChannelMessage& message);
+
+    // Seals the image channel's small answers (progress, done, error,
+    // skipped) on the viewer's reply key instead, with clipboard text: the
+    // relay passes those with its events, which it never drops, where
+    // chunks share a queue with file data that it may. False when that
+    // viewer is gone or refused.
+    bool send_clipboard_image_reply(std::uint64_t viewer, const ChannelMessage& message);
+
     // Opens one sealed file-channel message; returns it if it's genuine,
     // new, and from a viewer with control while file transfer is on.
     [[nodiscard]] std::optional<ChannelMessage> file(std::uint64_t viewer, std::string_view sealed);

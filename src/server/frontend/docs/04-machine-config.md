@@ -39,6 +39,7 @@ enabled = true           # what the machine plays goes to its viewers
 mode = "pull"            # off | pull | sync
 max_size = 262144        # bytes of text, at most 262144 (256 KB)
 view_pull = false        # let view-only shares read it too
+images = true            # pictures too, as PNG of up to 8 MB
 
 [[files]]
 enabled = true
@@ -99,7 +100,8 @@ that doesn't parse turns sound off too.
 
 ## Clipboard
 
-Text only. The two directions are treated differently:
+Text, and pictures unless `images = false`. The two directions are
+treated differently:
 
 - **Pasting into the machine** needs control access. It's input in all
   but name.
@@ -113,6 +115,15 @@ Text only. The two directions are treated differently:
 
 View-only shares can never paste, and can read only with
 `view_pull = true`.
+
+Pictures follow the same rules as text, and go as PNG: up to 8 MB, and
+8K pixels (7680×4320, or 16384 on a side). A larger one is skipped, and
+the viewer told so; it's never cut down. When the clipboard holds text as
+well as a picture (cells copied from a spreadsheet), the text goes. A
+picture pasted into the machine goes on its clipboard in the formats
+Windows apps paste from (`PNG`, `CF_DIBV5`, and `CF_DIB` laid over white
+for those that ignore transparency). Machines and dashboards from before
+pictures stay text-only.
 
 ## Files
 

@@ -63,12 +63,18 @@ export interface RemoteInput {
 // puts it on the machine's clipboard, and the V follows a moment later.
 // `onPaste` returns false when it didn't send anything (no text, too long),
 // and the machine then pastes whatever it already had.
+//
+// With `onPasteImage` too, a clipboard holding a picture and no text sends
+// the picture (PNG, as browsers hand them over). That takes longer than a
+// moment, so the V waits for it to land, and isn't sent at all when it
+// doesn't (too large, refused): the note under the screen says why.
 export function useRemoteInput(
   canvasRef: RefObject<HTMLCanvasElement>,
   enabled: boolean,
   sendInput: (event: InputEvent) => void,
   onPaste: ((text: string) => boolean) | null = null,
   onSas: (() => void) | null = null,
+  onPasteImage: ((image: File) => Promise<boolean>) | null = null,
 ): RemoteInput {
   const [active, setActive] = useState(false);
   const sendInputRef = useRef(sendInput);
@@ -77,6 +83,8 @@ export function useRemoteInput(
   onPasteRef.current = onPaste;
   const onSasRef = useRef(onSas);
   onSasRef.current = onSas;
+  const onPasteImageRef = useRef(onPasteImage);
+  onPasteImageRef.current = onPasteImage;
   const pasting = onPaste !== null;
 
   const release = useCallback((): void => canvasRef.current?.blur(), [canvasRef]);
@@ -185,6 +193,8 @@ export function useRemoteInput(
 
     // A Ctrl+V waiting for its paste event, and the V taps still to come.
     let pasteWait: number | null = null;
+    // Set once torn down: a picture that lands after that taps nothing.
+    let disposed = false;
     const pasteTaps = new Set<number>();
     const tapV = (delay: number): void => {
       const timer = window.setTimeout(() => {
@@ -206,6 +216,14 @@ export function useRemoteInput(
       window.clearTimeout(pasteWait);
       pasteWait = null;
       const text = event.clipboardData?.getData("text/plain") ?? "";
+      const image = [...(event.clipboardData?.files ?? [])].find((file) => file.type === "image/png");
+      const pasteImage = onPasteImageRef.current;
+      if (text === "" && image !== undefined && pasteImage !== null) {
+        void pasteImage(image).then((sent) => {
+          if (sent && !disposed) tapV(0);
+        });
+        return;
+      }
       const sent = text !== "" && (onPasteRef.current?.(text) ?? false);
       tapV(sent ? PASTE_KEY_DELAY_MS : 0);
     };
@@ -294,6 +312,7 @@ export function useRemoteInput(
       document.removeEventListener("paste", onPaste);
       if (pasteWait !== null) window.clearTimeout(pasteWait);
       for (const timer of pasteTaps) window.clearTimeout(timer);
+      disposed = true;
       if (moveFrame !== null) window.cancelAnimationFrame(moveFrame);
       releaseHeld();
       setActive(false);

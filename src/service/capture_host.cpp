@@ -206,6 +206,9 @@ private:
         if (options.clipboard_listen) {
             command_line += L" --clipboard-listen";
         }
+        if (options.clipboard_images) {
+            command_line += L" --clipboard-images";
+        }
     }
     if (options.audio) {
         command_line += L" --audio";
@@ -470,9 +473,9 @@ struct CaptureHost::Impl {
         return hawk::service::read_exact(pipe.get(), io_event.get(), stop_event.get(), process.get(), out);
     }
 
-    // header || UTF-8 text, in one write. Never blocks on a hawk-capture
-    // that hasn't connected yet; a write that fails or times out closes
-    // the clipboard for the rest of the run, as with input.
+    // header || UTF-8 text (or PNG), in one write. Never blocks on a
+    // hawk-capture that hasn't connected yet; a write that fails or times
+    // out closes the clipboard for the rest of the run, as with input.
     [[nodiscard]] bool write_clipboard(ipc::ClipboardKind kind, std::string_view text) {
         if (!clipboard_pipe || clipboard_failed) {
             return false;
@@ -481,7 +484,7 @@ struct CaptureHost::Impl {
             spdlog::info("capture: hawk-capture hasn't opened the clipboard pipe yet; dropping the request");
             return false;
         }
-        if (text.size() > ipc::max_clipboard_size) {
+        if (text.size() > ipc::max_payload(kind)) {
             return false;
         }
         const ipc::ClipboardPacketHeader header{.size = static_cast<std::uint32_t>(text.size()),
@@ -528,8 +531,9 @@ struct CaptureHost::Impl {
                 break;
             }
             const auto kind = static_cast<ipc::ClipboardKind>(header.kind);
-            if (header.magic != ipc::clipboard_packet_magic || header.size > ipc::max_clipboard_size ||
-                (kind != ipc::ClipboardKind::text && kind != ipc::ClipboardKind::changed)) {
+            const bool known = kind == ipc::ClipboardKind::text || kind == ipc::ClipboardKind::changed ||
+                               kind == ipc::ClipboardKind::image || kind == ipc::ClipboardKind::image_changed;
+            if (header.magic != ipc::clipboard_packet_magic || !known || header.size > ipc::max_payload(kind)) {
                 spdlog::error("capture: malformed clipboard message from hawk-capture, closing the clipboard");
                 break;
             }
@@ -697,11 +701,11 @@ bool CaptureHost::send_input(const ipc::InputPacket& packet) {
     return impl_->write_input(packet);
 }
 
-bool CaptureHost::send_clipboard(ipc::ClipboardKind kind, std::string_view text) {
+bool CaptureHost::send_clipboard(ipc::ClipboardKind kind, std::string_view payload) {
     if (!impl_->running.load()) {
         return false;
     }
-    return impl_->write_clipboard(kind, text);
+    return impl_->write_clipboard(kind, payload);
 }
 
 void CaptureHost::stop() noexcept {

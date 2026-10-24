@@ -311,6 +311,20 @@ it says is taken on trust. Formats are in `relay/src/e2e.rs`,
   requests on for any role while the viewer is watching, and leaves the
   rest to the machine. Each message is at most about 342 KB, and there are
   at most 2 a second per dashboard and per viewer.
+- **Clipboard pictures** (protocol 9): PNG of up to 8 MB, far past that
+  cap, so it goes in 64 KB chunks over an image channel of its own rather
+  than as clipboard text. A viewer's requests (hello, ack, cancel) are
+  sealed like input; the chunks of a picture it pastes are sealed apart
+  from them, with their own associated data, so the relay can pass those
+  on for control alone while the requests go for any role watching. What
+  the machine sends uses a ninth per-viewer key with its own counter, and
+  is queued with file data, behind events and video; its small answers
+  (progress, done, error, too large) are sealed on the reply key instead
+  and go with the events, which are never dropped. A few chunks are
+  unacknowledged at a time either way, so a large picture never holds up
+  input or the stream. Requests are budgeted at 256 a second per dashboard
+  and chunks at 32 MB/s, both apart from clipboard text's budget; each
+  message is at most about 89 KB. Only for machines that speak protocol 9.
 - **Files:** requests and upload chunks are sealed like input, with their
   own associated data. What the machine sends back (listings, progress,
   download chunks) uses a fourth per-viewer key with its own counter,

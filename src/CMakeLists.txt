@@ -13,6 +13,7 @@ add_executable(hawk-service
     service/main.cpp
     service/audio_devices.cpp
     service/capture_host.cpp
+    service/clipboard_images.cpp
     service/config.cpp
     service/config_sync.cpp
     service/crypto.cpp
@@ -77,6 +78,7 @@ add_executable(hawk-capture
     capture/input.cpp
     capture/desktop.cpp
     capture/clipboard.cpp
+    capture/clipboard_image.cpp
     capture/audio.cpp
     capture/capture.rc  # embeds capture.manifest (DPI awareness, asInvoker)
     ${HAWK_VERSION_RC}
@@ -105,6 +107,8 @@ target_link_libraries(hawk-capture PRIVATE
     ole32
     oleaut32
     winmm
+    # clipboard pictures: PNG in and out
+    windowscodecs
 )
 
 target_set_warning(hawk-capture OFF)

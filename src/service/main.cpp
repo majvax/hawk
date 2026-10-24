@@ -3,6 +3,7 @@
 #include "config_sync.hpp"
 #include "crypto.hpp"
 #include "e2e.hpp"
+#include "clipboard_images.hpp"
 #include "files.hpp"
 #include "shell.hpp"
 #include "machine_identity.hpp"
@@ -58,7 +59,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 8;
+constexpr std::uint32_t kProtocolVersion = 9;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -153,11 +154,11 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*, config_*, quality, sas, ping
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard*, file, shell, metrics, audio_*, config_*, quality, sas, ping
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard, file, shell, metrics, power, audio_*, config_*, quality, sas
+    std::string                                  sealed;         // input, clipboard*, file, shell, metrics, power, audio_*, config_*, quality, sas
     std::vector<svc::SignedStatement>            revocations;    // revocations
     bool                                         audio = false;  // start_capture: the relay passes sound on
     std::uint32_t                                bitrate = 0;    // bitrate: Auto's next step, bits per second
@@ -486,6 +487,7 @@ struct Connection {
     Session&                             session;
     std::unique_ptr<svc::ViewerHub>&     hub;
     std::unique_ptr<svc::FileTransfers>& files;
+    std::unique_ptr<svc::ClipboardImages>& images;
     std::unique_ptr<svc::ShellSessions>& shells;
     std::unique_ptr<svc::MetricsChannel>& metrics;
     svc::MetricsRecorder*                recorder;  // null with [[metrics]] off
@@ -542,7 +544,8 @@ void ReportQuality(net::WebSocketClient& client, const Encoding& encoding) {
 // nobody is signed in) and forwards every
 // packet it produces to the relay, sealed for the machine's viewers. With
 // the clipboard allowed, what hawk-capture reads off it goes to the viewers
-// that asked (or, in sync mode, everyone who may read it). The stream starts
+// that asked (or, in sync mode, everyone who may read it): text through the
+// hub, pictures through ClipboardImages. The stream starts
 // at the quality it should have now, which the relay is told.
 void StartCapture(Connection& connection) {
     auto&       client = connection.client;
@@ -559,13 +562,21 @@ void StartCapture(Connection& connection) {
     const auto                encoding = CurrentEncoding(connection);
     const svc::CaptureOptions options{.clipboard = clipboard.mode != svc::ClipboardMode::off,
                                       .clipboard_listen = clipboard.mode == svc::ClipboardMode::sync,
+                                      .clipboard_images = clipboard.images,
                                       .audio = audio,
                                       // plausible_device_id() let only ASCII through.
                                       .audio_device = std::wstring(audio_device.begin(), audio_device.end()),
                                       .bitrate_bps = encoding.bitrate_bps,
                                       .fps = encoding.fps};
-    auto on_clipboard = [&hub](ipc::ClipboardKind kind, std::string_view text) {
-        hub.deliver_clipboard(text, kind == ipc::ClipboardKind::changed);
+    auto on_clipboard = [&hub, images = connection.images.get()](ipc::ClipboardKind kind, std::string_view payload) {
+        if (!ipc::is_image(kind)) {
+            hub.deliver_clipboard(payload, kind == ipc::ClipboardKind::changed);
+            return;
+        }
+        const bool pushed = kind == ipc::ClipboardKind::image_changed;
+        if (auto viewers = hub.deliver_clipboard_image(pushed); !viewers.empty() && images != nullptr) {
+            images->send(std::move(viewers), payload, pushed);
+        }
     };
     auto started = capture.start([&client, &hub](const svc::CapturePacket& packet) {
         // Frames come steadily, so this is where shares that ran out are
@@ -671,8 +682,9 @@ void SendConfig(svc::ViewerHub& hub, std::uint64_t viewer, bool saved = false, s
 // The rest waits for the service to start again.
 void ApplyConfig(Connection& connection, const svc::MachineConfig& saved) {
     auto&      config = connection.config;
-    const bool restart_capture =
-        saved.clipboard.mode != config.clipboard.mode || saved.audio.enabled != config.audio.enabled;
+    const bool restart_capture = saved.clipboard.mode != config.clipboard.mode ||
+                                 saved.clipboard.images != config.clipboard.images ||
+                                 saved.audio.enabled != config.audio.enabled;
     const bool was_auto = CurrentEncoding(connection).preset == svc::QualityPreset::automatic;
     config.clipboard = saved.clipboard;
     config.audio = saved.audio;
@@ -809,6 +821,8 @@ void OpenViewerHub(Connection& connection) {
     if (connection.config.files.enabled) {
         connection.files = std::make_unique<svc::FileTransfers>(connection.config.files, *connection.hub);
     }
+    // Whatever the config says now: the owner can turn pictures on live.
+    connection.images = std::make_unique<svc::ClipboardImages>(*connection.hub);
     if (connection.config.shell.enabled) {
         connection.shells = std::make_unique<svc::ShellSessions>(connection.config.shell, *connection.hub);
     }
@@ -823,7 +837,7 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         spdlog::warn("relay: received unparseable message: {}", text);
         return;
     }
-    auto& [client, capture, session, hub, files, shells, metrics, recorder, config, updater, capture_wanted,
+    auto& [client, capture, session, hub, files, images, shells, metrics, recorder, config, updater, capture_wanted,
            capture_audio, relay_audio, audio_device, quality_choice, auto_bitrate, encoding, encoder_pending] =
         connection;
 
@@ -872,6 +886,9 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
         if (files != nullptr) {
             files->drop_viewer(command.viewer);
         }
+        if (images != nullptr) {
+            images->drop_viewer(command.viewer);
+        }
         if (shells != nullptr) {
             shells->drop_viewer(command.viewer);
         }
@@ -889,6 +906,21 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
             if (!capture.is_running() || !capture.send_clipboard(kind, request->text)) {
                 spdlog::info("relay: the clipboard request from viewer {} couldn't reach hawk-capture",
                              command.viewer);
+            }
+        }
+    } else if (command.type == "clipboard_image") {
+        if (auto message = hub->clipboard_image(command.viewer, command.sealed); message.has_value() && images != nullptr) {
+            images->handle(command.viewer, std::move(*message));
+        }
+    } else if (command.type == "clipboard_image_put") {
+        std::string refusal;
+        if (const auto message = hub->clipboard_image_put(command.viewer, command.sealed, refusal);
+            message.has_value() && images != nullptr) {
+            if (!refusal.empty()) {
+                images->refuse(command.viewer, *message, refusal);
+            } else if (const auto pasted = images->receive(command.viewer, *message); pasted.has_value()) {
+                const bool set = capture.is_running() && capture.send_clipboard(ipc::ClipboardKind::set_image, pasted->png);
+                images->finished(command.viewer, pasted->id, set ? "" : "the machine's clipboard isn't reachable right now");
             }
         }
     } else if (command.type == "file") {
@@ -1112,6 +1144,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
 
         std::unique_ptr<svc::ViewerHub>     hub;
         std::unique_ptr<svc::FileTransfers> files;
+        std::unique_ptr<svc::ClipboardImages> images;
         std::unique_ptr<svc::ShellSessions> shells;
         std::unique_ptr<svc::MetricsChannel> metrics;
         Connection                          connection{.client = client,
@@ -1119,6 +1152,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
                                                        .session = *session,
                                                        .hub = hub,
                                                        .files = files,
+                                                       .images = images,
                                                        .shells = shells,
                                                        .metrics = metrics,
                                                        .recorder = recorder.get(),
@@ -1158,6 +1192,7 @@ void RelayLoop(const std::stop_token& stop_token, std::atomic<net::WebSocketClie
         // and before the viewers it seals frames for.
         capture.stop();
         files.reset();  // these answer through the hub
+        images.reset();
         shells.reset();
         metrics.reset();
         hub.reset();
@@ -1221,8 +1256,9 @@ void WINAPI ServiceMain([[maybe_unused]] DWORD argc, [[maybe_unused]] LPWSTR* ar
     InitLogging();
     spdlog::info("service: hawk-service {} starting", internal::version::full_version);
     svc::MachineConfig config = svc::load_machine_config();
-    spdlog::info("config: clipboard {}{}", to_string(config.clipboard.mode),
-                 config.clipboard.view_pull ? ", view shares may read it" : "");
+    spdlog::info("config: clipboard {}{}{}", to_string(config.clipboard.mode),
+                 config.clipboard.view_pull ? ", view shares may read it" : "",
+                 config.clipboard.images ? ", pictures too" : ", text only");
     spdlog::info("config: file transfer {}", config.files.enabled ? "on" : "off");
     spdlog::info("config: shell {}", config.shell.enabled ? std::format("on (\"{}\")", config.shell.command) : "off");
     spdlog::info("config: sound {}", config.audio.enabled ? "on" : "off");

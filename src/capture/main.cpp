@@ -139,8 +139,8 @@ private:
 };
 
 // hawk-service launches us with `--pipe <name> --input-pipe <name>`,
-// `--clipboard-pipe <name>` (plus `--clipboard-listen`) when its config
-// allows the clipboard, `--audio` when the machine's sound goes too
+// `--clipboard-pipe <name>` (plus `--clipboard-listen`, and
+// `--clipboard-images`) when its config allows the clipboard, `--audio` when the machine's sound goes too
 // (plus `--audio-device <endpoint id>` when a viewer chose the device), and
 // `--bitrate <bits/s> --fps <n>` for the stream's quality preset.
 [[nodiscard]] std::optional<std::string> option_value(std::span<char* const> args, std::string_view option) {
@@ -261,7 +261,8 @@ int main(int argc, char* argv[]) {
     // Best-effort too, and only there when hawk-service's config allows it.
     capture::ClipboardChannel clipboard;
     if (clipboard_pipe_name.has_value() &&
-        !clipboard.open(*clipboard_pipe_name, has_flag(args, "--clipboard-listen"))) {
+        !clipboard.open(*clipboard_pipe_name, has_flag(args, "--clipboard-listen"),
+                        has_flag(args, "--clipboard-images"))) {
         spdlog::warn("capture: continuing without the clipboard");
     }
 

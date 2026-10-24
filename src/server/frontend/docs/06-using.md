@@ -156,11 +156,27 @@ Power menu until it's updated.
 
 **Clipboard ▾** under the screen:
 
-- **Paste my clipboard to the machine** sends text from your computer to
-  the machine's clipboard (needs control). Then press `Ctrl+V` on the
-  machine. If your browser won't hand over your clipboard, a box appears
-  to paste the text into.
-- **Copy the machine's clipboard to mine** reads it onto your computer.
+- **Paste my clipboard to the machine** sends text or a picture from your
+  computer to the machine's clipboard (needs control). Then press `Ctrl+V`
+  on the machine. If your browser won't hand over your clipboard, a box
+  appears to paste the text into.
+- **Copy the machine's clipboard to mine** reads it onto your computer:
+  its text, or the picture on it.
+
+`Ctrl+V` on the screen does both at once: what's on your clipboard goes
+to the machine's, then the machine pastes it. A picture takes a moment to
+get there, and the machine pastes once it has; one too large isn't pasted,
+and the note under the screen says why.
+
+Pictures go as PNG, up to 8 MB and 8K pixels; larger ones are skipped,
+never cut. When your clipboard (or the machine's) holds text as well as a
+picture, the text goes. Some browsers handle pictures only partly:
+
+- **Firefox** before version 127 can't put a picture on your clipboard:
+  the picture shows under the screen instead, to right-click and copy, or
+  save.
+- A browser that won't hand the page pictures from your clipboard still
+  sends one with `Ctrl+V` on the screen.
 
 What's allowed depends on the machine's
 [config file](/docs/machine-config#clipboard).

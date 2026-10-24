@@ -12,6 +12,7 @@ import { relayHost, relayPageUrl } from "../relay.js";
 import type { Identity } from "../keys.js";
 import {
   MAX_CLIPBOARD_BYTES,
+  MAX_CLIPBOARD_IMAGE_BYTES,
   type Machine,
   type PowerAction,
   type Role,
@@ -20,6 +21,7 @@ import {
   canShell,
   canView,
 } from "../protocol.js";
+import { canReadImages, canWriteImages, formatBytes, imageProblem } from "../clipboardImages.js";
 import { Alert, CodeBlock, CopyButton, Corners, Dot, Metric, Tag, errorMessage, useNow } from "../ui.js";
 import type { Dashboard, ViewSecurity } from "../useDashboard.js";
 import { useRemoteInput } from "../useRemoteInput.js";
@@ -587,16 +589,19 @@ const keyboardLock = (): KeyboardLock | undefined => (navigator as Navigator & {
 
 // What the clipboard panel under the screen shows, if anything: text to
 // paste typed by hand (when the browser won't hand its clipboard over),
-// or the machine's text (when the browser won't take it).
-type ClipboardPanel = { kind: "paste"; text: string } | { kind: "received"; text: string } | null;
+// or the machine's text or picture (when the browser won't take it). A
+// picture's object URL is revoked once the panel moves on.
+type ClipboardPanel =
+  | { kind: "paste"; text: string }
+  | { kind: "received"; text: string }
+  | { kind: "image"; url: string; width: number; height: number }
+  | null;
 
 function byteSize(text: string): number {
   return new TextEncoder().encode(text).length;
 }
 
-function formatSize(bytes: number): string {
-  return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
-}
+const formatSize = formatBytes;
 
 // The Power menu. Anything that closes apps asks for a second click.
 const POWER_ITEMS: { action: PowerAction; label: string; warning: string | null; sent: (name: string) => string }[] = [
@@ -652,6 +657,7 @@ function Viewer({
     fileActions,
     sendInput,
     sendClipboard,
+    pasteImage,
     sendPower,
     elevated,
     sound,
@@ -756,6 +762,13 @@ function Viewer({
     );
   };
 
+  // A picture shown in the panel is let go of once it's gone from there.
+  useEffect(() => {
+    if (clipPanel?.kind !== "image") return;
+    const url = clipPanel.url;
+    return () => URL.revokeObjectURL(url);
+  }, [clipPanel]);
+
   // A new view, or none: whatever the panel held was for the last one.
   useEffect(() => {
     setClipPanel(null);
@@ -830,16 +843,49 @@ function Viewer({
     clearSasResult();
   }, [sasResult, clearSasResult]);
 
-  // Text from the machine: straight onto this computer's clipboard where
-  // the browser allows it, otherwise shown to copy by hand.
+  // Text or a picture from the machine: straight onto this computer's
+  // clipboard where the browser allows it, otherwise shown to copy (or
+  // save) by hand.
   const latest = clipboard.latest;
+  const images = clipboard.images;
   useEffect(() => {
     if (latest === null) return;
-    if (latest.text === "") {
-      if (!latest.pushed) setClipNote("The machine's clipboard has no text.");
+    const what = latest.pushed ? "Copied on the machine" : "The machine's clipboard";
+    if (latest.kind === "too_large") {
+      setClipNote(
+        `${latest.pushed ? "A picture copied on the machine" : "The machine's clipboard holds a picture that"} is ` +
+          `too large to send (more than ${formatSize(MAX_CLIPBOARD_IMAGE_BYTES)} as PNG, or past 8K).`,
+      );
       return;
     }
-    const what = latest.pushed ? "Copied on the machine" : "The machine's clipboard";
+    if (latest.kind === "image") {
+      const blob = new Blob([latest.png], { type: "image/png" });
+      const described = `a ${latest.width}×${latest.height} picture, ${formatSize(latest.png.length)}`;
+      const show = (why: string): void => {
+        setClipPanel({ kind: "image", url: URL.createObjectURL(blob), width: latest.width, height: latest.height });
+        setClipNote(`${what}: ${described}; ${why}`);
+      };
+      if (!document.hasFocus()) {
+        show("copy or save it below.");
+        return;
+      }
+      if (!canWriteImages()) {
+        show("this browser won't let the page copy pictures, so right-click it below to copy it, or save it.");
+        return;
+      }
+      navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]).then(
+        () => {
+          setClipPanel((prev) => (prev?.kind === "image" ? null : prev));
+          setClipNote(`${what} is on your clipboard: ${described}.`);
+        },
+        () => show("this browser wouldn't let the page copy it, so copy or save it below."),
+      );
+      return;
+    }
+    if (latest.text === "") {
+      if (!latest.pushed) setClipNote(images ? "The machine's clipboard has no text or picture." : "The machine's clipboard has no text.");
+      return;
+    }
     const size = formatSize(byteSize(latest.text));
     if (!document.hasFocus()) {
       setClipPanel({ kind: "received", text: latest.text });
@@ -856,7 +902,7 @@ function Viewer({
         setClipNote(`${what} (${size}); this browser won't let the page copy it, so copy it below.`);
       },
     );
-  }, [latest]);
+  }, [latest, images]);
 
   const pasteText = (text: string): void => {
     if (text === "") {
@@ -874,14 +920,59 @@ function Viewer({
     }
   };
 
+  // A picture to the machine's clipboard, with a note on how it went.
+  // Resolves to whether it's there.
+  const pastePicture = async (png: Blob): Promise<boolean> => {
+    const bytes = new Uint8Array(await png.arrayBuffer());
+    const problem = imageProblem(bytes);
+    if (problem !== null) {
+      setClipNote(`Not pasted: ${problem}.`);
+      return false;
+    }
+    setClipNote(`Sending a picture (${formatSize(bytes.length)}) to the machine's clipboard…`);
+    const result = await pasteImage(bytes);
+    setClipNote(
+      result.ok
+        ? `The picture (${formatSize(bytes.length)}) is on the machine's clipboard. Paste it there with Ctrl+V.`
+        : `The picture wasn't pasted: ${result.message}.`,
+    );
+    return result.ok;
+  };
+
   const pasteFromClipboard = async (): Promise<void> => {
+    // Text wins over a picture copied with it, as on the machine. Browsers
+    // that hand over only text (or nothing) fall through to that.
+    if (clipboard.images && canReadImages()) {
+      try {
+        const items = await navigator.clipboard.read();
+        const text = items.find((item) => item.types.includes("text/plain"));
+        const picture = items.find((item) => item.types.includes("image/png"));
+        if (text !== undefined) {
+          pasteText(await (await text.getType("text/plain")).text());
+          return;
+        }
+        if (picture !== undefined) {
+          setClipPanel(null);
+          await pastePicture(await picture.getType("image/png"));
+          return;
+        }
+        setClipNote("There's no text or picture to paste.");
+        return;
+      } catch {
+        // Refused, or not for pictures here: try for text alone.
+      }
+    }
     let text: string;
     try {
       text = await navigator.clipboard.readText();
     } catch {
       // Not allowed, or not supported: let it be pasted in by hand.
       setClipPanel({ kind: "paste", text: "" });
-      setClipNote("This browser won't hand the page your clipboard; paste the text below.");
+      setClipNote(
+        clipboard.images
+          ? "This browser won't hand the page your clipboard; paste the text below, or press Ctrl+V on the screen to send a picture."
+          : "This browser won't hand the page your clipboard; paste the text below.",
+      );
       return;
     }
     pasteText(text);
@@ -903,6 +994,7 @@ function Viewer({
     sendInput,
     canPaste ? pasteOnKey : null,
     canSas ? pressSas : null,
+    canPaste && clipboard.images ? pastePicture : null,
   );
 
   const getClipboard = (): void => {
@@ -1298,7 +1390,10 @@ function Viewer({
             canSendFiles && <span>Drop files on the screen to send them to the machine.</span>
           )}
           {canReadClipboard && clipboard.access === "sync" && (
-            <span>Text copied on the machine comes to your clipboard while this page has focus.</span>
+            <span>
+              {clipboard.images ? "Text and pictures" : "Text"} copied on the machine come to your clipboard while
+              this page has focus.
+            </span>
           )}
           {clipNote !== null && <span>{clipNote}</span>}
           {powerNote !== null && <span>{powerNote}</span>}
@@ -1345,6 +1440,24 @@ function Viewer({
                 </button>
                 <button type="button" className="btn btn-sm btn-ghost" onClick={() => setClipPanel(null)}>
                   Cancel
+                </button>
+              </div>
+            </>
+          ) : clipPanel.kind === "image" ? (
+            <>
+              <img
+                className="clip-image"
+                src={clipPanel.url}
+                width={clipPanel.width}
+                height={clipPanel.height}
+                alt="The picture on the machine's clipboard"
+              />
+              <div className="clip-actions">
+                <a className="btn btn-sm btn-primary" href={clipPanel.url} download="clipboard.png">
+                  Save
+                </a>
+                <button type="button" className="btn btn-sm btn-ghost" onClick={() => setClipPanel(null)}>
+                  Dismiss
                 </button>
               </div>
             </>

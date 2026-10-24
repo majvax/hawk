@@ -27,6 +27,7 @@ struct ClipboardTable {
     std::optional<std::string>   mode;
     std::optional<std::uint32_t> max_size;
     std::optional<bool>          view_pull;
+    std::optional<bool>          images;
 };
 
 struct FilesTable {
@@ -88,7 +89,8 @@ struct ConfigFile {
 template <>
 struct glz::meta<hawk::service::ClipboardTable> {
     using T                     = hawk::service::ClipboardTable;
-    static constexpr auto value = object("mode", &T::mode, "max_size", &T::max_size, "view_pull", &T::view_pull);
+    static constexpr auto value = object("mode", &T::mode, "max_size", &T::max_size, "view_pull", &T::view_pull,
+                                         "images", &T::images);
 };
 
 template <>
@@ -188,6 +190,7 @@ using Checked = std::expected<T, std::string>;
         config.max_size = *table.max_size;
     }
     config.view_pull = table.view_pull.value_or(config.view_pull);
+    config.images = table.images.value_or(config.images);
     return config;
 }
 
@@ -544,6 +547,12 @@ constexpr std::array kSettings{
             .description = "Let view-only shares read the clipboard too. Pasting in always needs control.",
             .apply = SettingApply::live,
             .value = [](const MachineConfig& c) -> SettingValue { return c.clipboard.view_pull; }},
+    Setting{.key = "clipboard.images",
+            .type = SettingType::boolean,
+            .description = "Pictures too, not only text: copied images go as PNG, up to 8 MB each, the same ways "
+                           "text does.",
+            .apply = SettingApply::live,
+            .value = [](const MachineConfig& c) -> SettingValue { return c.clipboard.images; }},
     Setting{.key = "audio.enabled",
             .type = SettingType::boolean,
             .description = "Send what this PC plays to everyone watching, with the picture.",

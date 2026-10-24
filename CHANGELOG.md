@@ -73,7 +73,22 @@ Each release's section becomes its release notes (see
   a machine that updates to this release needs `hawk-setup install machine`
   run on it once to allow it. A machine that doesn't allow it says so in
   the live view, with what to change.
-- Protocol version 8.
+- **Clipboard pictures.** Images go both ways, as text does: paste one into
+  the machine (**Clipboard ▾**, or `Ctrl+V` on the screen), copy the
+  machine's to yours, or in sync mode have every picture copied there come
+  to you, under the same roles and modes. They travel as PNG: the machine
+  reads `PNG`, `CF_DIBV5` or `CF_DIB` (encoding bitmaps with WIC) and puts a
+  pasted picture on as `PNG`, `CF_DIBV5` and `CF_DIB`, so any app can paste
+  it. Up to 8 MB of PNG and 8K pixels; a larger one is skipped with a note,
+  never cut. When the clipboard holds text as well, the text goes. Pictures
+  travel in 64 KB chunks on a channel of their own, with a few in flight at
+  a time, so a large one never holds up input or the picture; the relay
+  budgets them apart from text. `[[clipboard]] images = false` keeps the
+  clipboard to text. A browser that won't put pictures on its clipboard
+  (older Firefox) shows the picture to save or copy by hand; one that won't
+  hand them over still sends one with `Ctrl+V` on the screen. Older machines
+  and dashboards stay text-only.
+- Protocol version 9.
 
 ## 1.0.0
 

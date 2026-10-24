@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -36,6 +36,13 @@ export type ClipboardAccess = "off" | "pull" | "sync";
 
 // The most clipboard text sent either way, in UTF-8 bytes.
 export const MAX_CLIPBOARD_BYTES = 256 * 1024;
+
+// The most a clipboard picture may be either way: PNG bytes, the longest
+// side and the pixels in all (8K). Must match max_clipboard_image_* in
+// src/common/clipboard_pipe.hpp. Larger ones are skipped, never cut.
+export const MAX_CLIPBOARD_IMAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_CLIPBOARD_IMAGE_SIDE = 16384;
+export const MAX_CLIPBOARD_IMAGE_PIXELS = 7680 * 4320;
 
 // A machine as the logged-in user sees it.
 export interface Machine {
@@ -114,6 +121,9 @@ export type DashboardEvent =
       shell?: boolean;
       // Whether it may read the machine's analytics.
       analytics?: boolean;
+      // Whether pictures go with its clipboard (clipboardImages.ts); absent
+      // from a machine or relay that predates them.
+      clipboardImages?: boolean;
     }
   | { type: "view_rejected"; deviceId: string; reason: string }
   // Whether the relay passes on this view's input, files and shells. False
@@ -122,6 +132,13 @@ export type DashboardEvent =
   | { type: "stream_key"; deviceId: string; wrappedKey: string }
   // Clipboard text the machine sealed for this viewer (ViewSession.openClipboard).
   | { type: "clipboard"; deviceId: string; sealed: string }
+  // An image-channel message the machine sealed for this viewer
+  // (ViewSession.openClipboardImage): a chunk of a picture, or how a paste went.
+  | { type: "clipboard_image"; deviceId: string; sealed: string }
+  // How a paste of a picture went (progress, done, error), or word of one too
+  // large to send: sealed on the reply key (ViewSession.openClipboardImageReply)
+  // and passed with the events, so never dropped.
+  | { type: "clipboard_image_reply"; deviceId: string; sealed: string }
   // A file-channel message the machine sealed for this viewer (ViewSession.openFile).
   | { type: "file"; deviceId: string; sealed: string }
   // A shell-channel message the machine sealed for this viewer (ViewSession.openShell).
@@ -170,6 +187,12 @@ export type DashboardCommand =
   // A clipboard request, sealed the same way (ViewSession.sealClipboard).
   // Passed on for any role; the machine decides what its config allows.
   | { type: "clipboard"; deviceId: string; sealed: string }
+  // An image-channel request (ViewSession.sealClipboardImage): hello, ack,
+  // cancel. Passed on for any role, as clipboard requests are.
+  | { type: "clipboard_image"; deviceId: string; sealed: string }
+  // A chunk of a picture to paste (ViewSession.sealClipboardImagePut);
+  // control and owner.
+  | { type: "clipboard_image_put"; deviceId: string; sealed: string }
   // A file-channel message (ViewSession.sealFile); control, dev and owner.
   | { type: "file"; deviceId: string; sealed: string }
   // A shell-channel message (ViewSession.sealShell); dev and owner.

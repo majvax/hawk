@@ -16,8 +16,12 @@ namespace hawk::capture {
 // station is, whichever desktop the capture and input threads follow. Pipe
 // reads happen on a second thread, which hands requests to the window.
 //
-// Text only (CF_UNICODETEXT), passed as UTF-8 and capped at
-// ipc::max_clipboard_size.
+// Text (CF_UNICODETEXT) is passed as UTF-8 and capped at
+// ipc::max_clipboard_size. With `images`, a picture is too, as PNG (see
+// clipboard_image.hpp): one set by a viewer goes on as PNG, CF_DIBV5 and
+// CF_DIB, and one read here goes out when the clipboard holds no text.
+// Pictures past ipc::max_clipboard_image_size (or its size in pixels) are
+// reported as too large, never cut.
 class ClipboardChannel {
 public:
     ClipboardChannel();
@@ -30,7 +34,7 @@ public:
 
     // Opens hawk-service's end of the pipe and starts serving it. Failures
     // are logged; the clipboard simply stays unavailable.
-    [[nodiscard]] bool open(const std::string& pipe_name, bool listen);
+    [[nodiscard]] bool open(const std::string& pipe_name, bool listen, bool images);
 
     // Stops both threads. Safe to call when the channel was never opened.
     void close() noexcept;

@@ -54,6 +54,16 @@ Its key hasn't been checked, so nobody can watch it. See
 The machine checked your share and said no. The reason follows the
 message. Usually the share ended or changed: ask the owner.
 
+## A picture won't paste, or doesn't come over
+
+- **"Too large"**: pictures go up to 8 MB as PNG and 8K pixels. Crop or
+  scale it down, or send it as a file.
+- **Only text comes over**: the clipboard held text as well, and text
+  wins. Copy the picture on its own.
+- **Nothing about pictures at all**: the machine's config has
+  `images = false`, or the machine (or the relay) is older than pictures
+  and handles text only.
+
 ## Clipboard, Files or Terminal is missing or says it's off
 
 Either your access level doesn't include it (see

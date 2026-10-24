@@ -186,6 +186,7 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [x] Quality presets, and Auto: adaptive bitrate steered by the relay from its own queues
 - [ ] Quality: capture scale, keyframe interval, per-viewer layers (simulcast / SVC)
 - [x] Clipboard sync (text): paste into the machine, pull from it, or sync, set by the machine's config file
+- [x] Clipboard pictures: PNG both ways under the same modes, chunked so a large one never holds up input or video
 - [x] File transfer into and out of one drop folder, resumable and hash-checked, off unless the machine's config turns it on
 - [x] Remote power actions (lock, sign out, restart, shut down), reboot-and-reconnect, remote sign-in at the sign-in screen
 - [x] Ctrl+Alt+Del from the live view (`SendSAS` from the service), including at a sign-in screen that asks for it
@@ -553,9 +554,8 @@ away falls back to the default until it's back. The original plan:
 The two things people reach for within a minute of getting a remote
 desktop, and the two with the sharpest privacy and privilege edges.
 
-**Clipboard (built).** Text only (`CF_UNICODETEXT`); images (`CF_DIBV5`)
-may come later if they turn out to be worth the size. The directions are
-*not* symmetrical:
+**Clipboard (built).** Text (`CF_UNICODETEXT`), and pictures as PNG. The
+directions are *not* symmetrical:
 
 * **Viewer → machine** (paste into the machine) requires **control**; it's
   an input event in everything but name.
@@ -567,6 +567,25 @@ may come later if they turn out to be worth the size. The directions are
   machine's owner opts into.
 * Capped at 256 KB of UTF-8, rate-limited by the relay, and never offered
   to a **view** share unless `view_pull` says so.
+* **Pictures** follow the same rules (paste in with control, pull or sync
+  out, `view_pull` for view shares), and `images = false` keeps the
+  clipboard to text. They travel as PNG, the one image format browsers put
+  on their clipboard: the machine sends the `PNG` format an app put there
+  as it is, or encodes `CF_DIBV5` / `CF_DIB` (24- or 32-bit, either way up;
+  an alpha that's zero throughout counts as opaque) with WIC. A pasted
+  picture goes on as `PNG`, `CF_DIBV5` with its alpha, and a 24-bit
+  `CF_DIB` laid over white for the apps that ignore alpha. When the
+  clipboard holds text too (cells, a slide), the text goes. At most 8 MB
+  of PNG and 8K pixels (and 16384 on a side); a larger picture is skipped
+  with a note, never cut.
+* A picture doesn't fit a clipboard message, and one 8 MB message would
+  hold up everything queued behind it on the socket for seconds. So it
+  goes in 64 KB chunks over an image channel of its own, four
+  unacknowledged at a time either way: the relay queues the machine's with
+  file data, behind input, events and video, and what a viewer pastes
+  waits behind no more than a quarter megabyte of it. The relay budgets it
+  apart from text, which stays as quick as it was. Machines and dashboards
+  older than protocol 9 keep text alone, with no errors either side.
 
 It's set in the machine's own `C:\ProgramData\HawkService\config.toml`,
 read when the service starts, or by the owner from the machine's Config
@@ -577,6 +596,7 @@ tab (see *Synced configuration file*):
 mode = "pull"        # off | pull | sync
 max_size = 262144    # bytes of UTF-8, at most 262144
 view_pull = false    # let view-only shares read it too
+images = true        # pictures too, as PNG of up to 8 MB
 ```
 
 A missing file, or one with no `[[clipboard]]` table, means these defaults.
@@ -594,13 +614,15 @@ How it works:
   as in `src/common/clipboard_pipe.hpp`). That pipe is only created when the
   config doesn't say `off`, and the listener only runs in `sync` mode.
   hawk-capture only runs while someone is watching, so the clipboard is
-  reachable only then too.
+  reachable only then too. Each end checks a message's size against its
+  kind's cap (256 KB of text, 8 MB of PNG) before reading it.
 * Requests are sealed end to end (see the relay's README). The machine
   checks every one against the viewer's role and the config, whatever the
   dashboard showed. It logs who did what and how many bytes, never the
-  text.
+  text or the picture.
 * In sync mode, a copy is reported once the clipboard settles, so one copy
-  is one push. What a viewer pasted isn't pushed back.
+  is one push. What a viewer pasted isn't pushed back. A newer picture
+  replaces one still on its way.
 
 **File transfer (built).** Drop files on the screen (or use *Send files*
 in the machine's Files tab) to send them; the tab lists the machine's drop

@@ -46,6 +46,8 @@ struct CaptureOptions {
     bool clipboard = false;
     // Have hawk-capture report every copy made on the machine (sync mode).
     bool clipboard_listen = false;
+    // Pictures too, not only text.
+    bool clipboard_images = false;
     // Capture what the machine plays, too.
     bool audio = false;
     // From this output device (an endpoint id) rather than the default.
@@ -73,9 +75,11 @@ struct CaptureOptions {
 class CaptureHost {
 public:
     using PacketHandler = std::function<void(const CapturePacket&)>;
-    // Clipboard text from hawk-capture: `text` answering a get, or
-    // `changed` for a copy made on the machine. Only valid during the call.
-    using ClipboardHandler = std::function<void(ipc::ClipboardKind kind, std::string_view text)>;
+    // The clipboard from hawk-capture: `text` answering a get, or `changed`
+    // for a copy made on the machine; with pictures, `image` and
+    // `image_changed` carrying PNG (empty for one too large). Only valid
+    // during the call.
+    using ClipboardHandler = std::function<void(ipc::ClipboardKind kind, std::string_view payload)>;
 
     CaptureHost();
     ~CaptureHost();
@@ -96,11 +100,12 @@ public:
     // closed until capture restarts.
     [[nodiscard]] bool send_input(const ipc::InputPacket& packet);
 
-    // Asks hawk-capture to set (`set`, with `text`) or read (`get`) the
-    // clipboard; a read is answered through the ClipboardHandler. Returns
+    // Asks hawk-capture to set (`set` with text, `set_image` with PNG) or
+    // read (`get`) the clipboard; a read is answered through the
+    // ClipboardHandler. Returns
     // false, logged, when the clipboard pipe isn't open or isn't connected
     // yet; like input, it never waits for hawk-capture to start up.
-    [[nodiscard]] bool send_clipboard(ipc::ClipboardKind kind, std::string_view text = {});
+    [[nodiscard]] bool send_clipboard(ipc::ClipboardKind kind, std::string_view payload = {});
 
     // Stops the reader thread and hawk-capture. Once it returns, the
     // PacketHandler is never called again. Safe to call when not running.
