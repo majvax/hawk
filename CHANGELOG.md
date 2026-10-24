@@ -28,6 +28,12 @@ Each release's section becomes its release notes (see
 - **Sound ▾** lists the machine's output devices; control and the owner
   can choose which one the stream carries (after a fresh code, as with
   power). The choice lasts until the stream stops.
+- **Stats** in the live view lays the stream's numbers over the picture:
+  bitrate, frames received, decoded and shown, frames dropped or skipped,
+  what's waiting in the decoder and how long decoding takes (on the MSE
+  fallback, how far playback runs behind instead), the round trip to the
+  machine, and the sound's buffer. Remembered in the browser. The round
+  trip is a ping the machine echoes back, sent only while the stats show.
 - Protocol version 5.
 
 ## 1.0.0

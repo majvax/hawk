@@ -25,6 +25,7 @@ import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
 import { AudioPlayer, type SoundState, soundSupported } from "./audio.js";
 import type { SoundMode } from "./soundMode.js";
+import { DecodeClock, PingTracker, type Quality, type StreamStats, qualityDelta, summarize } from "./streamStats.js";
 import type {
   ClipboardAccess,
   DashboardCommand,
@@ -88,7 +89,13 @@ interface StreamDecoder {
   decode(frame: ParsedVideoFrame): void;
   close(): void;
   // Frames shown and dropped so far, where the browser counts them itself.
-  playbackQuality?(): { shown: number; dropped: number } | null;
+  playbackQuality?(): Quality | null;
+  // Frames waiting inside the decoder.
+  queued?(): number;
+  // Frames thrown away so far rather than decoded (MSE's own backlog).
+  discarded?(): number;
+  // How far playback runs behind what's buffered (MSE).
+  lagMs?(): number | null;
   debugInfo?(): string;
 }
 
@@ -192,15 +199,6 @@ export interface ShellActions {
   setSink: (id: string, sink: OutputSink | null) => void;
 }
 
-export interface StreamStats {
-  fps: number; // frames shown over the last second
-  received: number; // frames that arrived over the last second
-  dropped: number; // decoded but not shown over the last second
-  debug: string | null; // the decoder's own readout, with ?debug in the URL
-  kbps: number; // video received over the last second
-  receiving: boolean; // frames are arriving
-}
-
 export interface Dashboard {
   machines: Machine[];
   status: ConnectionStatus;
@@ -275,6 +273,13 @@ export interface Dashboard {
   // Prefer sync over latency: the picture waits for the sound (soundMode.ts).
   sync: boolean;
   setSync: (sync: boolean) => void;
+  // The stats overlay on the live view; while it's up, the machine is
+  // pinged once a second for the round trip. Remembered in the browser.
+  statsShown: boolean;
+  setStatsShown: (shown: boolean) => void;
+  // Whether the overlay is on screen now (the Screen tab is up): pings
+  // only go out while it is.
+  setStatsVisible: (visible: boolean) => void;
 }
 
 export interface AudioDevice {
@@ -310,6 +315,15 @@ function parseAudioDevices(header: unknown): AudioDevicesState | null {
 
 const MUTED_KEY = "hawk.sound.muted";
 const SYNC_KEY = "hawk.sound.sync";
+const STATS_KEY = "hawk.view.stats";
+
+function loadStatsShown(): boolean {
+  try {
+    return window.localStorage.getItem(STATS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 function loadSync(): boolean {
   try {
@@ -432,6 +446,14 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const bytesRef = useRef(0);
   const receivedRef = useRef(0);
   const lastFrameAtRef = useRef(0);
+  // Out of the WebCodecs decoder, and thrown away before reaching one.
+  const decodedRef = useRef(0);
+  const skippedRef = useRef(0);
+  const decodeClockRef = useRef(new DecodeClock());
+  const pingRef = useRef(new PingTracker());
+  const [statsShown, setStatsShownState] = useState(loadStatsShown);
+  const statsShownRef = useRef(statsShown);
+  const statsVisibleRef = useRef(false);
 
   const send = useCallback((command: DashboardCommand): boolean => {
     const socket = socketRef.current;
@@ -518,6 +540,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     const decoder = decoderRef.current;
     decoderRef.current = null;
     decoder?.close();
+    decodeClockRef.current.clear();
     audioRef.current?.reset();
   }, [dropHeld]);
 
@@ -583,6 +606,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   // the sound.
   const drawFrame = useCallback(
     (frame: VideoFrame): void => {
+      decodedRef.current += 1;
+      decodeClockRef.current.finished(frame.timestamp, performance.now());
       if (!syncRef.current && heldRef.current.length === 0) {
         skewMsRef.current = null;
         showFrame(frame);
@@ -652,6 +677,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
         decoder = {
           decode: (frame) => {
             if (videoDecoder.state !== "configured") return;
+            decodeClockRef.current.submitted(frame.timestamp, performance.now());
             videoDecoder.decode(
               new EncodedVideoChunk({
                 type: frame.isKeyframe ? "key" : "delta",
@@ -663,6 +689,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
           close: () => {
             if (videoDecoder.state !== "closed") videoDecoder.close();
           },
+          queued: () => videoDecoder.decodeQueueSize,
           debugInfo: () => {
             const skew = skewMsRef.current;
             return skew === null ? "a/v free" : `a/v ${skew >= 0 ? "+" : ""}${Math.round(skew)}ms`;
@@ -693,7 +720,10 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     (frame: ParsedVideoFrame): void => {
       // Decoding can only begin on a keyframe; drop deltas until the first
       // one arrives (e.g. when attaching mid-stream).
-      if (!sawKeyframeRef.current && !frame.isKeyframe) return;
+      if (!sawKeyframeRef.current && !frame.isKeyframe) {
+        skippedRef.current += 1;
+        return;
+      }
       sawKeyframeRef.current = true;
       ensureDecoder()?.decode(frame);
     },
@@ -714,6 +744,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       if ((flags & FRAME_AUDIO_FLAG) === 0) receivedRef.current += 1; // the stats count pictures
       if (pendingFramesRef.current >= MAX_PENDING_FRAMES && !keyframe) {
         sawKeyframeRef.current = false; // a gap: start again at a keyframe
+        if ((flags & FRAME_AUDIO_FLAG) === 0) skippedRef.current += 1;
         return;
       }
       pendingFramesRef.current += 1;
@@ -984,6 +1015,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
             .catch((error: unknown) => console.error("audio devices:", error));
           break;
         }
+        case "pong":
+          if (viewing === payload.deviceId) pingRef.current.answer(payload.nonce, performance.now());
+          break;
         case "elevation":
           if (viewing !== payload.deviceId) break;
           setElevated(payload.elevated);
@@ -1153,6 +1187,18 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     },
     [audioPlayer],
   );
+  const setStatsShown = useCallback((next: boolean): void => {
+    try {
+      window.localStorage.setItem(STATS_KEY, next ? "1" : "0");
+    } catch {
+      // Not remembered, then; it still applies now.
+    }
+    statsShownRef.current = next;
+    setStatsShownState(next);
+  }, []);
+  const setStatsVisible = useCallback((visible: boolean): void => {
+    statsVisibleRef.current = visible;
+  }, []);
 
   useEffect(() => {
     if (viewingId === null) {
@@ -1162,44 +1208,74 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     framesRef.current = 0;
     bytesRef.current = 0;
     receivedRef.current = 0;
+    decodedRef.current = 0;
+    skippedRef.current = 0;
     lastFrameAtRef.current = 0;
+    pingRef.current.reset();
     let last = performance.now();
     // Per decoder, since a new one starts counting from zero.
     let lastDecoder: StreamDecoder | null = null;
-    let lastQuality = { shown: 0, dropped: 0 };
+    let lastQuality: Quality | null = null;
+    let lastDiscarded = 0;
     const timer = window.setInterval(() => {
       const now = performance.now();
-      const seconds = Math.max(0.001, (now - last) / 1000);
+      const seconds = (now - last) / 1000;
       last = now;
+      const decoder = decoderRef.current;
+      const sameDecoder = decoder === lastDecoder;
+      lastDecoder = decoder;
       // The browser's own counts where it keeps them (MSE), else the
       // frames drawn here (WebCodecs).
-      const decoder = decoderRef.current;
       const quality = decoder?.playbackQuality?.() ?? null;
-      let shown = framesRef.current;
-      let dropped = droppedRef.current;
-      if (quality !== null) {
-        if (decoder === lastDecoder) {
-          shown = Math.max(0, quality.shown - lastQuality.shown);
-          dropped = Math.max(0, quality.dropped - lastQuality.dropped);
-        }
-        lastQuality = quality;
-      }
-      lastDecoder = decoder;
-      setStats({
-        fps: Math.round(shown / seconds),
-        received: Math.round(receivedRef.current / seconds),
-        dropped: Math.round(dropped / seconds),
-        debug: DEBUG ? (decoder?.debugInfo?.() ?? null) : null,
-        kbps: Math.round((bytesRef.current * 8) / 1000 / seconds),
-        receiving: now - lastFrameAtRef.current < STALL_MS,
-      });
+      const delta = quality === null ? null : qualityDelta(sameDecoder ? lastQuality : null, quality);
+      lastQuality = quality;
+      const discarded = decoder?.discarded?.() ?? 0;
+      const newlyDiscarded = sameDecoder ? Math.max(0, discarded - lastDiscarded) : discarded;
+      lastDiscarded = discarded;
+      const backend = backendRef.current === "webcodecs" || backendRef.current === "mse" ? backendRef.current : null;
+      const audioMs = audioRef.current?.bufferedMs() ?? null;
+      setStats(
+        summarize({
+          seconds,
+          bytes: bytesRef.current,
+          received: receivedRef.current,
+          decoded: backend === "webcodecs" ? decodedRef.current : delta === null ? null : delta.shown + delta.dropped,
+          shown: quality === null ? framesRef.current : (delta?.shown ?? 0),
+          dropped: quality === null ? droppedRef.current : (delta?.dropped ?? 0),
+          skipped: skippedRef.current + newlyDiscarded,
+          pending: pendingFramesRef.current,
+          queue: decoder?.queued?.() ?? null,
+          decodeMs: decodeClockRef.current.takeMeanMs(),
+          lagMs: decoder?.lagMs?.() ?? null,
+          rttMs: pingRef.current.rttMs(now),
+          audioMs: audioMs === null ? null : Math.round(audioMs),
+          backend,
+          receiving: now - lastFrameAtRef.current < STALL_MS,
+          debug: DEBUG ? (decoder?.debugInfo?.() ?? null) : null,
+        }),
+      );
       framesRef.current = 0;
       droppedRef.current = 0;
       bytesRef.current = 0;
       receivedRef.current = 0;
+      decodedRef.current = 0;
+      skippedRef.current = 0;
+      // Only while the overlay shows it, and to a machine that answers:
+      // it echoes it straight back.
+      const deviceId = streamingRef.current;
+      const answers = machinesRef.current.some((machine) => machine.id === deviceId && machine.ping === true);
+      if (
+        statsShownRef.current &&
+        statsVisibleRef.current &&
+        answers &&
+        deviceId !== null &&
+        sessionRef.current?.accepted === true
+      ) {
+        send({ type: "ping", deviceId, nonce: pingRef.current.start(now) });
+      }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [viewingId]);
+  }, [send, viewingId]);
 
   const sendInput = useCallback(
     (event: InputEvent): void => {
@@ -1378,5 +1454,8 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     unlockSound,
     sync,
     setSync,
+    statsShown,
+    setStatsShown,
+    setStatsVisible,
   };
 }

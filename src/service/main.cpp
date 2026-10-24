@@ -99,6 +99,14 @@ struct GoingDownMessage {
     bool        restart = false;
 };
 
+// The echo of a viewer's ping, for the round trip its stats show. Nothing
+// in it is secret, so it isn't sealed.
+struct PongMessage {
+    std::string   type = "pong";
+    std::uint64_t viewer = 0;
+    std::string   nonce;
+};
+
 // The header of the audio channel's one message: the machine's output
 // devices, and which one the stream captures (empty for the default).
 struct AudioDeviceEntry {
@@ -128,11 +136,11 @@ struct ProofMessage {
 // or forge them, and ViewerHub checks them.
 struct RelayCommand {
     std::string                                  type;
-    std::string                                  nonce;          // challenge
+    std::string                                  nonce;          // challenge, ping
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard, file, shell, metrics, audio_*, ping
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
@@ -175,6 +183,12 @@ template <>
 struct glz::meta<GoingDownMessage> {
     using T                     = GoingDownMessage;
     static constexpr auto value = object("type", &T::type, "restart", &T::restart);
+};
+
+template <>
+struct glz::meta<PongMessage> {
+    using T                     = PongMessage;
+    static constexpr auto value = object("type", &T::type, "viewer", &T::viewer, "nonce", &T::nonce);
 };
 
 template <>
@@ -557,6 +571,22 @@ void RunPowerAction(net::WebSocketClient& client, svc::PowerAction action) {
     }
 }
 
+// The longest nonce echoed back; the dashboard sends a counter.
+constexpr std::size_t kMaxPingNonce = 32;
+
+// Echoes a viewer's ping straight back.
+void SendPong(net::WebSocketClient& client, std::uint64_t viewer, const std::string& nonce) {
+    if (nonce.size() > kMaxPingNonce) {
+        return;
+    }
+    const PongMessage message{.viewer = viewer, .nonce = nonce};
+    if (auto json = glz::write_json(message); json.has_value()) {
+        if (auto sent = client.send_text(*json); !sent.has_value()) {
+            spdlog::debug("relay: failed to answer a ping: {}", net::to_string(sent.error()));
+        }
+    }
+}
+
 // The connection's viewers, once the machine knows its id.
 void OpenViewerHub(Connection& connection) {
     if (connection.hub != nullptr || !connection.session.machine_id.has_value()) {
@@ -678,6 +708,8 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
             SelectAudioDevice(connection, *id);
             SendAudioDevices(*hub, command.viewer, connection);
         }
+    } else if (command.type == "ping") {
+        SendPong(client, command.viewer, command.nonce);
     } else if (command.type == "revocations") {
         hub->apply_revocations(command.revocations);
     } else {

@@ -73,6 +73,10 @@ export class MseDecoder {
   private readonly anchors: Array<{ mediaS: number; streamUs: number }> = [];
   private skewMs: number | null = null;
 
+  // Frames thrown away rather than appended (a backlog, and the deltas
+  // after it until the next keyframe), for the stream stats.
+  private discardedFrames = 0;
+
   // For the ?debug readout.
   private stalls = 0;
   private seeks = 0;
@@ -134,7 +138,10 @@ export class MseDecoder {
 
   decode(frame: ParsedVideoFrame): void {
     if (this.closed) return;
-    if (this.awaitingKeyframe && !frame.isKeyframe) return;
+    if (this.awaitingKeyframe && !frame.isKeyframe) {
+      if (this.lastTimestamp !== null) this.discardedFrames += 1; // after a backlog, not the stream's start
+      return;
+    }
 
     const units = splitNalUnits(frame.data);
     if (frame.isKeyframe) {
@@ -176,6 +183,7 @@ export class MseDecoder {
     if (this.queue.length > MAX_QUEUED) {
       // An init segment may have gone with the rest, so forget the SPS and
       // let the next keyframe send one again.
+      this.discardedFrames += this.queue.filter((segment) => segment.codec === undefined).length;
       this.queue.length = 0;
       this.sps = null;
       this.awaitingKeyframe = true;
@@ -192,6 +200,23 @@ export class MseDecoder {
     const quality = this.video.getVideoPlaybackQuality?.();
     if (quality === undefined) return null;
     return { shown: quality.totalVideoFrames - quality.droppedVideoFrames, dropped: quality.droppedVideoFrames };
+  }
+
+  // Frames thrown away so far, rather than played.
+  discarded(): number {
+    return this.discardedFrames;
+  }
+
+  // Segments waiting for the source buffer.
+  queued(): number {
+    return this.queue.length;
+  }
+
+  // How far playback runs behind the newest buffered frame, in ms.
+  lagMs(): number | null {
+    const buffered = this.video.buffered;
+    if (buffered.length === 0) return null;
+    return Math.max(0, (buffered.end(buffered.length - 1) - this.video.currentTime) * 1000);
   }
 
   // A one-line account of how playback is going, for ?debug.

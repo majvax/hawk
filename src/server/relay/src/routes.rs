@@ -23,7 +23,7 @@ use crate::e2e;
 use crate::error::ApiError;
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
-    MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
+    MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
 use crate::registry::{Answer, DashboardHandle, DeviceInfo, DeviceOutbound, Outbound, RESTART_GRACE, Registry, StepUp};
@@ -363,6 +363,11 @@ fn route_device_answer(
         Ok(DeviceMessage::StreamKey { viewer, wrapped_key }) if answer_fits(&[&wrapped_key]) => {
             (viewer, Answer::StreamKey { wrapped_key })
         }
+        // With the events, ahead of frames, so the round trip isn't the
+        // video's queue.
+        Ok(DeviceMessage::Pong { viewer, nonce }) if nonce.len() <= MAX_PING_NONCE_LEN => {
+            (viewer, Answer::Pong { nonce })
+        }
         Ok(DeviceMessage::Clipboard { viewer, sealed }) if sealed.len() <= MAX_SEALED_CLIPBOARD_LEN => {
             if !clipboard_budgets.entry(viewer).or_insert_with(Budget::clipboard).take() {
                 debug!(%machine_id, viewer, "relay: dropping clipboard text over the budget");
@@ -500,6 +505,7 @@ async fn handle_dashboard(
     let mut shell_budget = Budget::shell_bytes();
     let mut metrics_budget = Budget::metrics();
     let mut audio_budget = Budget::audio();
+    let mut ping_budget = Budget::ping();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -573,6 +579,12 @@ async fn handle_dashboard(
                     registry.audio_select(dashboard_id, &device_id, sealed);
                 }
             }
+            Ok(DashboardCommand::Ping { device_id, nonce }) => {
+                // Once a second while the stats are up.
+                if nonce.len() <= MAX_PING_NONCE_LEN && ping_budget.take() {
+                    registry.ping(dashboard_id, &device_id, nonce);
+                }
+            }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
                 warn!(%error, "dashboard: received invalid command (further ones are logged at debug)")
             }
@@ -616,6 +628,11 @@ impl Budget {
     /// minute, and each has the machine do work (a choice restarts capture).
     fn audio() -> Self {
         Self::new(1.0, 5.0)
+    }
+
+    /// Pings from one dashboard: the stats overlay sends one a second.
+    fn ping() -> Self {
+        Self::new(2.0, 5.0)
     }
 
     /// Bytes of sealed file messages from one dashboard: far more than a

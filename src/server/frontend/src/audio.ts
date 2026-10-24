@@ -113,6 +113,14 @@ export class AudioPlayer {
     return anchor.streamUs + into * 1_000_000;
   }
 
+  // Sound queued ahead of what's heard, in ms; null while none plays.
+  bufferedMs(): number | null {
+    if (this.backend === "mse") return this.mse?.bufferedMs() ?? null;
+    const context = this.context;
+    if (context === null || context.state !== "running" || this.nextTime <= context.currentTime) return null;
+    return (this.nextTime - context.currentTime) * 1000;
+  }
+
   // One packet, as it came off the stream.
   play(frame: ParsedVideoFrame): void {
     if (!this.supported) return;

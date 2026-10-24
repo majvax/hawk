@@ -18,7 +18,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::protocol::{
-    AUDIO_DEVICES_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, POWER_PROTOCOL, SignedView, is_audio, is_keyframe,
+    AUDIO_DEVICES_PROTOCOL, DashboardEvent, DeviceCommand, MachineView, PING_PROTOCOL, POWER_PROTOCOL, SignedView, is_audio,
+    is_keyframe,
 };
 
 pub type DashboardId = u64;
@@ -157,6 +158,7 @@ pub enum Answer {
     Reject { reason: String },
     StreamKey { wrapped_key: String },
     Clipboard { sealed: String },
+    Pong { nonce: String },
 }
 
 #[derive(Default)]
@@ -208,6 +210,7 @@ impl Inner {
             restarting: self.restarting.get(&row.public_id).is_some_and(|until| *until > auth::now()),
             power: row.role.can_control() && device.is_some_and(|device| device.protocol >= POWER_PROTOCOL),
             audio_devices: device.is_some_and(|device| device.protocol >= AUDIO_DEVICES_PROTOCOL),
+            ping: device.is_some_and(|device| device.protocol >= PING_PROTOCOL),
         }
     }
 
@@ -622,6 +625,7 @@ impl Registry {
             }
             Answer::StreamKey { wrapped_key } => DashboardEvent::StreamKey { device_id, wrapped_key },
             Answer::Clipboard { sealed } => DashboardEvent::Clipboard { device_id, sealed },
+            Answer::Pong { nonce } => DashboardEvent::Pong { device_id, nonce },
             Answer::Reject { reason } => {
                 inner.detach(viewer, machine_id);
                 DashboardEvent::ViewRejected { device_id, reason }
@@ -693,6 +697,21 @@ impl Registry {
             return false;
         }
         device.send(DeviceCommand::AudioDevices { viewer: dashboard_id, sealed });
+        true
+    }
+
+    /// Passes a ping on to the machine if this dashboard is watching it,
+    /// whatever its role, and the machine is new enough to answer it.
+    /// Returns whether it was passed on.
+    pub fn ping(&self, dashboard_id: DashboardId, machine_id: &str, nonce: String) -> bool {
+        let inner = self.lock();
+        let has_access =
+            inner.dashboards.get(&dashboard_id).is_some_and(|dashboard| dashboard.access.contains_key(machine_id));
+        let Some(device) = inner.devices.get(machine_id) else { return false };
+        if !has_access || !device.viewers.contains_key(&dashboard_id) || device.protocol < PING_PROTOCOL {
+            return false;
+        }
+        device.send(DeviceCommand::Ping { viewer: dashboard_id, nonce });
         true
     }
 
@@ -877,7 +896,7 @@ mod tests {
         let (handle, events_rx) = handle(user_id);
         let dashboard = registry.add_dashboard(handle, vec![row(role)]);
         let (outbound, mut device_rx) = mpsc::unbounded_channel();
-        registry.add_device(MACHINE, 1, DeviceInfo::default(), outbound);
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: PING_PROTOCOL }, outbound);
         assert!(registry.start_view(dashboard, MACHINE, join()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture { .. })));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
@@ -979,6 +998,61 @@ mod tests {
         let (registry, dashboard, mut device_rx, _events) = watching(Role::Control);
         assert!(registry.audio_select(dashboard, MACHINE, "sealed".to_owned()));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::AudioSelect { viewer, .. }) if viewer == dashboard));
+    }
+
+    /// Anyone watching may ping the machine, and only its own viewer hears
+    /// the pong.
+    #[test]
+    fn pings_need_an_open_view() {
+        let (registry, dashboard, mut device_rx, mut events) = watching(Role::View);
+        assert!(registry.ping(dashboard, MACHINE, "1".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::Ping { viewer, .. }) if viewer == dashboard));
+        while events.try_recv().is_ok() {}
+        registry.answer(MACHINE, dashboard, Answer::Pong { nonce: "1".to_owned() });
+        let event = events.try_recv().ok().and_then(|outbound| match outbound {
+            Outbound::Event(event) => Some(*event),
+            Outbound::Close => None,
+        });
+        assert!(matches!(event, Some(DashboardEvent::Pong { nonce, .. }) if nonce == "1"));
+        registry.stop_view(dashboard, MACHINE);
+        assert!(!registry.ping(dashboard, MACHINE, "2".to_owned()));
+    }
+
+    /// A dashboard that isn't watching the machine, or can't see it at
+    /// all, can't ping it, and a pong for it goes nowhere.
+    #[test]
+    fn pings_need_access_and_a_view() {
+        let (registry, watcher, mut device_rx, _events) = watching(Role::View);
+        // Can see the machine, but isn't watching it.
+        let (idle_handle, mut idle_events) = handle(3);
+        let idle = registry.add_dashboard(idle_handle, vec![row(Role::View)]);
+        assert!(!registry.ping(idle, MACHINE, "1".to_owned()));
+        // Can't see it at all.
+        let (stranger_handle, _stranger_events) = handle(4);
+        let stranger = registry.add_dashboard(stranger_handle, vec![]);
+        assert!(!registry.ping(stranger, MACHINE, "1".to_owned()));
+        // No such machine.
+        assert!(!registry.ping(watcher, "machine-2", "1".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+        // A pong addressed to a dashboard that isn't watching is dropped.
+        while idle_events.try_recv().is_ok() {}
+        registry.answer(MACHINE, idle, Answer::Pong { nonce: "1".to_owned() });
+        assert!(idle_events.try_recv().is_err());
+    }
+
+    /// A machine too old to answer a ping is never sent one, and says so.
+    #[test]
+    fn pings_follow_the_protocol() {
+        let registry = Registry::default();
+        let (handle, mut events) = handle(2);
+        let dashboard = registry.add_dashboard(handle, vec![row(Role::View)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: POWER_PROTOCOL }, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| !view.ping));
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.ping(dashboard, MACHINE, "1".to_owned()));
+        assert!(next(&mut device_rx).is_none());
     }
 
     /// Only machines new enough to list their devices offer the picker.

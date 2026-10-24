@@ -86,6 +86,13 @@ export class MseAudio {
     return anchor.streamUs + Math.min(time - anchor.mediaS, PACKET_S) * 1_000_000;
   }
 
+  // Sound buffered ahead of what plays now, in ms; null while nothing plays.
+  bufferedMs(): number | null {
+    const buffered = this.audio.buffered;
+    if (this.closed || this.audio.paused || buffered.length === 0) return null;
+    return Math.max(0, (buffered.end(buffered.length - 1) - this.audio.currentTime) * 1000);
+  }
+
   // Call from a click or a key, the only place browsers let sound start.
   unlock(): void {
     if (this.blockedNow || this.audio.paused) this.play();

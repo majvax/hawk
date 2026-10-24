@@ -20,6 +20,9 @@ pub const POWER_PROTOCOL: u32 = 3;
 /// viewer choose one.
 pub const AUDIO_DEVICES_PROTOCOL: u32 = 5;
 
+/// The first protocol whose machines answer a ping.
+pub const PING_PROTOCOL: u32 = 5;
+
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
 ///
@@ -116,6 +119,8 @@ pub enum DeviceMessage {
     /// The machine's output devices, sealed for one viewer: the answer to
     /// its asking for them, or to its choosing one.
     Audio { viewer: u64, sealed: String },
+    /// The echo of a viewer's ping, for its round trip.
+    Pong { viewer: u64, nonce: String },
     /// The machine is about to restart (or shut down): Windows has accepted
     /// it, and the connection drops shortly. Only ever about the machine
     /// itself, so nothing a viewer could be misled by.
@@ -180,6 +185,8 @@ pub enum DeviceCommand {
     /// A choice of output device, sealed by the viewer. Only passed on for
     /// control, elevated; the machine checks the role again.
     AudioSelect { viewer: u64, sealed: String },
+    /// A viewer's ping, for the machine to echo straight back as a pong.
+    Ping { viewer: u64, nonce: String },
     /// Every revocation the owner has signed for this machine.
     Revocations { revocations: Vec<SignedView> },
     /// The owner asks the machine to install the update it's holding now.
@@ -243,6 +250,8 @@ pub const MAX_SEALED_AUDIO_REQUEST_LEN: usize = (8 + 256 + 16_usize).div_ceil(3)
 /// The machine's device list: counter, op, header length, a JSON header
 /// of up to 64 KB, and the tag, in base64.
 pub const MAX_SEALED_AUDIO_LEN: usize = (8 + 3 + 65_535 + 16_usize).div_ceil(3) * 4;
+/// A ping's nonce, either way: a counter, in decimal.
+pub const MAX_PING_NONCE_LEN: usize = 32;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
 const MAX_ANSWER_LEN: usize = 2048;
 
@@ -304,6 +313,9 @@ pub enum DashboardCommand {
     /// A sealed choice of output device. Only passed on while viewing the
     /// machine with a control (or owner) role, elevated.
     AudioSelect { device_id: String, sealed: String },
+    /// Asks the machine to echo `nonce` back, to time the round trip. Not
+    /// sealed: it carries nothing. Only passed on while viewing the machine.
+    Ping { device_id: String, nonce: String },
     /// The owner asks the machine to install the update it's holding.
     InstallUpdate { device_id: String },
 }
@@ -362,6 +374,8 @@ pub struct MachineView {
     /// While online: the machine lists its output devices, and lets
     /// control choose one.
     pub audio_devices: bool,
+    /// While online: the machine answers pings.
+    pub ping: bool,
 }
 
 /// Messages pushed to connected dashboards.
@@ -410,6 +424,8 @@ pub enum DashboardEvent {
     Metrics { device_id: String, sealed: String },
     /// The machine's output devices, sealed for this viewer.
     Audio { device_id: String, sealed: String },
+    /// The machine's echo of this dashboard's ping.
+    Pong { device_id: String, nonce: String },
 }
 
 /// Binary video frame produced by hawk-service (BuildVideoFrame):
@@ -553,6 +569,19 @@ mod tests {
         assert!(matches!(message, DeviceMessage::Shell { viewer: 3, .. }));
         let largest = BASE64.encode(vec![0u8; 8 + 3 + 1024 + 16 * 1024 + 16]);
         assert!(largest.len() <= MAX_SEALED_SHELL_LEN);
+    }
+
+    #[test]
+    fn pings_round_trip() {
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"ping","deviceId":"m1","nonce":"7"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::Ping { .. }));
+        let json = serde_json::to_value(DeviceCommand::Ping { viewer: 3, nonce: "7".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"ping","viewer":3,"nonce":"7"}));
+        let message: DeviceMessage = serde_json::from_str(r#"{"type":"pong","viewer":3,"nonce":"7"}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::Pong { viewer: 3, .. }));
+        let json = serde_json::to_value(DashboardEvent::Pong { device_id: "m1".into(), nonce: "7".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"pong","deviceId":"m1","nonce":"7"}));
     }
 
     #[test]

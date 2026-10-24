@@ -36,6 +36,28 @@ control**, enter a code from your authenticator first (see
 If your connection drops, the dashboard reconnects on its own and the
 view picks up where it was.
 
+## Stream stats
+
+**Stats** above the screen lays the stream's numbers over the top-left
+corner of the picture, each over the last second:
+
+- **Video**: what the picture costs your connection.
+- **Frames/s**: frames that arrived, came out of the decoder, and were
+  shown. **Lost/s**: decoded but never shown (*dropped*), or thrown away
+  before decoding because they piled up (*skipped*); the picture then
+  waits for the next keyframe.
+- **Waiting**: frames still being decrypted, and inside the decoder.
+- **Decode**: how long the decoder takes per frame. On the fallback that
+  Firefox for Android uses, the browser doesn't say, so **Behind** shows
+  how far its playback runs behind what has arrived instead. Anything a
+  decoder can't measure shows as *N/A*.
+- **Round trip**: to the machine and back, through the relay. A machine
+  older than this dashboard can't answer, and shows *N/A*.
+- **Sound**: how much sound is queued ahead of what you hear.
+
+The overlay doesn't take clicks, so you can control the machine through
+it. It's remembered in this browser.
+
 ## Sound
 
 What the machine plays comes with the picture, from its default output

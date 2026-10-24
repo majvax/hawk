@@ -657,6 +657,9 @@ function Viewer({
     audioDevices,
     requestAudioDevices,
     selectAudioDevice,
+    statsShown,
+    setStatsShown,
+    setStatsVisible,
   } = dashboard;
   const requestStepUp = useStepUp();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -739,6 +742,12 @@ function Viewer({
     setDropNote(null);
     setClipMenu(false);
   }, [viewing?.id, canReadClipboard]);
+
+  // Pings for the round trip only go out while the overlay is on screen.
+  useEffect(() => {
+    setStatsVisible(onScreen && statsShown);
+    return () => setStatsVisible(false);
+  }, [onScreen, setStatsVisible, statsShown]);
 
   useEffect(() => {
     setPowerMenu(false);
@@ -1017,6 +1026,16 @@ function Viewer({
             </button>
           )}
           {onScreen && (
+            <button
+              type="button"
+              aria-pressed={statsShown}
+              title={statsShown ? "Hide the stream stats" : "Show the stream stats over the picture"}
+              onClick={() => setStatsShown(!statsShown)}
+            >
+              Stats
+            </button>
+          )}
+          {onScreen && (
             <button type="button" onClick={() => void toggleFullscreen()}>
               {fullscreen ? "Exit full screen" : "Full screen"}
             </button>
@@ -1142,6 +1161,7 @@ function Viewer({
             tabIndex={canControl ? 0 : -1}
             aria-label={onScreen ? `${name} screen` : undefined}
           />
+          {onScreen && statsShown && <StatsOverlay stats={stats} picture={picture} pings={viewing.ping === true} />}
           {signal}
         </div>
       </div>
@@ -1422,6 +1442,56 @@ function ShellTab({
         </div>
       )}
     </div>
+  );
+}
+
+const BACKEND_LABEL = { webcodecs: "WebCodecs", mse: "MSE (fallback)" } as const;
+
+// "N/A" for what this decoder can't measure.
+function orNa(value: number | null, format: (value: number) => string): string {
+  return value === null ? "N/A" : format(value);
+}
+
+// The stream's numbers over the picture, top left. It takes no clicks, so
+// input goes on to the screen under it.
+// `pings`: the machine answers pings; an older one has no round trip.
+function StatsOverlay({
+  stats,
+  picture,
+  pings,
+}: {
+  stats: Dashboard["stats"];
+  picture: Dashboard["picture"];
+  pings: boolean;
+}): JSX.Element {
+  const rows: [string, string][] =
+    stats === null
+      ? [["Stream", "…"]]
+      : [
+          ["Decoder", stats.backend === null ? "…" : BACKEND_LABEL[stats.backend]],
+          ["Picture", picture === null ? "…" : `${picture.width}×${picture.height}`],
+          ["Video", formatBitrate(stats.kbps)],
+          ["Frames/s", `${stats.received} in · ${orNa(stats.decoded, String)} decoded · ${stats.fps} shown`],
+          ["Lost/s", `${stats.dropped} dropped · ${stats.skipped} skipped`],
+          ["Waiting", `${stats.pending} decrypting · ${orNa(stats.queue, String)} in decoder`],
+          [
+            stats.backend === "mse" ? "Behind" : "Decode",
+            stats.backend === "mse"
+              ? orNa(stats.lagMs, (ms) => `${Math.round(ms)} ms`)
+              : orNa(stats.decodeMs, (ms) => `${ms.toFixed(1)} ms`),
+          ],
+          ["Round trip", !pings ? "N/A" : stats.rttMs === null ? "…" : `${Math.round(stats.rttMs)} ms`],
+          ["Sound", stats.audioMs === null ? "none playing" : `${stats.audioMs} ms buffered`],
+        ];
+  return (
+    <dl className="stats-overlay" aria-label="Stream stats">
+      {rows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 

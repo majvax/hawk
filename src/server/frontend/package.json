@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "bun test",
     "build": "tsc -p tsconfig.json && vite build",
     "build:app": "tsc -p tsconfig.json && vite build --mode app --outDir dist-app",
     "build:setup": "tsc -p tsconfig.json && vite build --config vite.setup.config.ts"

@@ -78,6 +78,8 @@ export interface Machine {
   // While online: the machine lists its output devices (and lets control
   // choose one).
   audioDevices?: boolean;
+  // While online: the machine answers pings (the stats' round trip).
+  ping?: boolean;
 }
 
 // What a viewer with control can ask the machine to do with itself.
@@ -118,7 +120,9 @@ export type DashboardEvent =
   // A metrics-channel message the machine sealed for this viewer (ViewSession.openMetrics).
   | { type: "metrics"; deviceId: string; sealed: string }
   // The machine's output devices, sealed for this viewer (ViewSession.openAudio).
-  | { type: "audio"; deviceId: string; sealed: string };
+  | { type: "audio"; deviceId: string; sealed: string }
+  // The machine's echo of a ping, for the round trip in the stream stats.
+  | { type: "pong"; deviceId: string; nonce: string };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -161,6 +165,9 @@ export type DashboardCommand =
   | { type: "audio_devices"; deviceId: string; sealed: string }
   // Chooses one (ViewSession.sealAudioSelect); control and owner, elevated.
   | { type: "audio_select"; deviceId: string; sealed: string }
+  // Asks the machine to echo `nonce` back (a pong); anyone watching. Not
+  // sealed: it carries nothing, and only times the round trip.
+  | { type: "ping"; deviceId: string; nonce: string }
   // Owner only: install the update the machine is holding. The machine
   // checks the release's signature itself.
   | { type: "install_update"; deviceId: string };
