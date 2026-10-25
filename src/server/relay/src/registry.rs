@@ -21,7 +21,7 @@ use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
 use crate::metrics::{self, METRICS};
 use crate::protocol::{
-    AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, IMAGE_CLIPBOARD_PROTOCOL, MachineView,
+    AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, END_PROCESS_PROTOCOL, IMAGE_CLIPBOARD_PROTOCOL, MachineView,
     PING_PROTOCOL, POWER_PROTOCOL, QUALITY_PROTOCOL, SAS_PROTOCOL, SignedView, TEXT_INPUT_PROTOCOL, is_audio, is_keyframe, timestamp_us,
 };
 use crate::quality::{Meter, Preset, RateController, TICK_US};
@@ -206,6 +206,7 @@ pub enum Answer {
     Clipboard { sealed: String },
     Pong { nonce: String },
     Sas { sealed: String },
+    EndProcess { sealed: String },
     ClipboardImageReply { sealed: String },
 }
 
@@ -265,6 +266,8 @@ impl Inner {
             quality: row.role.can_control() && device.is_some_and(|device| device.protocol >= QUALITY_PROTOCOL),
             sas: row.role.can_control() && device.is_some_and(|device| device.protocol >= SAS_PROTOCOL),
             text: row.role.can_control() && device.is_some_and(|device| device.protocol >= TEXT_INPUT_PROTOCOL),
+            end_process: row.role.can_end_processes()
+                && device.is_some_and(|device| device.protocol >= END_PROCESS_PROTOCOL),
         }
     }
 
@@ -874,6 +877,7 @@ impl Registry {
             Answer::Clipboard { sealed } => DashboardEvent::Clipboard { device_id, sealed },
             Answer::Pong { nonce } => DashboardEvent::Pong { device_id, nonce },
             Answer::Sas { sealed } => DashboardEvent::Sas { device_id, sealed },
+            Answer::EndProcess { sealed } => DashboardEvent::EndProcess { device_id, sealed },
             Answer::ClipboardImageReply { sealed } => DashboardEvent::ClipboardImageReply { device_id, sealed },
             Answer::Reject { reason } => {
                 let refused = inner
@@ -1049,6 +1053,18 @@ impl Registry {
         let new_enough = self.lock().devices.get(machine_id).is_some_and(|device| device.protocol >= SAS_PROTOCOL);
         let command = DeviceCommand::Sas { viewer: dashboard_id, sealed };
         new_enough && self.pass_on(dashboard_id, machine_id, Role::can_control, command, Some(Use::CtrlAltDel))
+    }
+
+    /// Passes a sealed process to end on to the machine if this dashboard's
+    /// role may end one (control, dev or the owner) and it's watching the
+    /// machine, elevated, as for power actions: a fresh second factor
+    /// first. The relay can't see which process; the machine checks the
+    /// role again and refuses those Windows or Hawk can't do without.
+    pub fn end_process(&self, dashboard_id: DashboardId, machine_id: &str, sealed: String) -> bool {
+        let new_enough =
+            self.lock().devices.get(machine_id).is_some_and(|device| device.protocol >= END_PROCESS_PROTOCOL);
+        let command = DeviceCommand::EndProcess { viewer: dashboard_id, sealed };
+        new_enough && self.pass_on(dashboard_id, machine_id, Role::can_end_processes, command, Some(Use::EndProcess))
     }
 
     /// Passes the owner's go-ahead for an update on. Anyone else is ignored.
@@ -1669,6 +1685,80 @@ mod tests {
         assert!(next(&mut device_rx).is_none());
         // Nor on a machine that isn't connected.
         assert!(!registry.sas(control, "another-machine", "sealed".to_owned()));
+    }
+
+    /// Ending a process takes control, dev or the owner, watching, elevated,
+    /// on a machine new enough to do it.
+    #[test]
+    fn end_process_needs_the_role_elevation_and_the_protocol() {
+        let registry = Registry::default();
+        let (mut owner, mut events) = handle(1);
+        owner.step_up = StepUp { mfa: true, at: None };
+        let dashboard = registry.add_dashboard(owner, vec![row(Role::Owner)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: END_PROCESS_PROTOCOL }, outbound);
+        assert!(last_view(&mut events).is_some_and(|view| view.end_process));
+        assert!(!registry.end_process(dashboard, MACHINE, "sealed".to_owned()), "not watching");
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.end_process(dashboard, MACHINE, "sealed".to_owned()), "not elevated");
+        assert!(next(&mut device_rx).is_none());
+        registry.note_step_up(1, auth::now());
+        registry.elevate(dashboard, MACHINE);
+        assert!(registry.end_process(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(matches!(next(&mut device_rx), Some(DeviceCommand::EndProcess { viewer, .. }) if viewer == dashboard));
+
+        // A machine one protocol older would ignore it: not offered, not sent.
+        let (registry, dashboard, mut device_rx, mut events) = watching_on(Role::Owner, END_PROCESS_PROTOCOL - 1);
+        assert!(last_view(&mut events).is_some_and(|view| !view.end_process));
+        assert!(!registry.end_process(dashboard, MACHINE, "sealed".to_owned()));
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// Control and dev may end processes as the owner may; a view share
+    /// never, nor anyone who stopped watching or whose step-up ran out.
+    #[test]
+    fn end_process_follows_the_role() {
+        for (role, allowed) in [(Role::Owner, true), (Role::Control, true), (Role::Dev, true), (Role::View, false)] {
+            let registry = Registry::default();
+            let (user, mut events) = handle(if role == Role::Owner { 1 } else { 2 });
+            let dashboard = registry.add_dashboard(user, vec![row(role)]);
+            let (outbound, mut device_rx) = mpsc::unbounded_channel();
+            registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: END_PROCESS_PROTOCOL }, outbound);
+            assert_eq!(last_view(&mut events).map(|view| view.end_process), Some(allowed), "{role:?}");
+            assert!(registry.start_view(dashboard, MACHINE, join()));
+            while next(&mut device_rx).is_some() {}
+            assert_eq!(registry.end_process(dashboard, MACHINE, "sealed".to_owned()), allowed, "{role:?}");
+            assert_eq!(matches!(next(&mut device_rx), Some(DeviceCommand::EndProcess { .. })), allowed, "{role:?}");
+            registry.stop_view(dashboard, MACHINE);
+            while next(&mut device_rx).is_some() {}
+            assert!(!registry.end_process(dashboard, MACHINE, "sealed".to_owned()), "{role:?} after watching");
+        }
+
+        // A step-up older than the window doesn't elevate the view.
+        let registry = Registry::default();
+        let (mut control, _events) = handle(2);
+        control.step_up = StepUp { mfa: true, at: Some(auth::now() - STEP_UP_WINDOW - 1) };
+        let dashboard = registry.add_dashboard(control, vec![row(Role::Control)]);
+        let (outbound, mut device_rx) = mpsc::unbounded_channel();
+        registry.add_device(MACHINE, 1, DeviceInfo { version: None, protocol: END_PROCESS_PROTOCOL }, outbound);
+        assert!(registry.start_view(dashboard, MACHINE, join()));
+        registry.elevate(dashboard, MACHINE);
+        while next(&mut device_rx).is_some() {}
+        assert!(!registry.end_process(dashboard, MACHINE, "sealed".to_owned()), "stale step-up");
+        assert!(next(&mut device_rx).is_none());
+    }
+
+    /// The machine's answer goes to the viewer that asked, and nobody else.
+    #[test]
+    fn end_process_answers_reach_only_the_viewer() {
+        let (registry, dashboard, _device_rx, mut events) = watching(Role::Control);
+        while events.try_recv().is_ok() {}
+        registry.answer(MACHINE, dashboard, Answer::EndProcess { sealed: "ended".to_owned() });
+        let Ok(Outbound::Event(event)) = events.try_recv() else { panic!("no answer") };
+        assert!(matches!(*event, DashboardEvent::EndProcess { ref sealed, .. } if sealed == "ended"));
+        registry.answer(MACHINE, dashboard + 1, Answer::EndProcess { sealed: "stray".to_owned() });
+        assert!(events.try_recv().is_err());
     }
 
     /// Anyone watching may see the output devices; only control may choose.

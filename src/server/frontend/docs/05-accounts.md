@@ -150,8 +150,8 @@ code), password and two-factor changes (which kind of factor), invites, accounts
 machines enrolled, renamed and removed, shares granted and revoked; each
 view's start, end and length, when it took control, and the first time it
 used a shell, files or pasted a picture, with how much shell and file
-traffic went each way; power actions, Ctrl+Alt+Del, config changes and
-update installs. Not what any of it carried: the relay can't read it.
+traffic went each way; power actions, Ctrl+Alt+Del, processes ended
+(not which: that's encrypted), config changes and update installs. Not what any of it carried: the relay can't read it.
 Never a password, a code or a key.
 
 Events are kept 90 days unless the relay's operator sets otherwise. The

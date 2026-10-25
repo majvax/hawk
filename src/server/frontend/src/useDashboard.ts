@@ -4,6 +4,7 @@ import { getSession } from "./api.js";
 import { IN_APP } from "./desktop.js";
 import { socketProtocols, socketUrl } from "./relay.js";
 import {
+  type EndProcessAnswer,
   type EnrollmentCheck,
   FRAME_AUDIO_FLAG,
   type MachineTrust,
@@ -23,6 +24,7 @@ import { type OutputSink, type ShellInfo, ShellManager, type ShellSender } from 
 import { type ConfigState, type SettingValue, parseConfig } from "./machineConfig.js";
 import { ClipboardImageManager, type ImageSender, type PasteResult } from "./clipboardImages.js";
 import { EMPTY_METRICS, MetricsManager, type MetricsRange, type MetricsSender, type MetricsState } from "./metrics.js";
+import { SparkStore, sparkPoint } from "./sparkline.js";
 import type { Identity } from "./keys.js";
 import { MseDecoder, mseSupported } from "./mseDecoder.js";
 import { AudioPlayer, type SoundState, soundSupported } from "./audio.js";
@@ -239,6 +241,10 @@ export interface Dashboard {
   // The open view's machine analytics, when this viewer may read them.
   metrics: MetricsState;
   metricsActions: MetricsActions;
+  // The last few minutes of every machine watched with analytics since the
+  // page opened, for the sparklines. Filled as samples arrive; read it
+  // while rendering (it changes in place, as `metrics` does).
+  sparks: SparkStore;
   // Owned machines whose enrollment this browser checked: "mismatch" means
   // the key the machine answered with isn't bound to the code made here.
   enrollmentChecks: Record<string, EnrollmentCheck>;
@@ -311,6 +317,16 @@ export interface Dashboard {
   sasResult: SasResult | null;
   // Call once `sasResult` is shown, so it isn't shown again.
   clearSasResult: () => void;
+  // Ends a process on the machine being watched, named by its PID and when
+  // it started (the process list's `started`). The relay drops it unless
+  // this view's role may (control, dev or owner) and it's elevated, and the
+  // machine checks the role again and refuses the processes Windows and
+  // Hawk need; its answer lands in `endProcessResult`. False when there's
+  // no secured view to send it to.
+  endProcess: (target: { pid: number; started: number }) => boolean;
+  endProcessResult: EndProcessResult | null;
+  // Call once `endProcessResult` is shown, so it isn't shown again.
+  clearEndProcessResult: () => void;
   // Prefer sync over latency: the picture waits for the sound (soundMode.ts).
   sync: boolean;
   setSync: (sync: boolean) => void;
@@ -330,6 +346,9 @@ export interface SasResult {
   sent: boolean;
   error: string;
 }
+
+// The machine's answer to a process to end, numbered likewise.
+export type EndProcessResult = { id: number } & EndProcessAnswer;
 
 export interface AudioDevice {
   id: string;
@@ -417,9 +436,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const fileManagerRef = useRef<FileManager | null>(null);
   // File messages are opened one at a time, in the order they arrived.
   const fileChainRef = useRef<Promise<void>>(Promise.resolve());
-  // Clipboard text and Ctrl+Alt+Del answers share the reply key's counter,
-  // so they're opened one at a time, in the order they arrived: otherwise a
-  // slow earlier one could be dropped as already seen.
+  // Clipboard text, Ctrl+Alt+Del and end-process answers share the reply
+  // key's counter, so they're opened one at a time, in the order they
+  // arrived: otherwise a slow earlier one could be dropped as already seen.
   const replyChainRef = useRef<Promise<void>>(Promise.resolve());
   // Clipboard pictures, on a channel of their own (clipboardImages.ts).
   const imageChainRef = useRef<Promise<void>>(Promise.resolve());
@@ -450,6 +469,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   const [streamQuality, setStreamQuality] = useState<StreamQuality | null>(null);
   const [sasResult, setSasResult] = useState<SasResult | null>(null);
   const sasIdRef = useRef(0);
+  const [endProcessResult, setEndProcessResult] = useState<EndProcessResult | null>(null);
+  const endProcessIdRef = useRef(0);
+  const sparks = useRef(new SparkStore()).current;
   const configChainRef = useRef<Promise<void>>(Promise.resolve());
   const [config, setConfig] = useState<ConfigState | null>(null);
   const configRef = useRef<ConfigState | null>(null);
@@ -874,14 +896,18 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
       shellsEnabledRef.current = false;
       publishShells();
       metricsManagerRef.current?.close();
-      metricsManagerRef.current = deviceId === null ? null : new MetricsManager(setMetrics);
+      metricsManagerRef.current =
+        deviceId === null
+          ? null
+          : new MetricsManager(setMetrics, (sample) => sparks.push(deviceId, sparkPoint(sample), Date.now()));
       setMetrics(EMPTY_METRICS);
       setAudioDevices(null);
       setStreamQuality(null);
       setSasResult(null);
+      setEndProcessResult(null);
       setConfig(null);
     },
-    [publishFiles, publishShells],
+    [publishFiles, publishShells, sparks],
   );
 
   // The same for the shell channel.
@@ -1178,6 +1204,19 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
               setSasResult({ id: sasIdRef.current, ...opened });
             })
             .catch((error: unknown) => console.error("Ctrl+Alt+Del answer:", error));
+          break;
+        }
+        case "end_process": {
+          const session = sessionRef.current;
+          if (viewing !== payload.deviceId || session === null) break;
+          replyChainRef.current = replyChainRef.current
+            .then(() => session.openEndProcess(payload.sealed))
+            .then((opened) => {
+              if (opened === null || sessionRef.current !== session) return;
+              endProcessIdRef.current += 1;
+              setEndProcessResult({ id: endProcessIdRef.current, ...opened });
+            })
+            .catch((error: unknown) => console.error("end process answer:", error));
           break;
         }
         case "pong":
@@ -1571,7 +1610,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
   // chain: it's numbered from the same counter.
   const sendSealed = useCallback(
     (
-      type: "audio_devices" | "audio_select" | "config_get" | "config_set" | "quality" | "sas",
+      type: "audio_devices" | "audio_select" | "config_get" | "config_set" | "quality" | "sas" | "end_process",
       seal: (session: ViewSession) => Promise<string> | null,
     ): boolean => {
       const deviceId = streamingRef.current;
@@ -1619,6 +1658,15 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     return sendSealed("sas", (session) => session.sealSas());
   }, [sendSealed]);
   const clearSasResult = useCallback((): void => setSasResult(null), []);
+  const endProcess = useCallback(
+    (target: { pid: number; started: number }): boolean => {
+      const role = sessionRef.current?.role;
+      if (role === undefined || role === "view") return false;
+      return sendSealed("end_process", (session) => session.sealEndProcess(target));
+    },
+    [sendSealed],
+  );
+  const clearEndProcessResult = useCallback((): void => setEndProcessResult(null), []);
   const saveConfig = useCallback(
     (changes: Record<string, SettingValue>): boolean => {
       const version = configRef.current?.version;
@@ -1645,6 +1693,7 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     shellActions,
     metrics,
     metricsActions,
+    sparks,
     enrollmentChecks,
     elevated,
     elevate,
@@ -1670,6 +1719,9 @@ export function useDashboard(identity: Identity, onSessionEnded: () => void): Da
     sendSas,
     sasResult,
     clearSasResult,
+    endProcess,
+    endProcessResult,
+    clearEndProcessResult,
     sync,
     setSync,
     statsShown,

@@ -1,9 +1,10 @@
 // The Analytics and Processes tabs: a machine's health, sampled by the
 // machine itself once a second and read over the end-to-end encrypted
-// metrics channel (see ../metrics.ts). Charts are plain SVG in the
-// dashboard's own palette, sized to their card.
+// metrics channel (see ../metrics.ts). Charts and sparklines are plain SVG
+// in the dashboard's own palette tokens, sized to their card.
 import {
   type CSSProperties,
+  type FormEvent,
   type JSX,
   type PointerEvent,
   type ReactNode,
@@ -24,8 +25,10 @@ import {
   formatDuration,
   formatRate,
 } from "../metrics.js";
-import { Metric, Segmented } from "../ui.js";
-import type { MetricsActions } from "../useDashboard.js";
+import { type SparkSeries, sparkLabel, sparkPath } from "../sparkline.js";
+import { Corners, Metric, Segmented } from "../ui.js";
+import type { EndProcessResult, MetricsActions } from "../useDashboard.js";
+import { ANSWER_TIMEOUT_MS } from "./ConfigPanel.js";
 
 // --- Series ---------------------------------------------------------------------------------
 
@@ -304,6 +307,67 @@ function TimeChart({
   );
 }
 
+// --- Sparklines -----------------------------------------------------------------------------
+
+const SPARK_WIDTH = 120;
+const SPARK_HEIGHT = 28;
+
+// The last few minutes as a line, newest at the right. Stretched to its
+// box; the stroke keeps its width. Its label says the current, lowest and
+// highest values, for whoever can't see it.
+export function Sparkline({
+  values,
+  label,
+  format,
+  floor,
+  ceiling,
+}: {
+  values: readonly number[];
+  label: string;
+  format: (value: number) => string;
+  floor?: number;
+  ceiling?: number;
+}): JSX.Element {
+  return (
+    <svg
+      className="sparkline"
+      viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`}
+      preserveAspectRatio="none"
+      role="img"
+      aria-label={sparkLabel(label, values, format)}
+    >
+      <path d={sparkPath(values, SPARK_WIDTH, SPARK_HEIGHT, { floor, ceiling })} vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+const celsius = (value: number): string => `${Math.round(value)} °C`;
+
+// One number and its sparkline, for the strip over the charts.
+function SparkTile({
+  label,
+  value,
+  values,
+  format,
+  floor,
+  ceiling,
+}: {
+  label: string;
+  value: string;
+  values: readonly number[];
+  format: (value: number) => string;
+  floor?: number;
+  ceiling?: number;
+}): JSX.Element {
+  return (
+    <div className="spark-tile">
+      <span className="label">{label}</span>
+      <span className="num">{value}</span>
+      <Sparkline values={values} label={label} format={format} floor={floor} ceiling={ceiling} />
+    </div>
+  );
+}
+
 // --- Cards ----------------------------------------------------------------------------------
 
 const ACCENT = "var(--accent)";
@@ -366,7 +430,16 @@ function CoreStrip({ cores }: { cores: number[] }): JSX.Element {
 
 // --- Analytics tab ---------------------------------------------------------------------------
 
-export function AnalyticsPanel({ metrics, actions }: { metrics: MetricsState; actions: MetricsActions }): JSX.Element {
+export function AnalyticsPanel({
+  metrics,
+  actions,
+  sparks,
+}: {
+  metrics: MetricsState;
+  actions: MetricsActions;
+  // This machine's last few minutes, kept across tabs and machines.
+  sparks: SparkSeries | null;
+}): JSX.Element {
   const [range, setRange] = useState<Range>("live");
   const { info, latest } = metrics;
 
@@ -408,6 +481,11 @@ export function AnalyticsPanel({ metrics, actions }: { metrics: MetricsState; ac
     <TimeChart t={shown.t} lines={lines} step={shown.step} span={span} end={end} max={max} format={format} />
   );
   const memoryFraction = latest.mem_total > 0 ? (latest.mem_used / latest.mem_total) * 100 : 0;
+  const recent = (key: keyof SparkSeries): number[] => sparks?.[key] ?? [];
+  const gpuTemps = latest.gpus.flatMap((gpu) => (typeof gpu.temp === "number" ? [gpu.temp] : []));
+  const hottestGpu = gpuTemps.length > 0 ? Math.max(...gpuTemps) : null;
+  const cpuTemp = typeof latest.cpu_temp === "number" ? latest.cpu_temp : null;
+  const hottest = Math.max(cpuTemp ?? Number.NEGATIVE_INFINITY, hottestGpu ?? Number.NEGATIVE_INFINITY);
 
   return (
     <div className="analytics">
@@ -421,6 +499,50 @@ export function AnalyticsPanel({ metrics, actions }: { metrics: MetricsState; ac
         <Segmented small label="Time range" options={ranges} value={range} onChange={setRange} />
       </div>
       {metrics.error !== null && <div className="empty">{metrics.error}</div>}
+
+      <div className="spark-strip" role="group" aria-label="The last few minutes">
+        <SparkTile label="CPU" value={percent(latest.cpu)} values={recent("cpu")} format={percent} floor={0} ceiling={100} />
+        <SparkTile
+          label="Memory"
+          value={percent(memoryFraction)}
+          values={recent("mem")}
+          format={percent}
+          floor={0}
+          ceiling={100}
+        />
+        {latest.gpus.length > 0 && (
+          <SparkTile
+            label="GPU"
+            value={percent(Math.max(...latest.gpus.map((gpu) => gpu.util)))}
+            values={recent("gpu")}
+            format={percent}
+            floor={0}
+            ceiling={100}
+          />
+        )}
+        <SparkTile label="Received" value={formatRate(latest.net_rx)} values={recent("rx")} format={formatRate} floor={0} />
+        <SparkTile label="Sent" value={formatRate(latest.net_tx)} values={recent("tx")} format={formatRate} floor={0} />
+        <SparkTile
+          label="Disk read"
+          value={formatRate(latest.disk_read)}
+          values={recent("read")}
+          format={formatRate}
+          floor={0}
+        />
+        <SparkTile
+          label="Disk write"
+          value={formatRate(latest.disk_write)}
+          values={recent("write")}
+          format={formatRate}
+          floor={0}
+        />
+        {cpuTemp !== null && (
+          <SparkTile label="CPU temperature" value={celsius(cpuTemp)} values={recent("cpuTemp")} format={celsius} />
+        )}
+        {hottestGpu !== null && (
+          <SparkTile label="GPU temperature" value={celsius(hottestGpu)} values={recent("gpuTemp")} format={celsius} />
+        )}
+      </div>
 
       <div className="analytics-grid">
         <Card
@@ -494,6 +616,42 @@ export function AnalyticsPanel({ metrics, actions }: { metrics: MetricsState; ac
             />
           ))}
         </Card>
+
+        <Card
+          title="Temperatures"
+          value={Number.isFinite(hottest) ? celsius(hottest) : "—"}
+          sub="The hottest sensor the machine reads"
+        >
+          <dl className="temps">
+            <div>
+              <dt>
+                CPU <span className="faint">ACPI thermal zone</span>
+              </dt>
+              <dd className="num">{cpuTemp === null ? <span className="faint">unavailable</span> : celsius(cpuTemp)}</dd>
+              {cpuTemp !== null && <Sparkline values={recent("cpuTemp")} label="CPU temperature" format={celsius} />}
+            </div>
+            {latest.gpus.map((gpu) => (
+              <div key={gpu.name}>
+                <dt className="truncate" title={gpu.name}>
+                  {gpu.name}
+                </dt>
+                <dd className="num">
+                  {typeof gpu.temp === "number" ? celsius(gpu.temp) : <span className="faint">unavailable</span>}
+                </dd>
+                {/* The sparkline follows the hottest GPU: with one, that's this. */}
+                {typeof gpu.temp === "number" && latest.gpus.length === 1 && (
+                  <Sparkline values={recent("gpuTemp")} label={`${gpu.name} temperature`} format={celsius} />
+                )}
+              </div>
+            ))}
+          </dl>
+          {cpuTemp === null && hottestGpu === null && (
+            <p className="faint temps-note">
+              This machine reports no temperatures: it has no ACPI thermal zone, its graphics driver doesn't give one,
+              or it's older than temperatures.
+            </p>
+          )}
+        </Card>
       </div>
     </div>
   );
@@ -514,15 +672,132 @@ const COLUMNS: [SortKey, string, string][] = [
 
 const REFRESH_PROCESSES_MS = 2_000;
 
-export function ProcessesPanel({ metrics, actions }: { metrics: MetricsState; actions: MetricsActions }): JSX.Element {
+// What the Processes tab needs to end a process; null where this viewer's
+// role or the machine can't.
+export interface ProcessEnding {
+  // The relay passes it on only once the session has stepped up.
+  elevated: boolean;
+  onStepUp: () => void;
+  // Sends it; false when there's no view to send it on.
+  onEnd: (row: ProcessRow) => boolean;
+  result: EndProcessResult | null;
+  clearResult: () => void;
+}
+
+// Asks before ending one, naming it: unsaved work in it is lost.
+function EndProcessDialog({
+  row,
+  onConfirm,
+  onClose,
+}: {
+  row: ProcessRow;
+  onConfirm: () => void;
+  onClose: () => void;
+}): JSX.Element {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    dialogRef.current?.showModal();
+  }, []);
+  const submit = (event: FormEvent): void => {
+    event.preventDefault();
+    onConfirm();
+  };
+  return (
+    <dialog
+      ref={dialogRef}
+      className="dialog"
+      aria-labelledby="end-process-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+    >
+      <form className="auth-panel" onSubmit={submit}>
+        <Corners />
+        <h1 id="end-process-title">End {row.name || "this process"}?</h1>
+        <p className="prose">
+          <span className="mono">{row.name || "—"}</span>, PID <span className="mono">{row.pid}</span>
+          {row.user !== "" && (
+            <>
+              , running as <span className="mono">{row.user}</span>
+            </>
+          )}
+          . It stops at once, as from Task Manager: anything unsaved in it is lost. The machine refuses the processes
+          Windows and Hawk can't run without.
+        </p>
+        <div className="form-row tight">
+          <button type="submit" className="btn btn-danger" autoFocus>
+            End process
+          </button>
+          <button type="button" className="btn btn-ghost" onClick={onClose}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+export function ProcessesPanel({
+  metrics,
+  actions,
+  ending = null,
+}: {
+  metrics: MetricsState;
+  actions: MetricsActions;
+  ending?: ProcessEnding | null;
+}): JSX.Element {
   const [sort, setSort] = useState<{ key: SortKey; descending: boolean }>({ key: "cpu", descending: true });
   const [filter, setFilter] = useState("");
+  // The process waiting for its confirmation, and the one waiting for the
+  // machine's answer (when it was sent).
+  const [confirming, setConfirming] = useState<ProcessRow | null>(null);
+  const [waiting, setWaiting] = useState(0);
+  const [note, setNote] = useState<string | null>(null);
 
   useEffect(() => {
     actions.processes();
     const timer = window.setInterval(() => actions.processes(), REFRESH_PROCESSES_MS);
     return () => window.clearInterval(timer);
   }, [actions]);
+
+  // The relay drops a request it won't pass on without a word, and a
+  // machine can go away before answering.
+  useEffect(() => {
+    if (waiting === 0) return;
+    const timer = window.setTimeout(() => {
+      setWaiting(0);
+      setNote("No answer from the machine.");
+    }, ANSWER_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [waiting]);
+
+  // The machine's answer: ended, or why not. The list is asked for again
+  // straight away, so an ended process goes from it.
+  const result = ending?.result ?? null;
+  const clearResult = ending?.clearResult;
+  useEffect(() => {
+    if (result === null) return;
+    const name = result.name || "The process";
+    setNote(
+      result.ended ? `Ended ${name} (PID ${result.pid}).` : `${name} (PID ${result.pid}) wasn't ended: ${result.error}.`,
+    );
+    setWaiting(0);
+    clearResult?.();
+    actions.processes();
+  }, [result, clearResult, actions]);
+
+  const endConfirmed = (): void => {
+    const row = confirming;
+    setConfirming(null);
+    if (row === null || ending === null) return;
+    if (!ending.onEnd(row)) {
+      setNote("Not connected to the machine.");
+      return;
+    }
+    setNote(`Ending ${row.name || `PID ${row.pid}`}…`);
+    setWaiting(Date.now());
+  };
 
   const rows = metrics.processes?.rows ?? null;
   const shown = useMemo(() => {
@@ -592,10 +867,30 @@ export function ProcessesPanel({ metrics, actions }: { metrics: MetricsState; ac
           {percent(totalCpu)} · {formatBytes(totalMemory)}
         </span>
       </div>
+      {ending !== null && !ending.elevated && (
+        <div className="empty tool-connect">
+          <span>Ending a process needs a fresh code from your authenticator.</span>
+          <button type="button" className="btn btn-sm btn-accent" onClick={ending.onStepUp}>
+            Confirm
+          </button>
+        </div>
+      )}
+      {note !== null && (
+        <div className="processes-note" role="status">
+          {note}
+        </div>
+      )}
       <div className="table-wrap">
         <table className="table processes-table">
           <thead>
-            <tr>{COLUMNS.map(([key, label, className]) => header(key, label, className))}</tr>
+            <tr>
+              {COLUMNS.map(([key, label, className]) => header(key, label, className))}
+              {ending !== null && (
+                <th className="actions">
+                  <span className="sr-only">Actions</span>
+                </th>
+              )}
+            </tr>
           </thead>
           <tbody>
             {shown.map((row) => (
@@ -623,11 +918,28 @@ export function ProcessesPanel({ metrics, actions }: { metrics: MetricsState; ac
                   </span>
                 </td>
                 <td className="num muted hide-narrow">{row.threads}</td>
+                {ending !== null && (
+                  <td className="actions">
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-danger"
+                      // PID 0 and 4 are Windows itself: the machine refuses them anyway.
+                      disabled={!ending.elevated || waiting !== 0 || row.pid === 0 || row.pid === 4}
+                      aria-label={`End ${row.name || "process"} (PID ${row.pid})`}
+                      onClick={() => setConfirming(row)}
+                    >
+                      End
+                    </button>
+                  </td>
+                )}
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+      {confirming !== null && (
+        <EndProcessDialog row={confirming} onConfirm={endConfirmed} onClose={() => setConfirming(null)} />
+      )}
     </div>
   );
 }

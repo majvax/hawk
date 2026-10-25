@@ -2687,6 +2687,217 @@ a.btn {
     no-repeat;
 }
 
+.processes-note {
+  color: var(--fg-2);
+  font-size: 12px;
+}
+
+/* --- Sparklines ---------------------------------------------------------- */
+
+/* The last few minutes at a glance: the accent over the surface it sits on,
+   both from the palette's tokens, so a line reads on whatever the theme
+   makes them. Stretched to its box; the stroke keeps its width. */
+.sparkline {
+  display: block;
+  width: 100%;
+  height: 28px;
+  overflow: visible;
+}
+
+.sparkline path {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* Tiles share hairlines: the gaps show the line colour behind them. */
+.spark-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 150px), 1fr));
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+}
+
+.spark-tile {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+  padding: 8px 10px 6px;
+  background: var(--rail);
+}
+
+.spark-tile .label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spark-tile .sparkline {
+  grid-column: 1 / -1;
+}
+
+/* In the machine list: two small ones, CPU and memory. */
+.list-sparks {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.list-spark {
+  display: inline-grid;
+  grid-template-columns: auto 64px;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.list-spark .sparkline {
+  height: 16px;
+}
+
+.temps {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.temps > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+
+.temps dt {
+  min-width: 0;
+  color: var(--fg-2);
+}
+
+.temps dd {
+  margin: 0;
+  color: var(--fg);
+}
+
+.temps .sparkline {
+  grid-column: 1 / -1;
+}
+
+.temps-note {
+  margin: 0;
+  font-size: 12px;
+}
+
+/* --- Threshold alerts ---------------------------------------------------- */
+
+/* Above the status bar, bottom right; only the toasts take clicks. */
+.toasts {
+  position: fixed;
+  right: 16px;
+  bottom: calc(var(--status-h) + 16px);
+  z-index: 50;
+  display: grid;
+  gap: 8px;
+  width: min(360px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: stretch;
+  background: var(--raise);
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--tone);
+  pointer-events: auto;
+}
+
+.toast-body {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 0;
+  background: none;
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.toast-title {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.toast-close {
+  flex: none;
+  width: 28px;
+  border: 0;
+  background: none;
+  color: var(--fg-3);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.toast-close:hover {
+  color: var(--fg);
+}
+
+.alerts-panel {
+  width: min(480px, 100%);
+}
+
+.alert-rules {
+  display: grid;
+  gap: 10px;
+}
+
+.alert-rule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.alert-rule .check {
+  min-width: 190px;
+}
+
+.alert-number {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.alert-number .input {
+  width: 80px;
+}
+
+.alert-notify {
+  display: grid;
+  gap: 4px;
+}
+
+/* Read out, not shown. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 @media (max-width: 640px) {
   .hide-narrow {
     display: none;

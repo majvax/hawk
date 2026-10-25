@@ -27,7 +27,8 @@ use crate::error::ApiError;
 use crate::metrics::{METRICS, Peer};
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_IMAGE_LEN,
-    MAX_SEALED_CLIPBOARD_IMAGE_REPLY_LEN, MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
+    MAX_SEALED_CLIPBOARD_IMAGE_REPLY_LEN, MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_END_PROCESS_LEN,
+    MAX_SEALED_END_PROCESS_REPLY_LEN, MAX_SEALED_FILE_LEN,
     MAX_PING_NONCE_LEN, MAX_SEALED_AUDIO_LEN, MAX_SEALED_AUDIO_REQUEST_LEN, MAX_SEALED_CONFIG_LEN, MAX_SEALED_CONFIG_REQUEST_LEN, MAX_SEALED_INPUT_LEN, MAX_SEALED_METRICS_LEN, MAX_SEALED_POWER_LEN, MAX_SEALED_METRICS_REQUEST_LEN, MAX_SEALED_QUALITY_LEN, MAX_SEALED_SAS_LEN, MAX_SEALED_SAS_REPLY_LEN, MAX_SEALED_SHELL_LEN, PROTOCOL_VERSION, answer_fits, clipboard_access,
     machine_auth_message,
 };
@@ -410,6 +411,10 @@ fn route_device_answer(
         Ok(DeviceMessage::Sas { viewer, sealed }) if sealed.len() <= MAX_SEALED_SAS_REPLY_LEN => {
             (viewer, Answer::Sas { sealed })
         }
+        // One per process to end, which the relay passed on within its budget.
+        Ok(DeviceMessage::EndProcess { viewer, sealed }) if sealed.len() <= MAX_SEALED_END_PROCESS_REPLY_LEN => {
+            (viewer, Answer::EndProcess { sealed })
+        }
         Ok(DeviceMessage::Clipboard { viewer, sealed }) if sealed.len() <= MAX_SEALED_CLIPBOARD_LEN => {
             if !clipboard_budgets.entry(viewer).or_insert_with(Budget::clipboard).take() {
                 debug!(%machine_id, viewer, "relay: dropping clipboard text over the budget");
@@ -589,6 +594,7 @@ async fn handle_dashboard(
     let mut ping_budget = Budget::ping();
     let mut quality_budget = Budget::quality();
     let mut sas_budget = Budget::sas();
+    let mut end_process_budget = Budget::end_process();
     // A dashboard can send invalid commands as fast as it moves a mouse, so
     // only the first one per connection is worth a warning.
     let mut warned_invalid = false;
@@ -707,6 +713,12 @@ async fn handle_dashboard(
                     registry.sas(dashboard_id, &device_id, sealed);
                 }
             }
+            Ok(DashboardCommand::EndProcess { device_id, sealed }) => {
+                // By hand, each one confirmed.
+                if sealed.len() <= MAX_SEALED_END_PROCESS_LEN && end_process_budget.take() {
+                    registry.end_process(dashboard_id, &device_id, sealed);
+                }
+            }
             Err(error) if !std::mem::replace(&mut warned_invalid, true) => {
                 warn!(%error, "dashboard: received invalid command (further ones are logged at debug)")
             }
@@ -781,6 +793,11 @@ impl Budget {
     /// Ctrl+Alt+Del from one dashboard, pressed by hand.
     fn sas() -> Self {
         Self::new(1.0, 3.0)
+    }
+
+    /// Processes to end from one dashboard, each confirmed by hand.
+    fn end_process() -> Self {
+        Self::new(1.0, 5.0)
     }
 
     /// Pings from one dashboard: the stats overlay sends one a second.
@@ -961,6 +978,16 @@ mod tests {
         // Idle for long: still no more than the burst.
         budget.refilled -= Duration::from_secs(60);
         assert!(budget.take() && budget.take() && budget.take());
+        assert!(!budget.take());
+    }
+
+    /// Ending processes: five at once, then one a second.
+    #[test]
+    fn end_process_budget_allows_a_burst_of_five_then_one_a_second() {
+        let mut budget = Budget::end_process();
+        assert_eq!((0..100).take_while(|_| budget.take()).count(), 5);
+        budget.refilled -= Duration::from_millis(1100);
+        assert!(budget.take());
         assert!(!budget.take());
     }
 }

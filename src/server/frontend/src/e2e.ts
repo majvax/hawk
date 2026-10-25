@@ -250,10 +250,25 @@ const SAS_AAD = utf8("hawk-sas-v1");
 // src/service/e2e.cpp.
 const SAS_SENT = 1;
 const SAS_FAILED = 2;
+// A process to end, and the machine's answer to it on the reply key.
+const END_PROCESS_AAD = utf8("hawk-end-process-v1");
+// The first byte of that answer; must match kEndProcessEnded and
+// kEndProcessFailed in src/service/e2e.cpp.
+const END_PROCESS_ENDED = 1;
+const END_PROCESS_FAILED = 2;
 const CONFIG_AAD = utf8("hawk-config-v1");
 // The byte a sealed power request carries; must match PowerAction in
 // src/service/power.hpp.
 const POWER_ACTIONS: Record<PowerAction, number> = { lock: 1, sign_out: 2, restart: 3, shut_down: 4 };
+
+// The machine's answer to a process to end.
+export interface EndProcessAnswer {
+  ended: boolean;
+  pid: number;
+  started: number;
+  name: string; // its image name, when the machine could read it
+  error: string; // why not, when it wasn't ended
+}
 
 // One file- or shell-channel message from the machine, opened.
 export interface ChannelMessage {
@@ -557,6 +572,43 @@ export class ViewSession {
       if (op !== SAS_SENT && op !== SAS_FAILED) return null;
       this.replyCounter = counter;
       return { sent: op === SAS_SENT, error: new TextDecoder().decode(plain.slice(1)) };
+    } catch {
+      return null;
+    }
+  }
+
+  // Ends a process: its PID and when it started (unix milliseconds, as the
+  // process list gives it), so the machine never ends a newer process that
+  // was given the same PID.
+  sealEndProcess(target: { pid: number; started: number }): Promise<string> | null {
+    return this.sealRequest(utf8(JSON.stringify({ pid: target.pid, started: target.started })), END_PROCESS_AAD);
+  }
+
+  // The machine's answer to it: ended, or why not, and which process. On
+  // the reply key, so numbered with clipboard text and Ctrl+Alt+Del. null
+  // for anything that doesn't open, or that was seen before.
+  async openEndProcess(sealed: string): Promise<EndProcessAnswer | null> {
+    const key = this.replyKey;
+    if (key === null) return null;
+    try {
+      const bytes = fromBase64(sealed);
+      if (bytes.length < 8 + 16) return null;
+      const counter = new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(0);
+      if (counter <= this.replyCounter) return null;
+      const iv = concat(bytes.slice(0, 8), new Uint8Array(4));
+      const plain = await aesDecrypt(key, iv, bytes.slice(8), END_PROCESS_AAD);
+      if (counter <= this.replyCounter) return null; // another one got there first
+      const op = plain[0];
+      if (op !== END_PROCESS_ENDED && op !== END_PROCESS_FAILED) return null;
+      const body = JSON.parse(new TextDecoder().decode(plain.slice(1))) as Record<string, unknown>;
+      this.replyCounter = counter;
+      return {
+        ended: op === END_PROCESS_ENDED,
+        pid: typeof body.pid === "number" ? body.pid : 0,
+        started: typeof body.started === "number" ? body.started : 0,
+        name: typeof body.name === "string" ? body.name : "",
+        error: typeof body.error === "string" ? body.error : "",
+      };
     } catch {
       return null;
     }

@@ -12,7 +12,7 @@ use crate::quality::Preset;
 /// Bumped when a message changes in a way an older dashboard or machine
 /// can't follow. Must match `PROTOCOL_VERSION` in `frontend/src/protocol.ts`
 /// and `kProtocolVersion` in `src/service/main.cpp`.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The first protocol whose machines take power actions.
 pub const POWER_PROTOCOL: u32 = 3;
@@ -42,6 +42,11 @@ pub const IMAGE_CLIPBOARD_PROTOCOL: u32 = 9;
 /// The first protocol whose machines type text as characters, whatever
 /// their keyboard layout (a `text` input event, sealed like the rest).
 pub const TEXT_INPUT_PROTOCOL: u32 = 10;
+
+/// The first protocol whose machines end a process for a viewer, named by
+/// its PID and when it started. (Their samples also carry temperatures,
+/// sealed like the rest, which an older dashboard ignores.)
+pub const END_PROCESS_PROTOCOL: u32 = 11;
 
 /// Text messages a device sends. A connection opens with a hello, the relay
 /// answers with a challenge, and the device signs it with its machine key:
@@ -165,6 +170,9 @@ pub enum DeviceMessage {
     /// Whether Ctrl+Alt+Del was pressed, and why not, sealed for the viewer
     /// that asked.
     Sas { viewer: u64, sealed: String },
+    /// Whether a process was ended, and why not, sealed for the viewer that
+    /// asked.
+    EndProcess { viewer: u64, sealed: String },
     /// The machine is about to restart (or shut down): Windows has accepted
     /// it, and the connection drops shortly. Only ever about the machine
     /// itself, so nothing a viewer could be misled by.
@@ -250,6 +258,10 @@ pub enum DeviceCommand {
     /// Ctrl+Alt+Del, sealed by the viewer. Passed on for control, elevated,
     /// as input is (it's a key press); the machine checks the role again.
     Sas { viewer: u64, sealed: String },
+    /// A process to end, sealed by the viewer. Passed on for control, dev
+    /// and the owner, elevated; the machine checks the role again, and
+    /// refuses anything Windows or Hawk can't do without.
+    EndProcess { viewer: u64, sealed: String },
     /// Auto's new target, in bits per second, from the relay's controller
     /// (crate::quality). The machine ignores it on any other preset and
     /// keeps it within Auto's range: all a relay could do with it is make
@@ -340,6 +352,12 @@ pub const MAX_SEALED_SAS_LEN: usize = (8 + 16_usize).div_ceil(3) * 4;
 /// The machine's answer to it: counter, a status byte, a reason of up to
 /// 512 bytes, and the tag, in base64.
 pub const MAX_SEALED_SAS_REPLY_LEN: usize = (8 + 1 + 512 + 16_usize).div_ceil(3) * 4;
+/// A viewer's process to end: counter, a small JSON naming it (its PID and
+/// when it started, well under 128 bytes), and the tag, in base64.
+pub const MAX_SEALED_END_PROCESS_LEN: usize = (8 + 128 + 16_usize).div_ceil(3) * 4;
+/// The machine's answer to it: counter, a status byte, a JSON of up to
+/// 1 KB (the process, and why not), and the tag, in base64.
+pub const MAX_SEALED_END_PROCESS_REPLY_LEN: usize = (8 + 1 + 1024 + 16_usize).div_ceil(3) * 4;
 /// A ping's nonce, either way: a counter, in decimal.
 pub const MAX_PING_NONCE_LEN: usize = 32;
 /// What the machine sends a viewer: a signed accept and a wrapped key.
@@ -425,6 +443,9 @@ pub enum DashboardCommand {
     /// A sealed Ctrl+Alt+Del. Only passed on while viewing the machine with
     /// a control (or owner) role, elevated, like input.
     Sas { device_id: String, sealed: String },
+    /// A sealed process to end. Only passed on while viewing the machine
+    /// with a control, dev (or owner) role, elevated.
+    EndProcess { device_id: String, sealed: String },
     /// The owner asks the machine to install the update it's holding.
     InstallUpdate { device_id: String },
 }
@@ -497,6 +518,9 @@ pub struct MachineView {
     /// While online: the machine types text sent as characters, for this
     /// user's role (control or owner).
     pub text: bool,
+    /// While online: the machine ends a process for this user's role
+    /// (control, dev or owner).
+    pub end_process: bool,
 }
 
 /// Messages pushed to connected dashboards.
@@ -560,6 +584,8 @@ pub enum DashboardEvent {
     Quality { device_id: String, preset: Preset, bitrate: u32, fps: u32 },
     /// The machine's answer to this dashboard's Ctrl+Alt+Del, sealed for it.
     Sas { device_id: String, sealed: String },
+    /// The machine's answer to this dashboard's process to end, sealed for it.
+    EndProcess { device_id: String, sealed: String },
 }
 
 /// Binary video frame produced by hawk-service (BuildVideoFrame):
@@ -860,6 +886,27 @@ mod tests {
         assert_eq!(serde_json::to_value(event).unwrap(), serde_json::json!({"type":"sas","deviceId":"m1","sealed":"y"}));
         // The request is only a counter and a tag.
         assert_eq!(BASE64.encode([0u8; 8 + 16]).len(), MAX_SEALED_SAS_LEN);
+    }
+
+    #[test]
+    fn end_process_round_trips() {
+        let command: DashboardCommand =
+            serde_json::from_str(r#"{"type":"end_process","deviceId":"m1","sealed":"AAAA"}"#).unwrap();
+        assert!(matches!(command, DashboardCommand::EndProcess { .. }));
+        let json = serde_json::to_value(DeviceCommand::EndProcess { viewer: 7, sealed: "x".into() }).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"end_process","viewer":7,"sealed":"x"}));
+        let message: DeviceMessage =
+            serde_json::from_str(r#"{"type":"end_process","viewer":3,"sealed":"y"}"#).unwrap();
+        assert!(matches!(message, DeviceMessage::EndProcess { viewer: 3, .. }));
+        let event = DashboardEvent::EndProcess { device_id: "m1".into(), sealed: "y".into() };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({"type":"end_process","deviceId":"m1","sealed":"y"})
+        );
+        // The longest request the dashboard seals fits: the largest PID and
+        // a start time in milliseconds.
+        let largest = r#"{"pid":4294967295,"started":-9223372036854775808}"#;
+        assert!(BASE64.encode(vec![0u8; 8 + largest.len() + 16]).len() <= MAX_SEALED_END_PROCESS_LEN);
     }
 
     #[test]

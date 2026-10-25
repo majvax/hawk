@@ -5,6 +5,7 @@
 #include "crypto.hpp"
 #include "machine_key.hpp"
 #include "power.hpp"
+#include "process_control.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -60,6 +61,14 @@ struct ClipboardRequest {
     enum class Op : std::uint8_t { set, get };
     Op          op = Op::get;
     std::string text;  // set: valid UTF-8, within the configured max_size
+};
+
+// A process a viewer asked to end, once ViewerHub checked that its role
+// allows it. `owner`: asked by the owner, who ends it as the service may;
+// anyone else ends what the signed-in user could (process_control.hpp).
+struct EndProcessRequest {
+    ProcessTarget target;
+    bool          owner = false;
 };
 
 // One message of the file or shell channel, either way, once opened: what
@@ -208,6 +217,14 @@ public:
     // Tells that viewer whether it was pressed: an empty `error` for yes,
     // otherwise why not. Sealed on its reply key.
     void send_sas_result(std::uint64_t viewer, std::string_view error);
+
+    // Opens a sealed process to end: returns it if it's genuine, new, names
+    // a process, and is from a viewer with control, dev or the owner's role.
+    [[nodiscard]] std::optional<EndProcessRequest> end_process(std::uint64_t viewer, std::string_view sealed);
+
+    // Tells that viewer whether it was ended, and why not. Sealed on its
+    // reply key.
+    void send_end_process_result(std::uint64_t viewer, const ProcessTarget& target, const EndProcessOutcome& outcome);
 
     // The clipboard rules from now on, after a change to the config.
     // Viewers already admitted were told the old ones, and are held to the

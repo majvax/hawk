@@ -62,6 +62,8 @@ constexpr std::string_view kConfigAad = "hawk-config-v1";
 constexpr std::string_view kQualityAad = "hawk-quality-v1";
 // Ctrl+Alt+Del, and the machine's answer to it on the reply key.
 constexpr std::string_view kSasAad = "hawk-sas-v1";
+// A process to end, and the machine's answer to it on the reply key.
+constexpr std::string_view kEndProcessAad = "hawk-end-process-v1";
 // A file- or shell-channel plaintext: op, header length (u16, big-endian),
 // the JSON header, then bytes.
 constexpr std::size_t kChannelPreamble = 3;
@@ -82,6 +84,17 @@ constexpr std::byte kSasFailed{2};
 // The longest reason sent with it; the relay drops a longer answer
 // (MAX_SEALED_SAS_REPLY_LEN).
 constexpr std::size_t kMaxSasError = 512;
+
+// The first byte of the answer to a process to end: ended, or not; a JSON
+// saying which, and why not, after it. Must match END_PROCESS_ENDED and
+// END_PROCESS_FAILED in frontend/src/e2e.ts.
+constexpr std::byte kEndProcessEnded{1};
+constexpr std::byte kEndProcessFailed{2};
+// The longest JSON sent with it; the relay drops a longer answer
+// (MAX_SEALED_END_PROCESS_REPLY_LEN). Name and reason are cut to fit.
+constexpr std::size_t kMaxEndProcessReply = 1024;
+constexpr std::size_t kMaxEndProcessName = 255;
+constexpr std::size_t kMaxEndProcessError = 512;
 
 // A single-view grant still admits its viewer this long after their
 // viewing ends, so a dashboard that dropped and reconnects isn't refused.
@@ -325,6 +338,20 @@ struct ChannelOutMessage {
     std::string   type;
     std::uint64_t viewer = 0;
     std::string   sealed;
+};
+
+// A viewer's process to end, once opened: which one.
+struct EndProcessBody {
+    std::uint32_t pid = 0;
+    std::int64_t  started = 0;  // unix milliseconds
+};
+
+// The machine's answer to it, after the status byte.
+struct EndProcessReply {
+    std::uint32_t pid = 0;
+    std::int64_t  started = 0;
+    std::string   name;
+    std::string   error;
 };
 
 }  // namespace
@@ -778,6 +805,13 @@ struct ViewerHub::Impl {
         return shell_enabled && !viewer.refused && (viewer.role == "owner" || viewer.role == "dev");
     }
 
+    // Ending a process: what control reaches through Task Manager, and dev
+    // through its shell, anyway; the owner too.
+    [[nodiscard]] static bool may_end_processes(const Viewer& viewer) {
+        return !viewer.refused &&
+               (viewer.role == "owner" || viewer.role == "control" || viewer.role == "dev");
+    }
+
     // Read-only, and only what the owner allowed: not part of any role.
     [[nodiscard]] bool may_use_metrics(const Viewer& viewer) const {
         return metrics_enabled && !viewer.refused && viewer.analytics;
@@ -862,8 +896,8 @@ struct ViewerHub::Impl {
     }
 
     // counter || AES-GCM(reply key, op || text), base64: for one viewer.
-    // Clipboard text and Ctrl+Alt+Del answers share the key and its counter,
-    // and are told apart by `aad`.
+    // Clipboard text, Ctrl+Alt+Del and end-process answers share the key and
+    // its counter, and are told apart by `aad`.
     [[nodiscard]] static std::string seal_reply(Viewer& viewer, std::string_view aad, std::byte op,
                                                 std::string_view text) {
         crypto::Bytes plain;
@@ -1704,6 +1738,52 @@ void ViewerHub::send_sas_result(std::uint64_t viewer, std::string_view error) {
     const auto sealed = Impl::seal_reply(found->second, kSasAad, error.empty() ? kSasSent : kSasFailed,
                                          utf8_prefix(error, kMaxSasError));
     impl.send(to_json(ChannelOutMessage{.type = "sas", .viewer = viewer, .sealed = sealed}));
+}
+
+std::optional<EndProcessRequest> ViewerHub::end_process(std::uint64_t viewer, std::string_view sealed) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || !Impl::may_end_processes(found->second)) {
+        spdlog::warn("processes: viewer {} asked to end a process, which its role doesn't allow; ignored", viewer);
+        return std::nullopt;
+    }
+    const auto plain = Impl::open_request(found->second, sealed, kEndProcessAad);
+    if (!plain.has_value()) {
+        return std::nullopt;
+    }
+    EndProcessBody body;
+    const std::string_view json(reinterpret_cast<const char*>(plain->data()), plain->size());
+    if (glz::read<glz::opts{.error_on_unknown_keys = false}>(body, json)) {
+        spdlog::warn("processes: viewer {} sent a malformed request to end a process; ignored", viewer);
+        return std::nullopt;
+    }
+    spdlog::info("processes: viewer {} ({}) asked to end PID {}", viewer, found->second.fingerprint, body.pid);
+    return EndProcessRequest{.target = {.pid = body.pid, .started = body.started},
+                             .owner = found->second.role == "owner"};
+}
+
+void ViewerHub::send_end_process_result(std::uint64_t viewer, const ProcessTarget& target,
+                                        const EndProcessOutcome& outcome) {
+    auto&                 impl = *impl_;
+    const std::lock_guard lock(impl.mutex);
+    const auto            found = impl.viewers.find(viewer);
+    if (found == impl.viewers.end() || found->second.refused) {
+        return;
+    }
+    EndProcessReply reply{.pid = target.pid,
+                          .started = target.started,
+                          .name = std::string(utf8_prefix(outcome.name, kMaxEndProcessName)),
+                          .error = std::string(utf8_prefix(outcome.error, kMaxEndProcessError))};
+    auto json = to_json(reply);
+    if (json.size() > kMaxEndProcessReply) {
+        // A name escaped past the room left: the dashboard knows it anyway.
+        reply.name.clear();
+        json = to_json(reply);
+    }
+    const auto sealed =
+        Impl::seal_reply(found->second, kEndProcessAad, outcome.ended ? kEndProcessEnded : kEndProcessFailed, json);
+    impl.send(to_json(ChannelOutMessage{.type = "end_process", .viewer = viewer, .sealed = sealed}));
 }
 
 void ViewerHub::set_clipboard(const ClipboardConfig& clipboard) {

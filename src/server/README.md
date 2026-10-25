@@ -473,8 +473,8 @@ changes, invites, accounts disabled, the MFA policy), machine events
 (enrolled, renamed, removed, shared, unshared) and view events (started
 when the machine accepts, ended with its length and sealed shell/file
 bytes each way, refused, elevated mid-view; the first shell, file and
-picture-paste use per view; every power action, Ctrl+Alt+Del, config
-change and update install). The relay can't see content, so there is one
+picture-paste use per view; every power action, Ctrl+Alt+Del, process
+ended (not which: it's sealed), config change and update install). The relay can't see content, so there is one
 row per view per channel rather than per shell or transfer; quality
 changes and plain input aren't recorded. No secret ever is: events are
 built from typed fields only.

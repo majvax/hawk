@@ -33,6 +33,9 @@ export interface GpuSample {
   dedicated_used: number;
   dedicated_total: number;
   shared_used: number;
+  // °C, from a machine that can read it; absent otherwise (and from one
+  // older than temperatures).
+  temp?: number;
 }
 
 export interface Sample {
@@ -52,6 +55,9 @@ export interface Sample {
   volumes: { name: string; label: string; total: number; free: number }[];
   uptime: number;
   processes: number;
+  // °C, the hottest ACPI thermal zone, where the machine has one; absent
+  // otherwise. Often the board's rather than the CPU package's.
+  cpu_temp?: number;
 }
 
 // Columns, one value per point; `t` in unix seconds.
@@ -113,7 +119,12 @@ export class MetricsManager {
   private subscribers = 0;
   private state: MetricsState = EMPTY_METRICS;
 
-  constructor(private readonly onChange: (state: MetricsState) => void) {}
+  // `onSample` hears every sample as it arrives, for the sparklines' and
+  // the alerts' own bookkeeping, which outlives this manager.
+  constructor(
+    private readonly onChange: (state: MetricsState) => void,
+    private readonly onSample: (sample: Sample) => void = () => {},
+  ) {}
 
   // A sender while the view is secured and allows analytics; null once it
   // isn't. A new sender re-subscribes whoever was watching.
@@ -163,6 +174,7 @@ export class MetricsManager {
         const live = [...this.state.live, sample];
         if (live.length > LIVE_SAMPLES) live.splice(0, live.length - LIVE_SAMPLES);
         this.update({ latest: sample, live });
+        this.onSample(sample);
         break;
       }
       case METRICS_OP.historyData: {

@@ -89,6 +89,9 @@ struct GpuSample {
     std::uint64_t dedicated_used = 0;
     std::uint64_t dedicated_total = 0;
     std::uint64_t shared_used = 0;
+    // °C, where the GPU reports it (GpuThermals); left out otherwise, which
+    // an older dashboard ignores either way.
+    std::optional<double> temp;
 };
 
 struct AdapterSample {
@@ -121,6 +124,9 @@ struct Sample {
     std::vector<VolumeSample>  volumes;
     std::uint64_t              uptime = 0;  // seconds
     std::uint32_t              processes = 0;
+    // °C, the hottest ACPI thermal zone (Counters::thermal_zone), where the
+    // machine has one; left out otherwise.
+    std::optional<double>      cpu_temp;
 };
 
 struct History {
@@ -291,6 +297,8 @@ struct Gpu {
     std::uint64_t luid = 0;
     std::string   name;
     std::uint64_t dedicated = 0;
+    std::uint32_t vendor = 0;  // PCI ids, to find it in NVML
+    std::uint32_t device = 0;
 };
 
 [[nodiscard]] std::uint64_t luid_value(LONG high, DWORD low) {
@@ -309,7 +317,9 @@ struct Gpu {
         if (SUCCEEDED(adapter->GetDesc1(&desc)) && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
             gpus.push_back(Gpu{.luid = luid_value(desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart),
                                .name = win::to_utf8(desc.Description),
-                               .dedicated = desc.DedicatedVideoMemory});
+                               .dedicated = desc.DedicatedVideoMemory,
+                               .vendor = desc.VendorId,
+                               .device = desc.DeviceId});
         }
         adapter.Reset();
     }
@@ -381,8 +391,14 @@ struct Gpu {
     return value.doubleValue;
 }
 
-// Disk throughput and the GPU counters, through PDH by their English
-// names, so a German or French Windows reads the same ones.
+// A reading worth showing, in °C: sensors that aren't there read 0 K, 0 or
+// something absurd rather than failing.
+[[nodiscard]] bool plausible_temperature(double celsius) {
+    return celsius > 1 && celsius < 150;
+}
+
+// Disk throughput, the GPU counters and the thermal zones, through PDH by
+// their English names, so a German or French Windows reads the same ones.
 class Counters {
 public:
     Counters() {
@@ -396,6 +412,9 @@ public:
         gpu_engine_ = add(L"\\GPU Engine(*)\\Utilization Percentage");
         gpu_dedicated_ = add(L"\\GPU Adapter Memory(*)\\Dedicated Usage");
         gpu_shared_ = add(L"\\GPU Adapter Memory(*)\\Shared Usage");
+        // Kelvin: tenths of one where Windows has the precise counter.
+        thermal_precise_ = add(L"\\Thermal Zone Information(*)\\High Precision Temperature");
+        thermal_ = add(L"\\Thermal Zone Information(*)\\Temperature");
         PdhCollectQueryData(query_);
     }
     ~Counters() {
@@ -443,6 +462,36 @@ public:
     [[nodiscard]] std::map<std::uint64_t, double> gpu_dedicated() const { return per_luid(gpu_dedicated_); }
     [[nodiscard]] std::map<std::uint64_t, double> gpu_shared() const { return per_luid(gpu_shared_); }
 
+    // The hottest ACPI thermal zone, in °C: what Windows reads for its own
+    // thermal policy, through PDH so it never waits on WMI. Often the
+    // board's or the chipset's rather than the CPU package's, sometimes a
+    // fixed number, and absent from many desktops: nullopt then. A fixed
+    // number is the common fake (290 K, 16.85 °C): readings under 20 °C are
+    // dropped, and so is a zone that hasn't moved at all in ten minutes.
+    [[nodiscard]] std::optional<double> thermal_zone() {
+        auto readings = counter_array(thermal_precise_);
+        for (auto& [name, value] : readings) {
+            value /= 10;
+        }
+        if (readings.empty()) {
+            readings = counter_array(thermal_);
+        }
+        const auto            now = std::chrono::steady_clock::now();
+        std::optional<double> hottest;
+        for (const auto& [name, kelvin] : readings) {
+            auto& zone = zones_[name];
+            if (zone.changed == std::chrono::steady_clock::time_point{} || kelvin != zone.kelvin) {
+                zone = Zone{.kelvin = kelvin, .changed = now};
+            }
+            const double celsius = kelvin - 273.15;
+            if (now - zone.changed >= kStuckZone || celsius < kColdestZone || !plausible_temperature(celsius)) {
+                continue;
+            }
+            hottest = std::max(hottest.value_or(celsius), celsius);
+        }
+        return hottest;
+    }
+
 private:
     [[nodiscard]] PDH_HCOUNTER add(const wchar_t* path) const {
         PDH_HCOUNTER counter = nullptr;
@@ -469,6 +518,285 @@ private:
     PDH_HCOUNTER gpu_engine_ = nullptr;
     PDH_HCOUNTER gpu_dedicated_ = nullptr;
     PDH_HCOUNTER gpu_shared_ = nullptr;
+    PDH_HCOUNTER thermal_precise_ = nullptr;
+    PDH_HCOUNTER thermal_ = nullptr;
+
+    // A thermal zone's last reading, and when it last moved.
+    struct Zone {
+        double                                kelvin = 0;
+        std::chrono::steady_clock::time_point changed{};
+    };
+    static constexpr std::chrono::minutes kStuckZone{10};
+    static constexpr double               kColdestZone = 20;
+    std::map<std::wstring, Zone>          zones_;
+};
+
+// The graphics kernel's thunks and the bits of their structures used here,
+// declared rather than taken from d3dkmthk.h, which MinGW's headers don't
+// all have the WDDM 2.4 parts of. Layouts as in the Windows SDK.
+namespace kmt {
+
+using Handle = UINT;
+
+struct OpenAdapterFromLuid {
+    LUID   luid;
+    Handle adapter;
+};
+
+struct CloseAdapter {
+    Handle adapter;
+};
+
+struct QueryAdapterInfo {
+    Handle adapter;
+    UINT   type;  // KMTQUERYADAPTERINFOTYPE
+    void*  data;
+    UINT   size;
+};
+
+// D3DKMT_ADAPTER_PERFDATA, what Task Manager's GPU temperature comes from.
+struct AdapterPerfData {
+    UINT32    physical_adapter_index;
+    ULONGLONG memory_frequency;
+    ULONGLONG max_memory_frequency;
+    ULONGLONG max_memory_frequency_oc;
+    ULONGLONG memory_bandwidth;
+    ULONGLONG pcie_bandwidth;
+    ULONG     fan_rpm;
+    ULONG     power;        // tenths of a percent
+    ULONG     temperature;  // tenths of a degree Celsius; 0 when unknown
+    UCHAR     power_state_override;
+};
+
+// KMTQAITYPE_ADAPTERPERFDATA, WDDM 2.4 (Windows 10 1803) and later.
+constexpr UINT kAdapterPerfData = 62;
+
+using OpenAdapterFromLuidFn = NTSTATUS(APIENTRY*)(OpenAdapterFromLuid*);
+using CloseAdapterFn = NTSTATUS(APIENTRY*)(const CloseAdapter*);
+using QueryAdapterInfoFn = NTSTATUS(APIENTRY*)(const QueryAdapterInfo*);
+
+}  // namespace kmt
+
+// NVML, the NVIDIA driver's management library, likewise declared here.
+namespace nvml {
+
+using Device = void*;
+
+struct PciInfo {
+    char         bus_id_legacy[16];
+    unsigned int domain;
+    unsigned int bus;
+    unsigned int device;
+    unsigned int pci_device_id;  // device id << 16 | vendor id
+    unsigned int pci_subsystem_id;
+    char         bus_id[32];
+};
+
+constexpr int kSuccess = 0;
+constexpr int kTemperatureGpu = 0;
+
+using InitFn = int(__cdecl*)();
+using ShutdownFn = int(__cdecl*)();
+using CountFn = int(__cdecl*)(unsigned int*);
+using HandleFn = int(__cdecl*)(unsigned int, Device*);
+using PciInfoFn = int(__cdecl*)(Device, PciInfo*);
+using TemperatureFn = int(__cdecl*)(Device, int, unsigned int*);
+
+}  // namespace nvml
+
+template <typename Function>
+[[nodiscard]] Function load(HMODULE module, const char* name) {
+    return module == nullptr ? nullptr : reinterpret_cast<Function>(reinterpret_cast<void*>(GetProcAddress(module, name)));
+}
+
+// GPU temperatures, as Task Manager reads them: each adapter's performance
+// data from the graphics kernel (WDDM 2.4 and later), whatever the vendor.
+// For an NVIDIA card that doesn't report one there, NVML from System32,
+// where the driver installs it. Both are loaded at run time and asked
+// nothing that waits; with neither, a GPU simply has no temperature.
+class GpuThermals {
+public:
+    explicit GpuThermals(const std::vector<Gpu>& gpus) : gpus_(gpus) {
+        for (const auto& gpu : gpus) {
+            luids_.insert(gpu.luid);
+        }
+        HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+        if (gdi == nullptr) {
+            gdi = LoadLibraryExW(L"gdi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        }
+        open_ = load<kmt::OpenAdapterFromLuidFn>(gdi, "D3DKMTOpenAdapterFromLuid");
+        close_ = load<kmt::CloseAdapterFn>(gdi, "D3DKMTCloseAdapter");
+        query_ = load<kmt::QueryAdapterInfoFn>(gdi, "D3DKMTQueryAdapterInfo");
+    }
+    ~GpuThermals() {
+        for (const auto& [luid, adapter] : adapters_) {
+            const kmt::CloseAdapter close{.adapter = adapter};
+            close_(&close);
+        }
+        if (nvml_shutdown_ != nullptr) {
+            nvml_shutdown_();
+        }
+    }
+    GpuThermals(const GpuThermals&) = delete;
+    GpuThermals& operator=(const GpuThermals&) = delete;
+    GpuThermals(GpuThermals&&) = delete;
+    GpuThermals& operator=(GpuThermals&&) = delete;
+
+    // °C by GPU luid, for those that report one.
+    [[nodiscard]] std::map<std::uint64_t, double> read() {
+        forget_on_change();
+        std::map<std::uint64_t, double> result;
+        bool                            missing_nvidia = false;
+        for (const auto& gpu : gpus_) {
+            if (const auto celsius = from_kernel(gpu.luid); celsius.has_value()) {
+                result[gpu.luid] = *celsius;
+            } else if (const auto device = nvml_devices_.find(gpu.luid); device != nvml_devices_.end()) {
+                if (const auto from_nvml = from_driver(device->second); from_nvml.has_value()) {
+                    result[gpu.luid] = *from_nvml;
+                }
+            } else {
+                missing_nvidia |= gpu.vendor == kNvidia;
+            }
+        }
+        // Only once, and only for a card the kernel had nothing for: NVML
+        // takes a moment to start.
+        if (missing_nvidia && !nvml_tried_) {
+            nvml_tried_ = true;
+            start_nvml();
+        }
+        return result;
+    }
+
+private:
+    static constexpr std::uint32_t kNvidia = 0x10DE;
+    // What a driver without KMTQAITYPE_ADAPTERPERFDATA answers.
+    static constexpr NTSTATUS kStatusNotImplemented = static_cast<NTSTATUS>(0xC0000002L);
+    static constexpr NTSTATUS kStatusInvalidParameter = static_cast<NTSTATUS>(0xC000000DL);
+    static constexpr NTSTATUS kStatusNotSupported = static_cast<NTSTATUS>(0xC00000BBL);
+    // Reads between looks at the adapter list, while some adapter is
+    // remembered as not supporting the query: about a minute.
+    static constexpr int kAdapterCheckEvery = 60;
+
+    // A new driver comes with new adapter LUIDs: then every adapter is
+    // asked again. Only looked for while there's something to forget.
+    void forget_on_change() {
+        if (unsupported_.empty() || ++reads_ < kAdapterCheckEvery) {
+            return;
+        }
+        reads_ = 0;
+        std::set<std::uint64_t> luids;
+        for (const auto& gpu : list_gpus()) {
+            luids.insert(gpu.luid);
+        }
+        if (luids == luids_) {
+            return;
+        }
+        unsupported_.clear();
+        for (const auto& [luid, adapter] : adapters_) {
+            const kmt::CloseAdapter close{.adapter = adapter};
+            close_(&close);
+        }
+        adapters_.clear();
+        luids_ = std::move(luids);
+    }
+
+    [[nodiscard]] std::optional<double> from_kernel(std::uint64_t luid) {
+        if (open_ == nullptr || close_ == nullptr || query_ == nullptr || unsupported_.contains(luid)) {
+            return std::nullopt;
+        }
+        auto adapter = adapters_.find(luid);
+        if (adapter == adapters_.end()) {
+            kmt::OpenAdapterFromLuid open{};
+            open.luid.LowPart = static_cast<DWORD>(luid & 0xFFFFFFFFU);
+            open.luid.HighPart = static_cast<LONG>(luid >> 32U);
+            if (open_(&open) < 0) {
+                return std::nullopt;
+            }
+            adapter = adapters_.emplace(luid, open.adapter).first;
+        }
+        kmt::AdapterPerfData   data{};
+        const kmt::QueryAdapterInfo info{
+            .adapter = adapter->second, .type = kmt::kAdapterPerfData, .data = &data, .size = sizeof(data)};
+        if (const NTSTATUS status = query_(&info); status < 0) {
+            const kmt::CloseAdapter close{.adapter = adapter->second};
+            close_(&close);
+            adapters_.erase(adapter);
+            // A driver without the query says so every time: not asked
+            // again until the adapters change. Anything else (gone in a
+            // driver update or a reset) is opened again next time.
+            if (status == kStatusNotSupported || status == kStatusNotImplemented || status == kStatusInvalidParameter) {
+                unsupported_.insert(luid);
+            }
+            return std::nullopt;
+        }
+        const double celsius = data.temperature / 10.0;
+        return plausible_temperature(celsius) ? std::optional(celsius) : std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<double> from_driver(nvml::Device device) const {
+        unsigned int celsius = 0;
+        if (nvml_temperature_ == nullptr ||
+            nvml_temperature_(device, nvml::kTemperatureGpu, &celsius) != nvml::kSuccess ||
+            !plausible_temperature(celsius)) {
+            return std::nullopt;
+        }
+        return static_cast<double>(celsius);
+    }
+
+    // Loads NVML from System32 only (never from a folder someone else could
+    // write to: this runs as SYSTEM), and pairs its devices with the DXGI
+    // adapters by PCI ids, when that's unambiguous.
+    void start_nvml() {
+        const HMODULE module = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const auto    init = load<nvml::InitFn>(module, "nvmlInit_v2");
+        const auto    count = load<nvml::CountFn>(module, "nvmlDeviceGetCount_v2");
+        const auto    handle = load<nvml::HandleFn>(module, "nvmlDeviceGetHandleByIndex_v2");
+        const auto    pci = load<nvml::PciInfoFn>(module, "nvmlDeviceGetPciInfo_v3");
+        const auto    shutdown = load<nvml::ShutdownFn>(module, "nvmlShutdown");
+        nvml_temperature_ = load<nvml::TemperatureFn>(module, "nvmlDeviceGetTemperature");
+        if (init == nullptr || count == nullptr || handle == nullptr || pci == nullptr || shutdown == nullptr ||
+            nvml_temperature_ == nullptr || init() != nvml::kSuccess) {
+            spdlog::info("metrics: no GPU temperature from NVML either");
+            nvml_temperature_ = nullptr;
+            return;
+        }
+        nvml_shutdown_ = shutdown;
+        unsigned int devices = 0;
+        if (count(&devices) != nvml::kSuccess) {
+            return;
+        }
+        std::map<std::uint32_t, std::vector<nvml::Device>> by_id;
+        for (unsigned int i = 0; i < devices; ++i) {
+            nvml::Device  device = nullptr;
+            nvml::PciInfo info{};
+            if (handle(i, &device) == nvml::kSuccess && pci(device, &info) == nvml::kSuccess) {
+                by_id[info.pci_device_id].push_back(device);
+            }
+        }
+        for (const auto& gpu : gpus_) {
+            const auto id = (gpu.device << 16U) | gpu.vendor;
+            const auto same = std::ranges::count_if(gpus_, [&](const Gpu& other) {
+                return ((other.device << 16U) | other.vendor) == id;
+            });
+            if (const auto found = by_id.find(id); found != by_id.end() && found->second.size() == 1 && same == 1) {
+                nvml_devices_[gpu.luid] = found->second.front();
+            }
+        }
+        spdlog::info("metrics: GPU temperature from NVML for {} GPU(s)", nvml_devices_.size());
+    }
+
+    std::vector<Gpu>                        gpus_;
+    kmt::OpenAdapterFromLuidFn              open_ = nullptr;
+    kmt::CloseAdapterFn                     close_ = nullptr;
+    kmt::QueryAdapterInfoFn                 query_ = nullptr;
+    std::map<std::uint64_t, kmt::Handle>    adapters_;
+    std::set<std::uint64_t>                 unsupported_;  // luids whose driver lacks the query
+    std::set<std::uint64_t>                 luids_;        // the adapter list last looked at
+    int                                     reads_ = 0;
+    bool                                    nvml_tried_ = false;
+    nvml::ShutdownFn                        nvml_shutdown_ = nullptr;
+    nvml::TemperatureFn                     nvml_temperature_ = nullptr;
+    std::map<std::uint64_t, nvml::Device>   nvml_devices_;
 };
 
 // Each fixed volume's space. Asked every few seconds, not every second:
@@ -728,7 +1056,8 @@ struct MetricsRecorder::Impl {
     // --- sampling ---
 
     void run(const std::stop_token& stop) {
-        Counters counters;
+        Counters    counters;
+        GpuThermals thermals(gpus);
         std::mutex                  sleep_mutex;
         std::condition_variable_any wake;
         auto next = std::chrono::steady_clock::now();
@@ -736,7 +1065,7 @@ struct MetricsRecorder::Impl {
         bool primed = false;
         while (!stop.stop_requested()) {
             counters.collect();
-            auto sample = take(counters);
+            auto sample = take(counters, thermals);
             if (primed) {
                 record(std::move(sample));
             }
@@ -751,7 +1080,7 @@ struct MetricsRecorder::Impl {
         }
     }
 
-    [[nodiscard]] Sample take(const Counters& counters) {
+    [[nodiscard]] Sample take(Counters& counters, GpuThermals& thermals) {
         Sample sample;
         sample.t = unix_millis();
         sample.uptime = GetTickCount64() / 1000;
@@ -765,7 +1094,11 @@ struct MetricsRecorder::Impl {
             volumes_age = 0;
         }
         sample.volumes = volumes;
-        read_gpus(counters, sample);
+        read_gpus(counters, thermals.read(), sample);
+        // To a tenth, like the loads.
+        if (const auto celsius = counters.thermal_zone(); celsius.has_value()) {
+            sample.cpu_temp = std::round(*celsius * 10) / 10;
+        }
         return sample;
     }
 
@@ -852,7 +1185,8 @@ struct MetricsRecorder::Impl {
         previous_net_time = now;
     }
 
-    void read_gpus(const Counters& counters, Sample& sample) const {
+    void read_gpus(const Counters& counters, const std::map<std::uint64_t, double>& temperatures,
+                   Sample& sample) const {
         const auto utilisation = counters.gpu_utilisation();
         const auto dedicated = counters.gpu_dedicated();
         const auto shared = counters.gpu_shared();
@@ -865,7 +1199,11 @@ struct MetricsRecorder::Impl {
                                             .util = std::round(value(utilisation, gpu.luid) * 10) / 10,
                                             .dedicated_used = static_cast<std::uint64_t>(value(dedicated, gpu.luid)),
                                             .dedicated_total = gpu.dedicated,
-                                            .shared_used = static_cast<std::uint64_t>(value(shared, gpu.luid))});
+                                            .shared_used = static_cast<std::uint64_t>(value(shared, gpu.luid)),
+                                            .temp = std::nullopt});
+            if (const auto found = temperatures.find(gpu.luid); found != temperatures.end()) {
+                sample.gpus.back().temp = std::round(found->second * 10) / 10;
+            }
         }
     }
 

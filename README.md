@@ -174,7 +174,7 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [x] Email ownership verification and security notices (when the relay has a mailer)
 - [ ] Trusted-proxy address resolution, with IP allow/deny lists
 - [x] Machine analytics (CPU/RAM/GPU/disk/network, processes) with charts, history kept on the machine, end-to-end encrypted
-- [ ] Analytics alerts (disk full, machine silent), sparklines in the machine list, temperatures, ending processes
+- [x] Analytics alerts (CPU, memory, disk, temperature, offline; checked in the browser), sparklines, temperatures, ending processes
 - [x] `dev` role: a shell instead of a video stream, for low bandwidth (ConPTY as the logged-on user)
 - [x] GUI and CLI installer (`hawk-setup`): machine, relay, app; preflight, repair, uninstall
 - [ ] Installer pre-stamped by the dashboard with relay URL, pin and enroll code; Authenticode signing
@@ -953,7 +953,7 @@ attached, which is why it isn't in the section above yet.
 
 **Built:** the relay records events (sign-ins and failures, views with
 their length and traffic, the first shell/file/picture use per view, power,
-Ctrl+Alt+Del, config changes, shares, enrollments, account changes) with
+Ctrl+Alt+Del, processes ended, config changes, shares, enrollments, account changes) with
 the account and the client address, in `audit_events`, kept
 `HAWK_AUDIT_RETENTION_DAYS` (90 by default). Owners see their machines'
 Activity, everyone their own account's, the admin everything. Because of

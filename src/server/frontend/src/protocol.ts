@@ -3,7 +3,7 @@
 
 // Bumped with relay/src/protocol.rs PROTOCOL_VERSION when a message changes
 // in a way the other side can't follow.
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 
 // What a user may do with a machine. Not a ladder: dev gets a shell and
 // files, but neither the screen nor input.
@@ -27,6 +27,12 @@ export function canFiles(role: Role): boolean {
 // Opens shells on the machine.
 export function canShell(role: Role): boolean {
   return role === "dev" || role === "owner";
+}
+
+// Ends processes on the machine: what control reaches through Task Manager
+// and dev through its shell anyway.
+export function canEndProcesses(role: Role): boolean {
+  return role !== "view";
 }
 
 // What the machine's config lets a viewer do with its clipboard: nothing,
@@ -99,6 +105,9 @@ export interface Machine {
   // While online: the machine types `text` input events as characters, for
   // this user's role (control or owner).
   text?: boolean;
+  // While online: the machine ends a process for this user's role
+  // (control, dev or owner).
+  endProcess?: boolean;
 }
 
 // What a viewer with control can ask the machine to do with itself.
@@ -159,7 +168,10 @@ export type DashboardEvent =
   | { type: "quality"; deviceId: string; preset: string; bitrate: number; fps: number }
   // Whether the machine pressed this viewer's Ctrl+Alt+Del, sealed for it
   // (ViewSession.openSas).
-  | { type: "sas"; deviceId: string; sealed: string };
+  | { type: "sas"; deviceId: string; sealed: string }
+  // Whether the machine ended this viewer's process, sealed for it
+  // (ViewSession.openEndProcess).
+  | { type: "end_process"; deviceId: string; sealed: string };
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -238,6 +250,9 @@ export type DashboardCommand =
   // Presses Ctrl+Alt+Del on the machine (ViewSession.sealSas); control and
   // owner, elevated, as input is.
   | { type: "sas"; deviceId: string; sealed: string }
+  // Ends a process on the machine (ViewSession.sealEndProcess); control,
+  // dev and owner, elevated.
+  | { type: "end_process"; deviceId: string; sealed: string }
   // Owner only: install the update the machine is holding. The machine
   // checks the release's signature itself.
   | { type: "install_update"; deviceId: string };

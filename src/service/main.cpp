@@ -11,6 +11,7 @@
 #include "metrics.hpp"
 #include "audio_devices.hpp"
 #include "power.hpp"
+#include "process_control.hpp"
 #include "quality.hpp"
 #include "sas.hpp"
 #include "updater.hpp"
@@ -59,7 +60,7 @@ namespace {
 // relay-pins.txt on top of that.
 constexpr std::chrono::seconds kReconnectDelay{5};
 // Must match PROTOCOL_VERSION in src/server/relay/src/protocol.rs.
-constexpr std::uint32_t kProtocolVersion = 10;
+constexpr std::uint32_t kProtocolVersion = 11;
 // After the relay refuses this machine (unknown machine, bad code, failed
 // key proof), or while there's nothing to identify with, retry less eagerly.
 constexpr std::chrono::seconds kRejectedRetryDelay{30};
@@ -154,11 +155,11 @@ struct RelayCommand {
     std::string                                  machine_id;     // enrolled
     std::string                                  owner_key;      // enrolled: base64 identity key
     std::string                                  owner_binding;  // enrolled: base64 HMAC under the code
-    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard*, file, shell, metrics, audio_*, config_*, quality, sas, ping
+    std::uint64_t                                viewer = 0;     // viewer_join, viewer_left, input, clipboard*, file, shell, metrics, audio_*, config_*, quality, sas, end_process, ping
     std::string                                  statement;      // viewer_join
     std::string                                  signature;      // viewer_join
     std::optional<svc::SignedStatement>          grant;          // viewer_join
-    std::string                                  sealed;         // input, clipboard*, file, shell, metrics, power, audio_*, config_*, quality, sas
+    std::string                                  sealed;         // input, clipboard*, file, shell, metrics, power, audio_*, config_*, quality, sas, end_process
     std::vector<svc::SignedStatement>            revocations;    // revocations
     bool                                         audio = false;  // start_capture: the relay passes sound on
     std::uint32_t                                bitrate = 0;    // bitrate: Auto's next step, bits per second
@@ -782,6 +783,14 @@ void PressCtrlAltDel(svc::ViewerHub& hub, std::uint64_t viewer) {
     hub.send_sas_result(viewer, done.has_value() ? std::string_view{} : std::string_view(done.error()));
 }
 
+// Ends a process for a viewer, and tells it whether that worked. The owner's
+// request runs as the service; anyone else's as the signed-in user, so a
+// share ends only what that user could (process_control.hpp).
+void EndProcess(svc::ViewerHub& hub, std::uint64_t viewer, const svc::EndProcessRequest& request) {
+    const auto outcome = svc::end_process(request.target, !request.owner);
+    hub.send_end_process_result(viewer, request.target, outcome);
+}
+
 // The longest nonce echoed back; the dashboard sends a counter.
 constexpr std::size_t kMaxPingNonce = 32;
 
@@ -963,6 +972,10 @@ void HandleRelayCommand(std::string_view text, Connection& connection) {
     } else if (command.type == "sas") {
         if (hub->sas(command.viewer, command.sealed)) {
             PressCtrlAltDel(*hub, command.viewer);
+        }
+    } else if (command.type == "end_process") {
+        if (const auto request = hub->end_process(command.viewer, command.sealed); request.has_value()) {
+            EndProcess(*hub, command.viewer, *request);
         }
     } else if (command.type == "bitrate") {
         // Only ever from the relay, whose controller runs Auto: anything

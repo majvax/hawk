@@ -85,12 +85,13 @@ pub enum Kind {
     ClipboardImagePasted,
     Power,
     CtrlAltDel,
+    EndProcess,
     ConfigChanged,
     UpdateInstall,
 }
 
 impl Kind {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::SignIn,
         Self::SignInFailed,
         Self::MfaFailed,
@@ -120,6 +121,7 @@ impl Kind {
         Self::ClipboardImagePasted,
         Self::Power,
         Self::CtrlAltDel,
+        Self::EndProcess,
         Self::ConfigChanged,
         Self::UpdateInstall,
     ];
@@ -155,6 +157,7 @@ impl Kind {
             Self::ClipboardImagePasted => "clipboard_image_pasted",
             Self::Power => "power",
             Self::CtrlAltDel => "ctrl_alt_del",
+            Self::EndProcess => "end_process",
             Self::ConfigChanged => "config_changed",
             Self::UpdateInstall => "update_install",
         }
@@ -506,12 +509,15 @@ pub enum Use {
     ClipboardImage,
     Power,
     CtrlAltDel,
+    /// A process to end: which one is sealed, so not which.
+    EndProcess,
     ConfigChange,
 }
 
 /// One view's record: one row when it starts, one when it ends, one the
 /// first time it uses a shell, files or pastes a picture, and one per power
-/// action, Ctrl+Alt+Del and config change. Never one per message.
+/// action, Ctrl+Alt+Del, process ended and config change. Never one per
+/// message.
 #[derive(Debug)]
 pub struct ViewLog {
     context: ViewContext,
@@ -577,6 +583,7 @@ impl ViewLog {
             Use::ClipboardImage => first(&mut self.clipboard_image).then_some(Kind::ClipboardImagePasted)?,
             Use::Power => Kind::Power,
             Use::CtrlAltDel => Kind::CtrlAltDel,
+            Use::EndProcess => Kind::EndProcess,
             Use::ConfigChange => Kind::ConfigChanged,
         };
         Some(self.context.event(kind))
@@ -1118,6 +1125,7 @@ mod tests {
         assert!(registry.file(dashboard, "m1", SECRET.into()));
         assert!(registry.power(dashboard, "m1", SECRET.into()));
         assert!(registry.sas(dashboard, "m1", SECRET.into()));
+        assert!(registry.end_process(dashboard, "m1", SECRET.into()));
         assert!(registry.config_set(dashboard, "m1", SECRET.into()));
         assert!(registry.clipboard_image_put(dashboard, "m1", SECRET.into()));
         assert!(registry.input(dashboard, "m1", SECRET.into()));
@@ -1136,7 +1144,7 @@ mod tests {
 
         drain(&state, &mut events).await;
         let stored = everything_stored(&state.db).await;
-        for kind in ["view_started", "shell_used", "files_used", "power", "ctrl_alt_del", "config_changed"] {
+        for kind in ["view_started", "shell_used", "files_used", "power", "ctrl_alt_del", "end_process", "config_changed"] {
             assert!(stored.contains(kind), "{kind} missing from {stored}");
         }
         assert!(stored.contains("clipboard_image_pasted") && stored.contains("view_ended") && stored.contains("mfa_failed"));

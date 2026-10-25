@@ -34,6 +34,19 @@ have to trust with your screen.
 - **The service runs as SYSTEM**, so it can capture the lock screen and
   UAC prompts. That's what makes them controllable remotely.
 - **Shells and files run as the signed-in user**, never as SYSTEM.
+- **Ending a process** (the Processes tab) is a privileged request, like
+  power actions: control, shell or the owner's role, a fresh second factor
+  (the relay won't pass it on without), and the machine checks the role
+  again. It's end-to-end encrypted, so the relay logs that a process was
+  ended but not which. A shared account's request runs as the signed-in
+  user, so it ends only what that user could; the owner's runs as the
+  service. Either way the machine refuses PID 0 and 4, Windows' own
+  processes (`csrss`, `wininit`, `smss`, `lsass`, `services`, `winlogon`,
+  `svchost`, `dwm`, `fontdrvhost`, System), anything marked critical or protected, and Hawk itself, and it
+  names the process by PID and start time, so a reused PID is never hit.
+- **Alerts are checked in your browser.** The machine's numbers are sealed
+  for you, so the relay can't evaluate thresholds; the dashboard does, while
+  it's open, and keeps your thresholds in the browser.
 - **It connects out only.** Nothing listens on the PC, so there's nothing
   to reach from outside.
 - **It pins the relay's key**, so a rogue certificate authority or an

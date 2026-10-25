@@ -5,6 +5,30 @@ Each release's section becomes its release notes (see
 
 ## Unreleased
 
+- **Analytics upgrades.** **Sparklines:** the last five minutes of CPU,
+  memory, GPU, network, disk and temperatures over the Analytics charts,
+  and CPU and memory in the machine list, kept in the browser per machine
+  (bounded, never sent anywhere), each labelled with its current, lowest
+  and highest value. **Temperatures** where the machine can read them: the
+  hottest ACPI thermal zone for the CPU (through PDH, so nothing waits on
+  WMI), and each GPU's from the graphics kernel's adapter data (WDDM 2.4,
+  any vendor) or, for an NVIDIA card without it, NVML from System32; both
+  loaded at run time, *unavailable* otherwise. They ride in the sealed
+  samples as new fields, which older dashboards ignore. **End process**
+  in the Processes tab, after a confirmation naming it: for the owner,
+  control and dev, elevated, enforced by the relay and checked again by
+  the machine; sealed on the input key with its answer back. The machine
+  finds the process by PID and start time (a reused PID is never ended),
+  runs a share's request as the signed-in user, and refuses PID 0 and 4,
+  Windows' own (`csrss`, `wininit`, `smss`, `lsass`, `services`,
+  `winlogon`, `svchost`, `dwm`, `fontdrvhost`, System and the like), anything marked critical
+  (`ProcessBreakOnTermination`) or protected, and Hawk itself. The
+  activity log records **Ended a process** (not which: it's sealed).
+  **Alerts** per machine: CPU over a level for a time, memory, a drive's
+  free space, temperature, offline. Checked by the dashboard while it's
+  open (the relay can't read the numbers), with hysteresis so they don't
+  flap; a badge on the machine, a toast, and browser notifications if you
+  turn them on. Thresholds stay in the browser.
 - **Relay operations.** The relay is easier to run and to watch.
   **Scheduled backups:** set `HAWK_BACKUP_DIR` and it backs the database
   up there every `HAWK_BACKUP_INTERVAL` hours (24), keeping the newest
@@ -165,7 +189,7 @@ Each release's section becomes its release notes (see
   (older Firefox) shows the picture to save or copy by hand; one that won't
   hand them over still sends one with `Ctrl+V` on the screen. Older machines
   and dashboards stay text-only.
-- Protocol version 10.
+- Protocol version 11.
 
 ## 1.0.0
 

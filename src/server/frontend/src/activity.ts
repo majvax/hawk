@@ -93,6 +93,7 @@ const LABELS: Record<string, [Exclude<Category, "all">, string]> = {
   clipboard_image_pasted: ["actions", "Pasted a picture"],
   power: ["actions", "Power action"],
   ctrl_alt_del: ["actions", "Ctrl+Alt+Del"],
+  end_process: ["actions", "Ended a process"],
   config_changed: ["actions", "Changed the config"],
   update_install: ["actions", "Installed an update"],
 };

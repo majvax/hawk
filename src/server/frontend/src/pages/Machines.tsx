@@ -17,6 +17,7 @@ import {
   type PowerAction,
   type Role,
   canControl as roleCanControl,
+  canEndProcesses,
   canFiles,
   canShell,
   canView,
@@ -28,8 +29,12 @@ import { useRemoteInput } from "../useRemoteInput.js";
 import { useTouchInput, useTouchKeyboard } from "../useTouchInput.js";
 import type { Modifier } from "../touchKeyboard.js";
 import { useStepUp } from "../stepUp.js";
+import type { AlertKind } from "../alerts.js";
+import { type Alerts, useAlerts } from "../useAlerts.js";
+import type { SparkStore } from "../sparkline.js";
 import { ActivityTable } from "./Activity.js";
-import { AnalyticsPanel, ProcessesPanel } from "./AnalyticsPanel.js";
+import { AlertBadge, AlertToasts, AlertsDialog } from "./Alerts.js";
+import { AnalyticsPanel, type ProcessEnding, ProcessesPanel, Sparkline } from "./AnalyticsPanel.js";
 import { ANSWER_TIMEOUT_MS, ConfigPanel } from "./ConfigPanel.js";
 import { FilesPanel } from "./FilesPanel.js";
 import { QUALITY_PRESETS, describeQuality } from "../quality.js";
@@ -87,6 +92,10 @@ export function MachinesPage({
   const [tab, setTab] = useState<DetailTab>("screen");
   const [enrollment, setEnrollment] = useState<EnrollmentCode | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The machine whose alert thresholds are being set.
+  const [alertsFor, setAlertsFor] = useState<Machine | null>(null);
+  const alerts = useAlerts(dashboard);
+  const requestStepUp = useStepUp();
   const now = useNow();
 
   const selected = machines.find((machine) => machine.id === selectedId) ?? null;
@@ -117,6 +126,24 @@ export function MachinesPage({
   };
 
   const online = machines.filter((machine) => machine.online).length;
+
+  // Ending a process from the Processes tab: control, dev or the owner, on a
+  // machine new enough, once the view is secured; the relay wants a step-up.
+  const security = dashboard.security;
+  const ending: ProcessEnding | null =
+    selected !== null &&
+    viewing?.id === selected.id &&
+    selected.endProcess === true &&
+    security?.kind === "secured" &&
+    canEndProcesses(security.role)
+      ? {
+          elevated: dashboard.elevated,
+          onStepUp: () => void requestStepUp().then((ok) => ok && dashboard.elevate()),
+          onEnd: (row) => dashboard.endProcess({ pid: row.pid, started: row.started }),
+          result: dashboard.endProcessResult,
+          clearResult: dashboard.clearEndProcessResult,
+        }
+      : null;
 
   return (
     <div className="console">
@@ -152,6 +179,7 @@ export function MachinesPage({
               machine={machine}
               selected={machine.id === selectedId}
               live={machine.id === viewingId}
+              alerts={alerts.active[machine.id]}
               onSelect={() => select(machine.id)}
             />
           ))}
@@ -171,6 +199,8 @@ export function MachinesPage({
           <Overview
             machines={machines}
             viewingId={viewingId}
+            alerts={alerts}
+            sparks={dashboard.sparks}
             now={now}
             onSelect={select}
             onConnect={connect}
@@ -194,6 +224,15 @@ export function MachinesPage({
                 </span>
               </div>
               <div className="pane-actions">
+                <AlertBadge kinds={alerts.active[selected.id]} />
+                <button
+                  type="button"
+                  className="btn"
+                  title="Warn me when this machine is busy, full, hot or offline"
+                  onClick={() => setAlertsFor(selected)}
+                >
+                  Alerts
+                </button>
                 {selected.id === viewingId ? (
                   <button type="button" className="btn" onClick={stopView}>
                     Disconnect
@@ -236,9 +275,13 @@ export function MachinesPage({
             {(detailTab === "analytics" || detailTab === "processes") && (
               <AnalyticsTab dashboard={dashboard} machine={selected} viewing={viewing} onConnect={connect}>
                 {detailTab === "analytics" ? (
-                  <AnalyticsPanel metrics={dashboard.metrics} actions={dashboard.metricsActions} />
+                  <AnalyticsPanel
+                    metrics={dashboard.metrics}
+                    actions={dashboard.metricsActions}
+                    sparks={dashboard.sparks.series(selected.id)}
+                  />
                 ) : (
-                  <ProcessesPanel metrics={dashboard.metrics} actions={dashboard.metricsActions} />
+                  <ProcessesPanel metrics={dashboard.metrics} actions={dashboard.metricsActions} ending={ending} />
                 )}
               </AnalyticsTab>
             )}
@@ -284,6 +327,9 @@ export function MachinesPage({
           onConnect={connect}
         />
       </section>
+
+      {alertsFor !== null && <AlertsDialog machine={alertsFor} alerts={alerts} onClose={() => setAlertsFor(null)} />}
+      <AlertToasts toasts={alerts.toasts} onDismiss={alerts.dismissToast} onOpen={(id) => select(id)} />
     </div>
   );
 }
@@ -292,11 +338,13 @@ function RailItem({
   machine,
   selected,
   live,
+  alerts,
   onSelect,
 }: {
   machine: Machine;
   selected: boolean;
   live: boolean;
+  alerts: AlertKind[] | undefined;
   onSelect: () => void;
 }): JSX.Element {
   const watchers = machine.viewers?.length ?? 0;
@@ -309,7 +357,9 @@ function RailItem({
     >
       <Dot tone={statusTone(machine)} title={statusText(machine)} />
       <span className="rail-name truncate">{machine.name}</span>
-      {live ? (
+      {alerts !== undefined && alerts.length > 0 ? (
+        <AlertBadge kinds={alerts} />
+      ) : live ? (
         <Tag tone="accent">Live</Tag>
       ) : machine.role === "owner" && machine.keyStorage === null ? (
         <Tag tone="err">Re-enroll</Tag>
@@ -406,9 +456,38 @@ function MachineStrip({
   );
 }
 
+// A machine's sparklines in the list are only for one sampled lately: an
+// older line would pass for the machine's state now.
+const SPARK_FRESH_MS = 10_000;
+
+const percentLabel = (value: number): string => `${Math.round(value)}%`;
+
+// CPU and memory over the last few minutes, for a machine watched with
+// analytics lately; nothing otherwise (the relay never sees the numbers,
+// so only the machine being watched has any).
+function ListSparks({ sparks, machineId, now }: { sparks: SparkStore; machineId: string; now: number }): JSX.Element {
+  const at = sparks.updatedAt(machineId);
+  const series = at !== null && now - at <= SPARK_FRESH_MS ? sparks.series(machineId) : null;
+  if (series === null) return <span className="faint">—</span>;
+  return (
+    <span className="list-sparks">
+      <span className="list-spark">
+        <span className="faint">CPU</span>
+        <Sparkline values={series.cpu} label="CPU" format={percentLabel} floor={0} ceiling={100} />
+      </span>
+      <span className="list-spark">
+        <span className="faint">MEM</span>
+        <Sparkline values={series.mem} label="Memory" format={percentLabel} floor={0} ceiling={100} />
+      </span>
+    </span>
+  );
+}
+
 function Overview({
   machines,
   viewingId,
+  alerts,
+  sparks,
   now,
   onSelect,
   onConnect,
@@ -416,6 +495,8 @@ function Overview({
 }: {
   machines: Machine[];
   viewingId: string | null;
+  alerts: Alerts;
+  sparks: SparkStore;
   now: number;
   onSelect: (id: string) => void;
   onConnect: (machine: Machine) => void;
@@ -473,6 +554,7 @@ function Overview({
                 <th>Machine</th>
                 <th>Host</th>
                 <th>Status</th>
+                <th className="hide-narrow">Last minutes</th>
                 <th>Access</th>
                 <th>Watching</th>
                 <th />
@@ -487,10 +569,14 @@ function Overview({
                       <span className="truncate">{machine.name}</span>
                       {machine.id === viewingId && <Tag tone="accent">Live</Tag>}
                       {machine.role === "owner" && machine.keyStorage === null && <Tag tone="err">Re-enroll</Tag>}
+                      <AlertBadge kinds={alerts.active[machine.id]} />
                     </span>
                   </td>
                   <td className="mono muted">{machine.hostname}</td>
                   <td className={machine.online ? "num" : "num muted"}>{presence(machine, now)}</td>
+                  <td className="hide-narrow">
+                    <ListSparks sparks={sparks} machineId={machine.id} now={now} />
+                  </td>
                   <td>
                     <span className="cell">
                       {ROLE_LABEL[machine.role]}

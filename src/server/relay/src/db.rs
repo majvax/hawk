@@ -1146,6 +1146,12 @@ impl Role {
     pub fn can_shell(self) -> bool {
         matches!(self, Self::Dev | Self::Owner)
     }
+
+    /// Ends a process on the machine: what control reaches through Task
+    /// Manager and dev through its shell anyway.
+    pub fn can_end_processes(self) -> bool {
+        matches!(self, Self::Control | Self::Dev | Self::Owner)
+    }
 }
 
 /// A statement and someone's signature over it (see crate::e2e).

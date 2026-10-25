@@ -26,6 +26,11 @@
 // History: one point a second for the last hour, in memory; one a minute
 // for `history_days`, also in C:\ProgramData\HawkService\metrics. A range
 // comes back averaged into at most a few hundred points.
+//
+// Temperatures ride in the samples only (`cpu_temp`, and `temp` per GPU),
+// where the machine has a sensor to read: left out otherwise, so an older
+// dashboard ignores them and a newer one shows them as unavailable. They
+// aren't kept in the history, whose file keeps its layout.
 namespace hawk::service {
 
 namespace metrics_op {

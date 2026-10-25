@@ -40,6 +40,7 @@ describe("activity", () => {
     expect(kindsFor("all")).toEqual([]);
     expect(kindsFor("sessions")).toEqual(["view_started", "view_ended", "view_rejected", "view_elevated"]);
     expect(kindsFor("actions")).toContain("ctrl_alt_del");
+    expect(kindsFor("actions")).toContain("end_process");
     expect(kindsFor("account")).not.toContain("power");
   });
 
