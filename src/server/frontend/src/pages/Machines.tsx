@@ -831,10 +831,8 @@ function Viewer({
   const [clipNote, setClipNote] = useState<string | null>(null);
   const [dropping, setDropping] = useState(false);
   const [dropNote, setDropNote] = useState<string | null>(null);
-  const [clipMenu, setClipMenu] = useState(false);
-  const [powerMenu, setPowerMenu] = useState(false);
-  const [soundMenu, setSoundMenu] = useState(false);
-  const [qualityMenu, setQualityMenu] = useState(false);
+  // The one menu behind "More", for everything past the bar's few buttons.
+  const [moreMenu, setMoreMenu] = useState(false);
   // The power action waiting for its second click.
   const [armed, setArmed] = useState<PowerAction | null>(null);
   const [powerNote, setPowerNote] = useState<string | null>(null);
@@ -877,7 +875,6 @@ function Viewer({
   const canChooseDevice = mayChooseDevice && elevated;
   const chooseHint = mayChooseDevice ? "Confirm it's you first" : "Choosing the device needs control";
   const defaultName = audioDevices?.devices.find((device) => device.default)?.name;
-  const soundMenuShown = onScreen && (sound.supported || listsDevices);
   // The stream's quality preset: control (or the owner) picks it for
   // everyone watching, on a machine new enough to take one. No fresh
   // factor: it only changes how the picture is encoded.
@@ -920,7 +917,7 @@ function Viewer({
     setClipPanel(null);
     setClipNote(null);
     setDropNote(null);
-    setClipMenu(false);
+    setMoreMenu(false);
   }, [viewing?.id, canReadClipboard]);
 
   // Pings for the round trip only go out while the overlay is on screen.
@@ -930,9 +927,7 @@ function Viewer({
   }, [onScreen, setStatsVisible, statsShown]);
 
   useEffect(() => {
-    setPowerMenu(false);
-    setSoundMenu(false);
-    setQualityMenu(false);
+    setMoreMenu(false);
     setArmed(null);
     setPowerNote(null);
     setSasNote(null);
@@ -954,7 +949,7 @@ function Viewer({
       return;
     }
     setArmed(null);
-    setPowerMenu(false);
+    setMoreMenu(false);
     if (sendPower(action)) setPowerNote(item.sent(viewing.name));
   };
 
@@ -1184,44 +1179,17 @@ function Viewer({
   const clipboardMenu = canPaste || canReadClipboard;
   // The menu closes on any click outside it (or its button).
   useEffect(() => {
-    if (!clipMenu) return;
+    if (!moreMenu) return;
     const onPointer = (event: PointerEvent): void => {
       const target = event.target as Element | null;
-      if (target?.closest(".stage-menu, [data-clip-menu]") == null) setClipMenu(false);
-    };
-    document.addEventListener("pointerdown", onPointer);
-    return () => document.removeEventListener("pointerdown", onPointer);
-  }, [clipMenu]);
-  useEffect(() => {
-    if (!soundMenu) return;
-    const onPointer = (event: PointerEvent): void => {
-      const target = event.target as Element | null;
-      if (target?.closest(".stage-menu, [data-sound-menu]") == null) setSoundMenu(false);
-    };
-    document.addEventListener("pointerdown", onPointer);
-    return () => document.removeEventListener("pointerdown", onPointer);
-  }, [soundMenu]);
-  useEffect(() => {
-    if (!qualityMenu) return;
-    const onPointer = (event: PointerEvent): void => {
-      const target = event.target as Element | null;
-      if (target?.closest(".stage-menu, [data-quality-menu]") == null) setQualityMenu(false);
-    };
-    document.addEventListener("pointerdown", onPointer);
-    return () => document.removeEventListener("pointerdown", onPointer);
-  }, [qualityMenu]);
-  useEffect(() => {
-    if (!powerMenu) return;
-    const onPointer = (event: PointerEvent): void => {
-      const target = event.target as Element | null;
-      if (target?.closest(".stage-menu, [data-power-menu]") == null) {
-        setPowerMenu(false);
+      if (target?.closest(".stage-menu, [data-more-menu]") == null) {
+        setMoreMenu(false);
         setArmed(null);
       }
     };
     document.addEventListener("pointerdown", onPointer);
     return () => document.removeEventListener("pointerdown", onPointer);
-  }, [powerMenu]);
+  }, [moreMenu]);
 
   useEffect(() => {
     const onChange = (): void => {
@@ -1270,33 +1238,25 @@ function Viewer({
       {/* Any click on the stage lets the browser start the sound. */}
       <div ref={stageRef} className={controlling ? "stage controlling" : "stage"} onPointerDown={unlockSound}>
         <div className="stage-bar">
-          {onScreen ? (
-            <span className="live">
-              <Dot tone={stats?.receiving === false ? "warn" : "accent"} />
-              Live
-            </span>
-          ) : (
-            <span>
-              <Dot tone="idle" />
-              Idle
-            </span>
-          )}
-          <span className="v truncate">{name}</span>
-          {onScreen && picture !== null && (
-            <span className="wide">
-              {picture.width}×{picture.height}
-            </span>
-          )}
-          {onScreen && stats !== null && <span>{String(stats.fps).padStart(2, " ")} fps</span>}
-          {/* Shown only when the browser falls behind what arrives. */}
-          {onScreen && stats !== null && stats.received - stats.fps > 2 && (
-            <span className="wide">{stats.received} in</span>
-          )}
-          {onScreen && stats !== null && stats.dropped > 0 && <span className="wide">{stats.dropped} dropped</span>}
-          {onScreen && stats?.debug != null && <span>{stats.debug}</span>}
-          {onScreen && stats !== null && <span className="wide">{formatBitrate(stats.kbps)}</span>}
-          <span className="spacer" />
-          {onScreen && viewing.role === "view" && <span>View only</span>}
+          {/* What it is and how it's doing: clipped first when the bar runs
+              short, so the buttons on the right stay reachable. */}
+          <div className="stage-bar-info">
+            {onScreen ? (
+              <span className="live">
+                <Dot tone={stats?.receiving === false ? "warn" : "accent"} />
+                Live
+              </span>
+            ) : (
+              <span className="idle">
+                <Dot tone="idle" />
+                Idle
+              </span>
+            )}
+            <span className="v truncate">{name}</span>
+            {onScreen && stats !== null && <span>{String(stats.fps).padStart(2, " ")} fps</span>}
+            {onScreen && stats?.debug != null && <span>{stats.debug}</span>}
+            {onScreen && viewing.role === "view" && <span>View only</span>}
+          </div>
           {controlLocked && (
             <button type="button" onClick={() => void requestStepUp().then((ok) => ok && dashboard.elevate())}>
               Confirm to control
@@ -1318,42 +1278,6 @@ function Viewer({
               Release
             </button>
           )}
-          {clipboardMenu && (
-            <button
-              type="button"
-              data-clip-menu
-              aria-expanded={clipMenu}
-              onClick={() => {
-                setPowerMenu(false);
-                setSoundMenu(false);
-                setQualityMenu(false);
-                setClipMenu(!clipMenu);
-              }}
-            >
-              {clipboard.waiting ? "Getting…" : "Clipboard ▾"}
-            </button>
-          )}
-          {canPower && (
-            <button
-              type="button"
-              data-power-menu
-              aria-expanded={powerMenu}
-              onClick={() => {
-                setClipMenu(false);
-                setSoundMenu(false);
-                setQualityMenu(false);
-                setArmed(null);
-                setPowerMenu(!powerMenu);
-              }}
-            >
-              Power ▾
-            </button>
-          )}
-          {canSas && (
-            <button type="button" title="Or press Ctrl+Alt+End on the screen" onClick={pressSas}>
-              Ctrl+Alt+Del
-            </button>
-          )}
           {onScreen && sound.supported && (
             <button
               type="button"
@@ -1364,48 +1288,19 @@ function Viewer({
               {sound.blocked ? "Click for sound" : sound.muted ? "Sound off" : "Sound on"}
             </button>
           )}
-          {soundMenuShown && (
-            <button
-              type="button"
-              data-sound-menu
-              aria-expanded={soundMenu}
-              onClick={() => {
-                setClipMenu(false);
-                setPowerMenu(false);
-                setQualityMenu(false);
-                setArmed(null);
-                // Fresh each time: devices come and go.
-                if (!soundMenu && listsDevices) requestAudioDevices();
-                setSoundMenu(!soundMenu);
-              }}
-            >
-              Sound ▾
-            </button>
-          )}
-          {canChooseQuality && (
-            <button
-              type="button"
-              data-quality-menu
-              aria-expanded={qualityMenu}
-              onClick={() => {
-                setClipMenu(false);
-                setPowerMenu(false);
-                setSoundMenu(false);
-                setArmed(null);
-                setQualityMenu(!qualityMenu);
-              }}
-            >
-              Quality ▾
-            </button>
-          )}
           {onScreen && (
             <button
               type="button"
-              aria-pressed={statsShown}
-              title={statsShown ? "Hide the stream stats" : "Show the stream stats over the picture"}
-              onClick={() => setStatsShown(!statsShown)}
+              data-more-menu
+              aria-expanded={moreMenu}
+              onClick={() => {
+                setArmed(null);
+                // Fresh each time: devices come and go.
+                if (!moreMenu && listsDevices) requestAudioDevices();
+                setMoreMenu(!moreMenu);
+              }}
             >
-              Stats
+              {clipboard.waiting ? "Getting…" : "More ▾"}
             </button>
           )}
           {onScreen && (
@@ -1414,37 +1309,28 @@ function Viewer({
             </button>
           )}
         </div>
-        {clipboardMenu && clipMenu && (
+        {onScreen && moreMenu && (
           <div className="stage-menu" role="menu">
-            {canPaste && (
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setClipMenu(false);
-                  void pasteFromClipboard();
-                }}
-              >
-                Paste my clipboard to the machine
-              </button>
-            )}
-            {canReadClipboard && (
-              <button
-                type="button"
-                role="menuitem"
-                disabled={clipboard.waiting}
-                onClick={() => {
-                  setClipMenu(false);
-                  getClipboard();
-                }}
-              >
-                Copy the machine's clipboard to mine
-              </button>
-            )}
-          </div>
-        )}
-        {soundMenuShown && soundMenu && (
-          <div className="stage-menu" role="menu">
+            <div className="stage-menu-label">Stream</div>
+            <button
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={statsShown}
+              onClick={() => {
+                setMoreMenu(false);
+                setStatsShown(!statsShown);
+              }}
+            >
+              {statsShown ? "✓ " : ""}Stats over the picture
+              {stats !== null && (
+                <span className="stage-menu-hint">
+                  {" · "}
+                  {picture !== null && `${picture.width}×${picture.height}, `}
+                  {formatBitrate(stats.kbps)}
+                  {stats.dropped > 0 && `, ${stats.dropped} dropped`}
+                </span>
+              )}
+            </button>
             {sound.supported && (
               <button
                 type="button"
@@ -1455,6 +1341,28 @@ function Viewer({
               >
                 {sync ? "✓ " : ""}Sync to sound
               </button>
+            )}
+            {canChooseQuality && (
+              <>
+                <div className="stage-menu-label">Quality, for everyone watching</div>
+                {QUALITY_PRESETS.map((entry) => (
+                  <button
+                    key={entry.preset}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={streamQuality?.preset === entry.preset}
+                    title={entry.hint}
+                    onClick={() => {
+                      setMoreMenu(false);
+                      if (streamQuality?.preset !== entry.preset) setQuality(entry.preset);
+                    }}
+                  >
+                    {streamQuality?.preset === entry.preset ? "✓ " : ""}
+                    {entry.label}
+                    <span className="stage-menu-hint"> · {entry.hint}</span>
+                  </button>
+                ))}
+              </>
             )}
             {listsDevices && (
               <>
@@ -1477,7 +1385,7 @@ function Viewer({
                       disabled={!canChooseDevice}
                       title={canChooseDevice ? undefined : chooseHint}
                       onClick={() => {
-                        setSoundMenu(false);
+                        setMoreMenu(false);
                         if (audioDevices.selected !== device.id) selectAudioDevice(device.id);
                       }}
                     >
@@ -1496,43 +1404,62 @@ function Viewer({
                 )}
               </>
             )}
-          </div>
-        )}
-        {canChooseQuality && qualityMenu && (
-          <div className="stage-menu" role="menu">
-            <div className="stage-menu-label">Quality, for everyone watching</div>
-            {QUALITY_PRESETS.map((entry) => (
+            {clipboardMenu && (
+              <>
+                <div className="stage-menu-label">Clipboard</div>
+                {canPaste && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMoreMenu(false);
+                      void pasteFromClipboard();
+                    }}
+                  >
+                    Paste my clipboard to the machine
+                  </button>
+                )}
+                {canReadClipboard && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={clipboard.waiting}
+                    onClick={() => {
+                      setMoreMenu(false);
+                      getClipboard();
+                    }}
+                  >
+                    Copy the machine's clipboard to mine
+                  </button>
+                )}
+              </>
+            )}
+            {(canSas || canPower) && <div className="stage-menu-label">Power</div>}
+            {canSas && (
               <button
-                key={entry.preset}
-                type="button"
-                role="menuitemradio"
-                aria-checked={streamQuality?.preset === entry.preset}
-                title={entry.hint}
-                onClick={() => {
-                  setQualityMenu(false);
-                  if (streamQuality?.preset !== entry.preset) setQuality(entry.preset);
-                }}
-              >
-                {streamQuality?.preset === entry.preset ? "✓ " : ""}
-                {entry.label}
-                <span className="stage-menu-hint"> · {entry.hint}</span>
-              </button>
-            ))}
-          </div>
-        )}
-        {canPower && powerMenu && (
-          <div className="stage-menu" role="menu">
-            {POWER_ITEMS.map((item) => (
-              <button
-                key={item.action}
                 type="button"
                 role="menuitem"
-                className={armed === item.action ? "armed" : undefined}
-                onClick={() => choosePower(item.action)}
+                onClick={() => {
+                  setMoreMenu(false);
+                  pressSas();
+                }}
               >
-                {armed === item.action ? `${item.label} ${viewing.name}? ${item.warning} Click again.` : item.label}
+                Send Ctrl+Alt+Del
+                <span className="stage-menu-hint"> · or Ctrl+Alt+End on the screen</span>
               </button>
-            ))}
+            )}
+            {canPower &&
+              POWER_ITEMS.map((item) => (
+                <button
+                  key={item.action}
+                  type="button"
+                  role="menuitem"
+                  className={armed === item.action ? "armed" : undefined}
+                  onClick={() => choosePower(item.action)}
+                >
+                  {armed === item.action ? `${item.label} ${viewing.name}? ${item.warning} Click again.` : item.label}
+                </button>
+              ))}
           </div>
         )}
         <div

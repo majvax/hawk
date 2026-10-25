@@ -63,6 +63,8 @@ struct MachineForm {
     pin: String,
     code: String,
     policy: String,
+    files: bool,
+    shell: bool,
 }
 
 #[tauri::command(async)]
@@ -75,6 +77,8 @@ fn install_machine(app: AppHandle, form: MachineForm) -> Result<(), String> {
             pins,
             code: Some(form.code).filter(|code| !code.trim().is_empty()),
             policy: Some(form.policy),
+            files: Some(form.files),
+            shell: Some(form.shell),
             overrides: Overrides::default(),
             unsigned_from: None,
             wait: std::time::Duration::from_secs(90),

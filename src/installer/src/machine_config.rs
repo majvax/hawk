@@ -60,6 +60,18 @@ fn first_table<'a>(document: &'a DocumentMut, name: &str) -> Option<&'a Table> {
     document.get(name)?.as_array_of_tables()?.get(0)
 }
 
+/// Turns one of the features that are off by default ("files", "shell") on
+/// or off, keeping the rest of its table.
+pub fn set_enabled(document: &mut DocumentMut, feature: &str, on: bool) {
+    single_table(document, feature)["enabled"] = value(on);
+}
+
+/// Whether a feature is on; anything unclear reads as off, as the service
+/// reads it.
+pub fn enabled(document: &DocumentMut, feature: &str) -> bool {
+    first_table(document, feature).and_then(|table| table.get("enabled")).and_then(|item| item.as_bool()).unwrap_or(false)
+}
+
 /// Sets what was chosen; leaves what wasn't as it is.
 pub fn set_update(document: &mut DocumentMut, settings: &UpdateSettings) {
     let table = single_table(document, "update");
@@ -140,6 +152,19 @@ mod tests {
     fn new_config_parses() {
         let document = parse(NEW_CONFIG).unwrap();
         assert!(document.get("clipboard").is_some_and(Item::is_array_of_tables));
+        assert!(!enabled(&document, "files") && !enabled(&document, "shell"));
+    }
+
+    #[test]
+    fn features_turn_on_in_place() {
+        let mut document = parse(NEW_CONFIG).unwrap();
+        set_enabled(&mut document, "shell", true);
+        set_enabled(&mut document, "files", false);
+        let text = document.to_string();
+        assert_eq!(text.matches("[[shell]]").count(), 1);
+        assert!(text.contains("command = \"powershell.exe -NoLogo\""), "the rest of the table kept");
+        let reread = parse(&text).unwrap();
+        assert!(enabled(&reread, "shell") && !enabled(&reread, "files"));
     }
 
     #[test]

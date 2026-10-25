@@ -3,7 +3,7 @@
 // happens. The rules and their evaluation are alerts.ts and useAlerts.ts.
 import { type FormEvent, type JSX, useEffect, useRef, useState } from "react";
 
-import { ALERT_LABEL, type AlertKind, type Thresholds, anyEnabled } from "../alerts.js";
+import { ALERT_KINDS, ALERT_LABEL, type AlertKind, type Thresholds, anyEnabled } from "../alerts.js";
 import type { Machine } from "../protocol.js";
 import type { AlertToast, Alerts } from "../useAlerts.js";
 import { Corners, Tag } from "../ui.js";
@@ -115,6 +115,10 @@ export function AlertsDialog({
 
   const rule = <K extends keyof Thresholds>(kind: K, patch: Partial<Thresholds[K]>): void =>
     setDraft((previous) => ({ ...previous, [kind]: { ...previous[kind], ...patch } }));
+
+  const allOff = (): void => {
+    for (const kind of ALERT_KINDS) rule(kind, { enabled: false });
+  };
 
   const toggle = (kind: keyof Thresholds, label: string, disabled = false): JSX.Element => (
     <label className="check">
@@ -238,10 +242,14 @@ export function AlertsDialog({
         </div>
         <div className="form-row tight">
           <button type="submit" className="btn btn-primary">
-            {anyEnabled(draft) ? "Save" : "Save, all off"}
+            Save
           </button>
           <button type="button" className="btn btn-ghost" onClick={onClose}>
             Cancel
+          </button>
+          {/* Unchecks every rule; Save is still what keeps it. */}
+          <button type="button" className="btn btn-ghost" disabled={!anyEnabled(draft)} onClick={allOff}>
+            Turn all off
           </button>
         </div>
       </form>

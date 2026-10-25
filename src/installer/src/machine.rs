@@ -708,6 +708,10 @@ pub struct InstallOptions {
     pub pins: Vec<String>,
     pub code: Option<String>,
     pub policy: Option<String>,
+    /// File transfer and the shell, on or off; None keeps what the config
+    /// says (off on a new machine).
+    pub files: Option<bool>,
+    pub shell: Option<bool>,
     pub overrides: Overrides,
     /// Development builds only: install these binaries, unchecked.
     pub unsigned_from: Option<PathBuf>,
@@ -788,8 +792,19 @@ pub fn install(options: InstallOptions, report: &Report) -> Result<(), String> {
         update.public_key = Some(options.overrides.public_key.clone());
     }
     machine_config::set_update(&mut config, &update);
+    for (feature, on) in [("files", options.files), ("shell", options.shell)] {
+        if let Some(on) = on {
+            machine_config::set_enabled(&mut config, feature, on);
+        }
+    }
     write_atomically(&config_path(), &config.to_string())?;
     report.detail(format!("Relay: {}", relay.socket_url()));
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    report.detail(format!(
+        "File transfer {}, shell {}",
+        on_off(machine_config::enabled(&config, "files")),
+        on_off(machine_config::enabled(&config, "shell"))
+    ));
     if !pins.is_empty() {
         write_atomically(&data_dir().join("relay-pins.txt"), &(pins.join("\n") + "\n"))?;
         report.detail(format!("Pinned the relay's key ({} pin{})", pins.len(), if pins.len() == 1 { "" } else { "s" }));
@@ -1077,6 +1092,8 @@ pub struct Summary {
     pub status: Option<ServiceStatus>,
     pub relay: Option<String>,
     pub update_policy: Option<String>,
+    pub files: bool,
+    pub shell: bool,
 }
 
 pub fn summary() -> Summary {
@@ -1088,6 +1105,8 @@ pub fn summary() -> Summary {
         status: service_status(),
         relay: config.as_ref().and_then(machine_config::relay_url),
         update_policy: config.as_ref().map(|config| machine_config::update_settings(config).policy.unwrap_or("notify".into())),
+        files: config.as_ref().is_some_and(|config| machine_config::enabled(config, "files")),
+        shell: config.as_ref().is_some_and(|config| machine_config::enabled(config, "shell")),
     }
 }
 

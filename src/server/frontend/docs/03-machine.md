@@ -66,6 +66,8 @@ hawk-setup install machine --relay relay.example.com --pin wqsPIpg8...xW0= --cod
 | `--pin` | The relay's TLS key pin. Repeat it to also accept the next key ahead of a change. Without one the machine checks only the certificate, which has to be from a CA it trusts. |
 | `--code` | The one-time code. Needed the first time, or to enroll again after removing the machine. |
 | `--updates` | `notify` (default), `auto` or `off`. See [Updates](/docs/updates). |
+| `--files` | `on` or `off`: file transfer into and out of one folder. Off on a new machine; left out, a repair keeps what's set. |
+| `--shell` | `on` or `off`: a shell for dev and owner shares. Off on a new machine; left out, a repair keeps what's set. |
 | `--quiet` | Print only warnings and errors. |
 
 Run it again with a different `--relay` or `--pin` to change them; the

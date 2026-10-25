@@ -1127,17 +1127,36 @@ select {
   display: flex;
   align-items: center;
   gap: 7px;
+  flex: none;
   padding: 0 10px;
   border-right: 1px solid var(--line);
 }
 
-.stage-bar > .spacer {
-  flex: 1;
-  border-right: 0;
+/* The telemetry gives way first: the buttons after it never shrink, so
+   Full screen stays in reach however narrow the stage gets. */
+.stage-bar > .stage-bar-info {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  gap: 0;
   padding: 0;
+  border-right: 0;
 }
 
-.stage-bar > .spacer + * {
+.stage-bar-info > * {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  padding: 0 10px;
+  border-right: 1px solid var(--line);
+}
+
+.stage-bar-info > .v {
+  flex: 0 1 auto;
+}
+
+.stage-bar > .stage-bar-info + * {
   border-left: 1px solid var(--line);
 }
 
@@ -1157,7 +1176,7 @@ select {
   text-transform: uppercase;
 }
 
-.stage-bar > span:first-child:not(.live) {
+.stage-bar .idle {
   font-family: var(--sans);
   font-size: 10px;
   font-weight: 600;
@@ -1585,6 +1604,9 @@ select {
   display: flex;
   flex-direction: column;
   min-width: 260px;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 36px);
+  overflow-y: auto;
   border: 1px solid var(--line-strong);
   background: var(--rail);
 }

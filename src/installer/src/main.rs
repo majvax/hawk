@@ -105,6 +105,14 @@ enum InstallPart {
         /// What the machine may do about updates on its own.
         #[arg(long, value_enum)]
         updates: Option<Policy>,
+        /// Sending files to and from one folder. Off on a new machine; a
+        /// repair keeps what's set.
+        #[arg(long, value_enum)]
+        files: Option<Switch>,
+        /// A shell for dev and owner shares, as the signed-in user. Off on a
+        /// new machine; a repair keeps what's set.
+        #[arg(long, value_enum)]
+        shell: Option<Switch>,
         /// Seconds to watch the service connect and enroll.
         #[arg(long, default_value_t = 60)]
         wait: u64,
@@ -179,6 +187,18 @@ impl Policy {
             Self::Notify => "notify",
             Self::Auto => "auto",
         }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl Switch {
+    fn is_on(self) -> bool {
+        matches!(self, Self::On)
     }
 }
 
@@ -269,12 +289,14 @@ fn unsupported(what: &str) -> String {
 fn install(part: InstallPart, report: &Report) -> Result<(), String> {
     match part {
         #[cfg(windows)]
-        InstallPart::Machine { relay, pins, code, updates, wait, unsigned_from, source } => machine::install(
+        InstallPart::Machine { relay, pins, code, updates, files, shell, wait, unsigned_from, source } => machine::install(
             machine::InstallOptions {
                 relay,
                 pins,
                 code,
                 policy: updates.map(|policy| policy.as_str().to_owned()),
+                files: files.map(Switch::is_on),
+                shell: shell.map(Switch::is_on),
                 overrides: source.overrides(),
                 unsigned_from,
                 wait: std::time::Duration::from_secs(wait),
@@ -388,6 +410,8 @@ fn status(json: bool) -> Result<(), String> {
             }
             println!("  relay     {}", machine.relay.as_deref().unwrap_or("not set"));
             println!("  updates   {}", machine.update_policy.as_deref().unwrap_or("notify"));
+            println!("  files     {}", if machine.files { "on" } else { "off" });
+            println!("  shell     {}", if machine.shell { "on" } else { "off" });
         } else if let Some(service) = &machine.service {
             println!("  service   {service}, registered by an earlier install (install-service.ps1)");
             println!("            run hawk-setup install machine --relay <address> to take it over");

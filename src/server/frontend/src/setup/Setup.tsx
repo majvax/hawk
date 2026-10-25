@@ -25,6 +25,8 @@ interface Status {
     status: ServiceStatus | null;
     relay: string | null;
     update_policy: string | null;
+    files: boolean;
+    shell: boolean;
   };
   status_text: string | null;
   app: string | null;
@@ -248,7 +250,7 @@ function Home({
           )}
           {checkError !== null && <Alert>{checkError}</Alert>}
           <button type="button" className="btn btn-block" onClick={onSetUp}>
-            Change relay or enroll again
+            Change relay, features or enroll again
           </button>
           <div className="setup-remove">
             <label className="check">
@@ -315,6 +317,8 @@ interface Form {
   pin: string;
   code: string;
   policy: Policy;
+  files: boolean;
+  shell: boolean;
 }
 
 function MachineForm({
@@ -331,6 +335,9 @@ function MachineForm({
     pin: "",
     code: "",
     policy: (status.machine.update_policy as Policy | null) ?? "notify",
+    // What the config says now: off on a new machine.
+    files: status.machine.files,
+    shell: status.machine.shell,
   });
   const [checks, setChecks] = useState<Check[] | null>(null);
   const [checking, setChecking] = useState(false);
@@ -362,7 +369,7 @@ function MachineForm({
   return (
     <form className="auth-panel setup-panel" onSubmit={check}>
       <Corners />
-      <h1>{status.machine.installed ? "Relay and enrollment" : "Set up this PC"}</h1>
+      <h1>{status.machine.installed ? "Relay, features and enrollment" : "Set up this PC"}</h1>
       <label className="field">
         <span className="label">Relay address</span>
         <input
@@ -400,6 +407,22 @@ function MachineForm({
         <span className="label">Updates</span>
         <Segmented label="Updates" options={POLICIES} value={form.policy} onChange={(policy) => set({ policy })} />
         <span className="field-hint">{POLICY_HINT[form.policy]}</span>
+      </div>
+      <div className="field">
+        <span className="label">Features</span>
+        <label className="check">
+          <input type="checkbox" checked={form.files} onChange={(e) => set({ files: e.target.checked })} />
+          File transfer
+        </label>
+        <span className="field-hint">Sending files to and from one folder (Downloads\Hawk).</span>
+        <label className="check">
+          <input type="checkbox" checked={form.shell} onChange={(e) => set({ shell: e.target.checked })} />
+          Shell
+        </label>
+        <span className="field-hint">A PowerShell for dev and owner shares, as the signed-in user.</span>
+        <span className="field-hint">
+          Only from this PC, never from the dashboard: change them later by opening this setup again.
+        </span>
       </div>
       {checks !== null && (
         <ul className="setup-checks">

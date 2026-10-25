@@ -189,6 +189,14 @@ Each release's section becomes its release notes (see
   (older Firefox) shows the picture to save or copy by hand; one that won't
   hand them over still sends one with `Ctrl+V` on the screen. Older machines
   and dashboards stay text-only.
+- **A shorter stream bar.** Clipboard, power, Ctrl+Alt+Del, sound sync and
+  output device, quality and the stats overlay are under one **More** menu;
+  sound and full screen stay on the bar, and the telemetry gives way first
+  when it's narrow, so full screen is always in reach.
+- **Alerts:** Save only saves; **Turn all off** is its own button.
+- **File transfer and the shell are asked at install**, in the setup window
+  and as `hawk-setup install machine --files on|off --shell on|off` (a
+  repair without them keeps what's set). `hawk-setup status` shows both.
 - Protocol version 11.
 
 ## 1.0.0
