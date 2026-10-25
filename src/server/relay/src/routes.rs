@@ -24,6 +24,7 @@ use crate::auth::{self, CurrentUser};
 use crate::db::{self, EnrollmentOwner, MachineAuth};
 use crate::e2e;
 use crate::error::ApiError;
+use crate::metrics::{METRICS, Peer};
 use crate::protocol::{
     DashboardCommand, DashboardEvent, DeviceCommand, DeviceMessage, MAX_SEALED_CLIPBOARD_IMAGE_LEN,
     MAX_SEALED_CLIPBOARD_IMAGE_REPLY_LEN, MAX_SEALED_CLIPBOARD_IMAGE_REQUEST_LEN, MAX_SEALED_CLIPBOARD_LEN, MAX_SEALED_FILE_LEN,
@@ -295,6 +296,7 @@ async fn handle_device(socket: WebSocket, state: AppState, peer: SocketAddr) {
             match message {
                 DeviceOutbound::Command(command) => {
                     let Ok(json) = serde_json::to_string(&command) else { continue };
+                    METRICS.sent(Peer::Machine, json.len());
                     if sink.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
@@ -311,8 +313,12 @@ async fn handle_device(socket: WebSocket, state: AppState, peer: SocketAddr) {
     let mut image_reply_budgets = HashMap::new();
     while let Some(Ok(message)) = stream.next().await {
         match message {
-            Message::Binary(frame) => state.registry.forward_frame(&machine_id, frame),
+            Message::Binary(frame) => {
+                METRICS.received(Peer::Machine, frame.len());
+                state.registry.forward_frame(&machine_id, frame);
+            }
             Message::Text(text) => {
+                METRICS.received(Peer::Machine, text.len());
                 match serde_json::from_str::<DeviceMessage>(&text) {
                     Ok(DeviceMessage::UpdateStatus { available }) => {
                         let available = available.map(|version| version.chars().take(32).collect());
@@ -550,6 +556,10 @@ async fn handle_dashboard(
                         let _ = sink.send(close(1008, "session ended")).await;
                         break;
                     }
+                    Outbound::GoingAway => {
+                        let _ = sink.send(close(1001, "relay shutting down")).await;
+                        break;
+                    }
                 },
                 Some(frame) = frame_rx.recv() => Message::Binary(frame),
                 // Last: file data and shell output fill whatever the
@@ -560,6 +570,7 @@ async fn handle_dashboard(
                 },
                 else => break,
             };
+            METRICS.sent(Peer::Dashboard, message_len(&message));
             if sink.send(message).await.is_err() {
                 break;
             }
@@ -587,6 +598,7 @@ async fn handle_dashboard(
             Message::Close(_) => break,
             _ => continue, // dashboards only send JSON control messages
         };
+        METRICS.received(Peer::Dashboard, text.len());
         match serde_json::from_str::<DashboardCommand>(&text) {
             Ok(DashboardCommand::StartView { device_id, join }) => {
                 if join.decode().is_none() || !registry.start_view(dashboard_id, &device_id, join) {
@@ -808,6 +820,15 @@ impl Budget {
         }
         self.tokens -= cost;
         true
+    }
+}
+
+/// What a message carries, for the byte counters.
+fn message_len(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) => bytes.len(),
+        _ => 0,
     }
 }
 

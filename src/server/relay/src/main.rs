@@ -4,10 +4,13 @@
 mod api;
 mod audit;
 mod auth;
+mod backup;
 mod db;
 mod error;
+mod healthcheck;
 mod machines;
 mod mail;
+mod metrics;
 mod mfa;
 mod passkeys;
 mod protocol;
@@ -20,10 +23,11 @@ mod totp;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -32,15 +36,17 @@ use base64::Engine;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::audit::AuditLog;
 use crate::auth::{AccountLimiter, AllowedOrigins, LoginLimiter};
+use crate::backup::BackupConfig;
 use crate::db::Db;
 use crate::mail::Mailer;
+use crate::metrics::MetricsConfig;
 use crate::mfa::LoginTickets;
 use crate::passkeys::{PasskeyConfig, Passkeys};
 use crate::registry::Registry;
@@ -97,6 +103,10 @@ struct Config {
     /// relay's own address is known (see crate::passkeys::PasskeyConfig).
     webauthn_rp_id: Option<String>,
     webauthn_origins: Option<String>,
+    /// `HAWK_METRICS_TOKEN` and `HAWK_METRICS_ADDR`; off when neither is set.
+    metrics: MetricsConfig,
+    /// `HAWK_BACKUP_DIR` and the rest; None when backups are off.
+    backup: Option<BackupConfig>,
 }
 
 impl Config {
@@ -124,6 +134,15 @@ impl Config {
             audit_retention_days: audit::retention_days(std::env::var("HAWK_AUDIT_RETENTION_DAYS").ok().as_deref())?,
             webauthn_rp_id: std::env::var("HAWK_WEBAUTHN_RP_ID").ok(),
             webauthn_origins: std::env::var("HAWK_WEBAUTHN_ORIGINS").ok(),
+            metrics: MetricsConfig::parse(
+                std::env::var("HAWK_METRICS_TOKEN").ok().as_deref(),
+                std::env::var("HAWK_METRICS_ADDR").ok().as_deref(),
+            )?,
+            backup: BackupConfig::parse(
+                std::env::var("HAWK_BACKUP_DIR").ok().as_deref(),
+                std::env::var("HAWK_BACKUP_INTERVAL").ok().as_deref(),
+                std::env::var("HAWK_BACKUP_KEEP").ok().as_deref(),
+            )?,
         })
     }
 }
@@ -215,6 +234,28 @@ async fn healthz(State(state): State<AppState>) -> StatusCode {
     }
 }
 
+/// Set once the relay has been told to stop: it's draining, and a load
+/// balancer should send new clients elsewhere.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize)]
+struct Readiness {
+    status: &'static str,
+}
+
+/// Readiness: what /healthz checks, and that the relay isn't stopping. A
+/// body a person can read, and still nothing about its users, machines or
+/// release.
+async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Readiness>) {
+    if SHUTTING_DOWN.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(Readiness { status: "stopping" }));
+    }
+    match state.db.call(|conn| conn.query_row("SELECT 1", [], |_| Ok(()))).await {
+        Ok(()) => (StatusCode::OK, Json(Readiness { status: "ok" })),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(Readiness { status: "unavailable" })),
+    }
+}
+
 #[derive(Serialize)]
 struct VersionInfo {
     /// What dashboards and machines speak. A dashboard compares it with its
@@ -248,9 +289,21 @@ async fn main() -> Result<(), String> {
         .init();
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    if std::env::args().nth(1).as_deref() == Some("--version") {
-        println!("hawk-relay {} (protocol {})", env!("CARGO_PKG_VERSION"), protocol::PROTOCOL_VERSION);
-        return Ok(());
+    match std::env::args().nth(1).as_deref() {
+        Some("--version") => {
+            println!("hawk-relay {} (protocol {})", env!("CARGO_PKG_VERSION"), protocol::PROTOCOL_VERSION);
+            return Ok(());
+        }
+        Some("healthcheck") => {
+            let config = Config::from_env()?;
+            let tls = (config.tls_cert.exists() && config.tls_key.exists()).then_some(config.tls_cert.as_path());
+            if let Err(error) = healthcheck::check(config.addr, tls) {
+                eprintln!("unhealthy: {error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        _ => {}
     }
     info!(version = env!("CARGO_PKG_VERSION"), protocol = protocol::PROTOCOL_VERSION, "hawk relay starting");
 
@@ -309,7 +362,7 @@ async fn main() -> Result<(), String> {
     let (view_ended, view_ended_rx) = mpsc::unbounded_channel();
     let (audit, audit_rx) = AuditLog::new(audit::QUEUE_LEN);
     let audit = Arc::new(audit);
-    audit::spawn_writer(&audit, db.clone(), audit_rx);
+    let audit_writer = audit::spawn_writer(&audit, db.clone(), audit_rx);
     match config.audit_retention_days {
         0 => info!("audit events are kept forever"),
         days => info!("audit events are kept for {days} days"),
@@ -333,12 +386,46 @@ async fn main() -> Result<(), String> {
     spawn_cleanup(state.clone(), config.audit_retention_days);
     machines::spawn_share_clock(state.clone());
     machines::spawn_single_view_watch(state.clone(), view_ended_rx);
+    match &config.backup {
+        Some(backup) => {
+            let hours = backup.interval.as_secs() / 3600;
+            info!(dir = %backup.dir.display(), hours, keep = backup.keep, "scheduled backups are on");
+            backup::spawn(backup.clone(), config.db_path.clone());
+        }
+        None => info!("scheduled backups are off (set HAWK_BACKUP_DIR)"),
+    }
+
+    // Told to stop, every listener stops taking connections and drains.
+    let (stop, stopping) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = stop.send(true);
+    });
+    let metrics_config = Arc::new(config.metrics.clone());
+    if let Some(addr) = metrics_config.addr {
+        if !addr.ip().is_loopback() && !metrics_config.has_token() {
+            warn!(%addr, "metrics are served beyond this host without HAWK_METRICS_TOKEN");
+        }
+        let listener =
+            tokio::net::TcpListener::bind(addr).await.map_err(|error| format!("HAWK_METRICS_ADDR {addr}: {error}"))?;
+        info!("metrics at http://{addr}/metrics");
+        let metrics_app = Router::new().route("/metrics", metrics_route(&metrics_config)).with_state(state.clone());
+        let stop = stopped(stopping.clone());
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, metrics_app).with_graceful_shutdown(stop).await {
+                error!(%error, "the metrics listener failed");
+            }
+        });
+    } else if metrics_config.enabled() {
+        info!("metrics at /metrics, for requests with HAWK_METRICS_TOKEN as a bearer token");
+    }
 
     let frontend = ServeDir::new(&config.frontend_dist)
         .fallback(ServeFile::new(config.frontend_dist.join("index.html")));
     let cors = cors_layer(&config.allowed_origins);
-    let app = Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/api/version", get(version))
         .route("/api/session", get(api::session))
         .route("/api/login", post(api::login))
@@ -380,17 +467,33 @@ async fn main() -> Result<(), String> {
         .route("/api/machines/{id}/shares", get(machines::list_shares).put(machines::share))
         .route("/api/machines/{id}/shares/{user_id}", delete(machines::unshare))
         .route("/v1/ws", get(routes::device_socket))
-        .route("/v1/dashboard", get(routes::dashboard_socket))
+        .route("/v1/dashboard", get(routes::dashboard_socket));
+    // On the relay's own port only when it has no listener of its own.
+    if metrics_config.enabled() && metrics_config.addr.is_none() {
+        router = router.route("/metrics", metrics_route(&metrics_config));
+    }
+    let app = router
         .fallback_service(frontend)
+        .layer(axum::middleware::from_fn(metrics::track))
         .layer(cors)
-        .with_state(state)
+        .with_state(state.clone())
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    match tls {
+    // Alongside the drain: once a request has become a WebSocket, the
+    // server no longer waits for it, so the sockets are closed apart.
+    let sockets = tokio::spawn(close_sockets(state.clone(), stopped(stopping.clone())));
+    let served = match tls {
         Some(tls) => {
             info!("relay listening at https://{}", config.addr);
             let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
-            axum_server::bind_rustls(config.addr, tls).serve(app).await.map_err(|error| error.to_string())
+            let handle = axum_server::Handle::new();
+            let draining = handle.clone();
+            let stop = stopped(stopping.clone());
+            tokio::spawn(async move {
+                stop.await;
+                draining.graceful_shutdown(Some(DRAIN_GRACE));
+            });
+            axum_server::bind_rustls(config.addr, tls).handle(handle).serve(app).await.map_err(|error| error.to_string())
         }
         None => {
             warn!(
@@ -399,7 +502,93 @@ async fn main() -> Result<(), String> {
             );
             info!("relay listening at http://{}", config.addr);
             let listener = tokio::net::TcpListener::bind(config.addr).await.map_err(|error| error.to_string())?;
-            axum::serve(listener, app).await.map_err(|error| error.to_string())
+            let serve = axum::serve(listener, app).with_graceful_shutdown(stopped(stopping.clone())).into_future();
+            let stop = stopped(stopping.clone());
+            tokio::select! {
+                served = serve => served.map_err(|error| error.to_string()),
+                () = async { stop.await; tokio::time::sleep(DRAIN_GRACE).await } => {
+                    warn!("requests still running after {}s, closing them", DRAIN_GRACE.as_secs());
+                    Ok(())
+                }
+            }
+        }
+    };
+    served?;
+
+    // Nothing new comes in now; what happened last goes in the log.
+    let _ = sockets.await;
+    if audit_writer.flush(AUDIT_FLUSH_GRACE).await {
+        info!("relay stopped");
+    } else {
+        warn!(queued = state.audit.queued(), "relay stopped before the audit log was written out");
+    }
+    // Exits here rather than returning: dropping the runtime would wait,
+    // without limit, for whatever still runs on the blocking pool (a
+    // database call the flush gave up on, a backup's VACUUM INTO), and run
+    // past the time the drain and flush are bounded to. A backup cut short
+    // leaves only its temporary file, which the next one deletes.
+    std::process::exit(0)
+}
+
+/// How long requests in flight get to finish once the relay is told to stop.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// How long open sockets get to close after they're asked to (alongside
+/// the drain).
+const SOCKET_GRACE: Duration = Duration::from_secs(2);
+/// How long the audit writer gets to write what's queued. With the drain,
+/// within the 10 seconds Docker gives before it kills a container.
+const AUDIT_FLUSH_GRACE: Duration = Duration::from_secs(3);
+
+/// SIGTERM or SIGINT on Unix; Ctrl+C on Windows.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(terminate) => terminate,
+            Err(error) => {
+                error!(%error, "can't listen for SIGTERM, only SIGINT");
+                let _ = tokio::signal::ctrl_c().await;
+                info!("SIGINT: stopping");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = terminate.recv() => info!("SIGTERM: stopping"),
+            _ = tokio::signal::ctrl_c() => info!("SIGINT: stopping"),
         }
     }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            error!(%error, "can't listen for Ctrl+C");
+            std::future::pending::<()>().await;
+        }
+        info!("Ctrl+C: stopping");
+    }
+}
+
+/// Resolves once the relay is told to stop.
+async fn stopped(mut stopping: watch::Receiver<bool>) {
+    let _ = stopping.wait_for(|stop| *stop).await;
+}
+
+/// Once told to stop: says so on /readyz, asks every machine and dashboard
+/// socket to close as going away, and gives them a moment to. Those that
+/// don't are forgotten, which ends their views in the audit log.
+async fn close_sockets(state: AppState, stop: impl Future<Output = ()>) {
+    stop.await;
+    SHUTTING_DOWN.store(true, Ordering::Relaxed);
+    state.registry.close_all();
+    let deadline = tokio::time::Instant::now() + SOCKET_GRACE;
+    while !state.registry.is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    state.registry.drop_all();
+}
+
+/// `GET /metrics`, behind the token if there is one.
+fn metrics_route(config: &Arc<MetricsConfig>) -> axum::routing::MethodRouter<AppState> {
+    let config = Arc::clone(config);
+    get(move |state: State<AppState>, headers: HeaderMap| metrics::serve(state, Arc::clone(&config), headers))
 }

@@ -1,0 +1,22 @@
+# The image (see Dockerfile) needs the Cargo workspace's manifests, the
+# relay's source and the dashboard's. Nothing else goes to the builder:
+# no build output, no node_modules, no local database, certificates or keys.
+*
+!Cargo.toml
+!Cargo.lock
+!src/update
+!src/installer
+!src/app
+!src/server/relay
+!src/server/package.json
+!src/server/bun.lock
+!src/server/frontend
+
+**/target
+**/node_modules
+**/dist
+**/dist-*
+**/gen
+**/*.pem
+**/*.key
+**/*.db

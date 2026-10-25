@@ -10,6 +10,8 @@
 //! Recording never waits. Events go into a bounded queue that one task
 //! writes to the database in batches; when the queue is full the event is
 //! dropped and counted, rather than holding up a login or the registry.
+//! When the relay stops, the writer is given a moment to write what's still
+//! queued (see [`AuditWriter::flush`]).
 //!
 //! Who reads what: everyone sees what they did and what was done to their
 //! account; a machine's owner also sees everything done on it, by anyone;
@@ -19,13 +21,15 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::AppState;
@@ -33,6 +37,7 @@ use crate::api;
 use crate::auth::{self, AdminUser, CurrentUser};
 use crate::db::{self, AuditFilter, Db, FactorKind, MachineRow, Role, SessionOrigin};
 use crate::error::ApiError;
+use crate::metrics::METRICS;
 
 /// Events waiting for the writer before new ones are dropped: minutes of
 /// a busy relay's worth, and a few hundred KB at most.
@@ -340,6 +345,7 @@ impl AuditLog {
     /// Queues the event without waiting. A full queue drops it: counted,
     /// and said in the log, less often the more there are.
     pub fn record(&self, event: Event) {
+        METRICS.audit_event(event.kind);
         match self.queue.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(event)) => {
@@ -358,16 +364,59 @@ impl AuditLog {
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    /// Events waiting for the writer.
+    pub fn queued(&self) -> usize {
+        self.queue.max_capacity() - self.queue.capacity()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.queue.max_capacity()
+    }
+}
+
+/// The writer task, for [`AuditWriter::flush`] when the relay stops.
+pub struct AuditWriter {
+    task: JoinHandle<()>,
+    stop: oneshot::Sender<()>,
+}
+
+impl AuditWriter {
+    /// Closes the queue and waits up to `limit` for the writer to write
+    /// what was already in it. Events recorded after this are dropped
+    /// quietly. False when the time ran out first: what was left is lost.
+    pub async fn flush(self, limit: Duration) -> bool {
+        let _ = self.stop.send(());
+        tokio::time::timeout(limit, self.task).await.is_ok()
+    }
 }
 
 /// Writes queued events to the database, as many as are waiting (up to a
 /// batch) per transaction. A batch that fails is lost, and counted as
 /// dropped.
-pub fn spawn_writer(log: &AuditLog, db: Db, mut events: mpsc::Receiver<Event>) {
+pub fn spawn_writer(log: &AuditLog, db: Db, mut events: mpsc::Receiver<Event>) -> AuditWriter {
     let dropped = Arc::clone(&log.dropped);
-    tokio::spawn(async move {
+    let (stop, mut stopping) = oneshot::channel();
+    let task = tokio::spawn(async move {
         let mut batch = Vec::with_capacity(BATCH_LEN);
-        while events.recv_many(&mut batch, BATCH_LEN).await > 0 {
+        let mut listening = true;
+        loop {
+            let received = tokio::select! {
+                received = events.recv_many(&mut batch, BATCH_LEN) => received,
+                // Told to stop: nothing more gets in, and the loop goes on
+                // until what's queued is written. A writer whose handle was
+                // dropped instead just carries on.
+                stop = &mut stopping, if listening => {
+                    listening = false;
+                    if stop.is_ok() {
+                        events.close();
+                    }
+                    continue;
+                }
+            };
+            if received == 0 {
+                break; // closed, and everything in it written
+            }
             let written = std::mem::take(&mut batch);
             let count = written.len();
             if let Err(error) = db.call(move |conn| db::insert_audit_events(conn, &written)).await {
@@ -376,6 +425,7 @@ pub fn spawn_writer(log: &AuditLog, db: Db, mut events: mpsc::Receiver<Event>) {
             }
         }
     });
+    AuditWriter { task, stop }
 }
 
 /// `HAWK_AUDIT_RETENTION_DAYS`: how many days events are kept, 0 for
@@ -488,6 +538,11 @@ fn nonzero(bytes: u64) -> Option<u64> {
 impl ViewLog {
     pub fn new(context: ViewContext) -> Self {
         Self { context, accepted_at: None, shell: false, files: false, clipboard_image: false, traffic: Traffic::default() }
+    }
+
+    /// The role the view was opened with.
+    pub fn role(&self) -> Role {
+        self.context.role
     }
 
     /// The machine accepted the viewer: the view starts, once.
@@ -1465,6 +1520,68 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(written.iter().map(|row| row.user_id).collect::<Vec<_>>(), [Some(2)]);
+    }
+
+    async fn stored_count(db: &Db) -> usize {
+        let count: i64 =
+            db.call(|conn| conn.query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))).await.unwrap();
+        usize::try_from(count).unwrap()
+    }
+
+    /// Stopping writes everything already queued, batches of it, before the
+    /// writer ends; what's recorded after is dropped quietly, not counted.
+    #[tokio::test]
+    async fn stopping_writes_what_is_queued() {
+        let db = Db::open_in_memory();
+        let (log, events) = AuditLog::new(QUEUE_LEN);
+        let queued = BATCH_LEN * 2 + 17;
+        for user in 0..queued {
+            log.record(Event::new(Kind::SignIn).by(user as i64));
+        }
+        assert_eq!(log.queued(), queued);
+        let writer = spawn_writer(&log, db.clone(), events);
+        assert!(writer.flush(std::time::Duration::from_secs(10)).await);
+        assert_eq!(stored_count(&db).await, queued);
+        assert_eq!(log.queued(), 0);
+        log.record(Event::new(Kind::SignIn).by(1));
+        assert_eq!((log.dropped(), stored_count(&db).await), (0, queued));
+
+        // A writer that's never stopped (its handle dropped) keeps going.
+        let (log, events) = AuditLog::new(8);
+        drop(spawn_writer(&log, db.clone(), events));
+        log.record(Event::new(Kind::SignIn).by(1));
+        for _ in 0..100 {
+            if stored_count(&db).await == queued + 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stored_count(&db).await, queued + 1);
+    }
+
+    /// A database that doesn't answer can't hold the relay up: the flush
+    /// gives up at its limit.
+    #[tokio::test]
+    async fn a_stuck_database_bounds_the_flush() {
+        let db = Db::open_in_memory();
+        let busy = db.clone();
+        let (held, holding) = oneshot::channel();
+        let stuck = tokio::spawn(async move {
+            busy.call(move |_| {
+                let _ = held.send(());
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                Ok(())
+            })
+            .await
+        });
+        holding.await.unwrap();
+        let (log, events) = AuditLog::new(8);
+        log.record(Event::new(Kind::SignIn).by(1));
+        let writer = spawn_writer(&log, db.clone(), events);
+        let started = std::time::Instant::now();
+        assert!(!writer.flush(std::time::Duration::from_millis(50)).await);
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+        stuck.await.unwrap().unwrap();
     }
 
     /// The Client extractor over a real server, the way main serves the

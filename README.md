@@ -194,7 +194,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [x] Remote power actions (lock, sign out, restart, shut down), reboot-and-reconnect, remote sign-in at the sign-in screen
 - [x] Ctrl+Alt+Del from the live view (`SendSAS` from the service), including at a sign-in screen that asks for it
 - [ ] Wake-on-LAN via a LAN peer, sleep and hibernate
-- [ ] Relay operations: container image, health endpoints, metrics, backups
+- [x] Relay operations: container image, health endpoints, metrics, scheduled backups, graceful shutdown
+- [ ] Relay operations follow-ups: structured JSON logs, ACME built in, reverse-proxy recipes
 - [ ] Trusted devices (remember a browser after MFA)
 - [x] Separately hosted dashboard: bearer-token sessions, `HAWK_ALLOWED_ORIGINS` (CORS + socket `Origin` allow-list), relay address entered in the browser, protocol version in the handshake
 - [x] Relay installer (Linux): `systemd` service, Let's Encrypt or self-signed TLS with a stable pinned key, frontend modes, first admin
@@ -736,11 +737,19 @@ needs a restart, or it's off.
   unwakeable on many NICs, so the docs say to disable it or to use
   hibernate instead.
 
-### Relay operations
+### Relay operations (built, except structured logs, ACME and proxy recipes)
 
 Running the relay on a VPS should be a documented path, not an exercise.
 It's one binary and one SQLite file, which makes this mostly packaging and
 visibility.
+
+Built: a distroless image (`Dockerfile`, `compose.yaml`) with
+`hawk-relay healthcheck` as its HEALTHCHECK; `/healthz` and `/readyz`
+(database answers, not stopping); `/metrics` behind a bearer token or on a
+listener of its own, with fixed-set labels only; scheduled `VACUUM INTO`
+backups with retention; and a graceful shutdown that drains requests,
+closes sockets as going away and writes out the audit queue. See
+`src/server/frontend/docs/02-relay.md`. The plan as it was:
 
 * **Container image and compose file.** Multi-stage build (cargo release +
   `bun run build`) onto a slim base, running as a non-root user with a

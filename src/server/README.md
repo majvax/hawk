@@ -64,11 +64,48 @@ origins that may sign in with bearer tokens: the desktop app and any
 separately hosted dashboard, comma separated), `HAWK_WEBAUTHN_RP_ID` and
 `HAWK_WEBAUTHN_ORIGINS` (where passkeys work; see "Passkeys" below),
 `HAWK_AUDIT_RETENTION_DAYS` (how many days the audit log keeps events,
-default 90, `0` for forever; pruned hourly), and `HAWK_SERVER_ROOT` (the
-directory the default paths are relative to; defaults to this directory).
-`RUST_LOG` controls log verbosity. `/healthz` answers 204 while the relay
-and its database are up, and `/api/version` gives the protocol version
-(not the release) to dashboards before they sign in.
+default 90, `0` for forever; pruned hourly), `HAWK_BACKUP_DIR`,
+`HAWK_BACKUP_INTERVAL` and `HAWK_BACKUP_KEEP` (scheduled backups, below),
+`HAWK_METRICS_TOKEN` and `HAWK_METRICS_ADDR` (metrics, below), and
+`HAWK_SERVER_ROOT` (the directory the default paths are relative to;
+defaults to this directory). `RUST_LOG` controls log verbosity.
+`/healthz` answers 204 while the relay and its database are up,
+`/readyz` 200 (`{"status":"ok"}`) while it's also not stopping, and
+`/api/version` gives the protocol version (not the release) to dashboards
+before they sign in.
+
+### Operations
+
+| Variable | Default | |
+|---|---|---|
+| `HAWK_BACKUP_DIR` | unset: off | Scheduled backups of the database go here (`backup.rs`). |
+| `HAWK_BACKUP_INTERVAL` | `24` | Hours between them. After a restart the next is due an interval after the newest there. |
+| `HAWK_BACKUP_KEEP` | `7` | The newest this many are kept, older ones deleted. |
+| `HAWK_METRICS_TOKEN` | unset | `/metrics` on the relay's port, for `Authorization: Bearer <token>` (16+ characters; compared as SHA-256 digests, in full). |
+| `HAWK_METRICS_ADDR` | unset | `/metrics` on a plain-HTTP listener of its own instead (e.g. `127.0.0.1:9100`), and not on the relay's port; asks for the token too if one is set. |
+
+- **Backups** are `VACUUM INTO` from a connection of their own on the
+  blocking pool (a WAL read transaction: writers aren't held up), into
+  `.hawk-<stamp>.db.tmp` created `0600` (its folder `0700` if the relay
+  makes it), then `PRAGMA quick_check`, fsync, and a rename to
+  `hawk-<stamp>.db`. They contain password hashes, sealed TOTP seeds and
+  session hashes: treat them like the database. `secret.key` isn't in
+  them.
+- **Metrics** (`metrics.rs`) are written by hand in the text format, from
+  process-wide atomics and the registry's counts at scrape time. Labels
+  come from fixed sets only (role, route template, status class), so
+  nothing identifying is exposed and the series stay bounded. Sign-in
+  counters are taken from the audit events as they're recorded.
+- **Shutdown** on SIGTERM/SIGINT (Ctrl+C on Windows): listeners stop
+  accepting and drain for up to 5 s, `/readyz` turns 503, every machine
+  and dashboard socket is closed with 1001 (2 s for them to go, then
+  they're dropped, ending their views in the audit log), and the audit
+  writer gets 3 s to write what's queued (`AuditWriter::flush`). Exit 0.
+- **Container:** `Dockerfile`, `.dockerignore` and `compose.yaml` at the
+  repository's root (the Cargo workspace is the build context). The image
+  is distroless and runs as uid 65532; `hawk-relay healthcheck` is its
+  HEALTHCHECK, asking `/healthz` over TLS pinned to the relay's own
+  certificate's key when there is one.
 
 **Back up the secret key with the database.** The relay creates
 `secret.key` (32 random bytes, readable by its owner only) on first start

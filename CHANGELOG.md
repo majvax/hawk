@@ -5,6 +5,27 @@ Each release's section becomes its release notes (see
 
 ## Unreleased
 
+- **Relay operations.** The relay is easier to run and to watch.
+  **Scheduled backups:** set `HAWK_BACKUP_DIR` and it backs the database
+  up there every `HAWK_BACKUP_INTERVAL` hours (24), keeping the newest
+  `HAWK_BACKUP_KEEP` (7): consistent copies taken while it runs (`VACUUM
+  INTO`, without holding anyone up), checked before they get their final
+  name, readable by the relay's user only on Linux. They hold password
+  hashes and the encrypted two-factor secrets, so treat them like the
+  database; the secret key isn't in them. **Metrics:** Prometheus
+  `/metrics`, off by default, behind `HAWK_METRICS_TOKEN` (a bearer token)
+  or on a listener of its own with `HAWK_METRICS_ADDR`: machines,
+  dashboards and views connected, bytes each way, dropped frames,
+  requests by route and status, sign-ins, wrong second factors, throttled
+  requests, the activity log's queue, the database's size and the
+  backups. Nothing in them names an account, a machine or an address.
+  **`/readyz`** beside `/healthz`, which is unchanged. **Graceful
+  shutdown:** on `SIGTERM` or Ctrl+C the relay drains requests, closes
+  machine and dashboard connections as "going away" (both reconnect by
+  themselves), writes out the activity log's queue and exits cleanly, all
+  within 10 seconds. **Container:** a `Dockerfile` (distroless, non-root,
+  with a health check by `hawk-relay healthcheck`) and an example
+  `compose.yaml`.
 - **Passkeys as a second factor.** Security keys (YubiKey, Titan),
   Windows Hello, Touch ID and phones, beside authenticator apps: add one or
   more in **Settings → Two-factor authentication**, name them, remove them

@@ -85,6 +85,34 @@ The other computer browses to `https://192.168.1.150:8080`. It warns about
 the certificate until `certs/dev-cert.pem` is imported into its trusted
 roots.
 
+## Run it in a container
+
+The repository's `Dockerfile` builds the dashboard and the relay into one
+small image (distroless: no shell, no package manager), running as a
+non-root user (uid 65532). From the repository's root:
+
+```sh
+docker build -t hawk-relay .
+```
+
+Or start from `compose.yaml` there: set `PUBLIC_URL`, put the
+certificate and key in `./tls`, and `docker compose up -d --build`. The
+link to create the admin account is in `docker compose logs relay`.
+
+| In the image | |
+|---|---|
+| Port | `8443` (`PORT`); map it to 443 on the host. |
+| `/var/lib/hawk` | Volume: the database and `secret.key`. |
+| `/var/lib/hawk-backups` | Where compose points `HAWK_BACKUP_DIR`, on a volume of its own. |
+| `/etc/hawk/tls/cert.pem`, `key.pem` | Mount them read-only. Without them the relay serves plain HTTP, for a proxy in front that terminates TLS. |
+| Health check | `hawk-relay healthcheck`, which asks the relay for `/healthz`. |
+
+Every [environment variable](#environment-variables) works as usual;
+`HOST`, `PORT`, `FRONTEND_DIST`, `HAWK_DB_PATH` and the TLS paths are set
+to the paths above. Files you mount (the TLS key, a bind-mounted data
+folder) must be readable, or writable for data, by uid 65532. The root
+filesystem can be read-only (compose does that) with a tmpfs on `/tmp`.
+
 ## Environment variables
 
 | Variable | Default | What it sets |
@@ -103,6 +131,11 @@ roots.
 | `HAWK_WEBAUTHN_RP_ID` | the host of `PUBLIC_URL` | The domain passkeys are bound to; `off` turns them off. See [Passkeys](#passkeys). |
 | `HAWK_WEBAUTHN_ORIGINS` | `PUBLIC_URL`, and the `HAWK_ALLOWED_ORIGINS` on the RP ID | The pages that may use passkeys, comma separated. |
 | `HAWK_AUDIT_RETENTION_DAYS` | `90` | How many days the activity log keeps events. `0` keeps them forever. Older ones are deleted hourly. |
+| `HAWK_BACKUP_DIR` | none (off) | Where to write scheduled backups of the database. See [Backups](#backups). |
+| `HAWK_BACKUP_INTERVAL` | `24` | Hours between backups. |
+| `HAWK_BACKUP_KEEP` | `7` | How many backups to keep; older ones are deleted. |
+| `HAWK_METRICS_TOKEN` | none | Turns on `/metrics` for requests with `Authorization: Bearer <token>`. At least 16 characters. See [Metrics](#metrics). |
+| `HAWK_METRICS_ADDR` | none | Serves `/metrics` on a listener of its own instead, e.g. `127.0.0.1:9100`, plain HTTP. With a token as well, it asks for it there. |
 | `HAWK_SERVER_ROOT` | `src/server` | The directory the default paths above are relative to. |
 | `RUST_LOG` | `info` | Log detail, e.g. `debug`. |
 
@@ -193,7 +226,7 @@ Mail is sent in the background. If it doesn't arrive, look for
 
 ## Backups
 
-Back up these two files together, ideally with the relay stopped:
+What to keep:
 
 - **The database** (`data/hawk.db`): accounts, machines, shares, sessions.
 - **The secret key** (`data/secret.key`): 32 random bytes the relay makes
@@ -205,6 +238,92 @@ account, and everyone sets it up again.
 
 Keep the TLS key too. A new key means a new pin, and every machine
 refuses it until you update the pin on it.
+
+### Scheduled backups
+
+Set `HAWK_BACKUP_DIR` and the relay backs the database up there itself,
+every `HAWK_BACKUP_INTERVAL` hours (24 by default), keeping the newest
+`HAWK_BACKUP_KEEP` (7). Each is a consistent copy taken while the relay
+runs (SQLite's `VACUUM INTO`, which doesn't hold up sign-ins or views),
+named for when it was taken, e.g. `hawk-20261025T081500Z.db`. It's
+written under a temporary name, checked, and only then renamed, so a
+file with that name is always a whole database. After a restart the next
+one is due an interval after the newest there is. Each one, and each
+failure, is in the log (`backup:`) and in the [metrics](#metrics).
+
+**A backup is as sensitive as the database.** It holds password hashes,
+the encrypted two-factor secrets and session hashes. The relay makes the
+files readable by its own user only (`0600`, in a folder it creates as
+`0700`), on Linux. Copy them somewhere else (another disk, another
+machine) with the same care; a folder beside the database doesn't
+survive losing the disk. The secret key isn't in them: keep it apart,
+and keep it.
+
+To restore: stop the relay, replace the database with a backup (and
+delete any `hawk.db-wal` and `hawk.db-shm` beside it), start the relay.
+What changed since that backup is gone: sessions and invites made since
+don't exist any more, and machines enrolled since have to enroll again.
+
+## Health checks and metrics
+
+- **`GET /healthz`** answers `204` while the relay and its database are
+  up, `503` otherwise. No body. For liveness checks and the updater.
+- **`GET /readyz`** answers `200` with `{"status":"ok"}` when the relay
+  can take clients, and `503` when it can't, including while it's
+  stopping. For a load balancer.
+
+Neither needs a sign-in, and neither says anything about the relay's
+accounts, machines or release.
+
+### Metrics
+
+`GET /metrics`, in Prometheus' text format, is off unless asked for.
+Either:
+
+- **`HAWK_METRICS_TOKEN`** alone: on the relay's own port, for requests
+  that send `Authorization: Bearer <token>` (anything else gets `401`).
+  Use a long random token, at least 16 characters.
+- **`HAWK_METRICS_ADDR`**: on a listener of its own, e.g.
+  `127.0.0.1:9100`, plain HTTP, and not on the relay's port at all. With
+  `HAWK_METRICS_TOKEN` as well, the token is asked for there too. The
+  relay warns if it's on an address other machines can reach without one.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: hawk-relay
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+    # With HAWK_METRICS_TOKEN:
+    # authorization:
+    #   credentials: "<the token>"
+```
+
+| Metric | |
+|---|---|
+| `hawk_relay_build_info` | The release and protocol, as labels. |
+| `hawk_relay_machines_connected`, `hawk_relay_dashboards_connected` | Connected now. |
+| `hawk_relay_views{role}` | Views open now, by the viewer's role. |
+| `hawk_relay_bytes_total{peer,direction}` | Bytes over machine and dashboard sockets, `in` and `out`. |
+| `hawk_relay_frames_dropped_total` | Video frames dropped for viewers that fell behind. |
+| `hawk_relay_http_requests_total{route,class}` | Requests by route template (`/api/invites/{token}`, never the token) and `2xx`… `5xx`. |
+| `hawk_relay_logins_total{result}`, `hawk_relay_mfa_failures_total` | Sign-ins that worked and failed; wrong second factors. |
+| `hawk_relay_rate_limited_total` | Requests refused by the sign-in throttles. |
+| `hawk_relay_audit_queue_depth`, `hawk_relay_audit_events_dropped_total` | The activity log's queue, and events it lost. |
+| `hawk_relay_db_size_bytes` | The database's size. |
+| `hawk_relay_backup_last_success_timestamp_seconds`, `hawk_relay_backups_total`, `hawk_relay_backup_failures_total` | With scheduled backups on. The timestamp starts from the newest backup already there, so it survives a restart. |
+
+No metric names an account, a machine or an address.
+
+## Stopping
+
+On `SIGTERM` or `SIGINT` (Ctrl+C on Windows) the relay stops taking
+connections and `/readyz` turns to `503`; requests in flight get up to 5
+seconds to finish; machines and dashboards are disconnected as "going
+away", and reconnect by themselves once it's back (machines at once,
+dashboards on their usual backoff); the activity log writes out what's
+queued (up to 3 seconds). Then it exits with `0`, within the 10 seconds
+Docker and systemd give before they kill a process.
 
 ## Behind a reverse proxy
 

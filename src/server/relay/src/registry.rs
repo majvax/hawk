@@ -19,6 +19,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::audit::{AuditLog, Client, Event, Kind, Use, ViewContext, ViewLog};
 use crate::auth::{self, STEP_UP_WINDOW};
 use crate::db::{MachineRow, Role, Signed};
+use crate::metrics::{self, METRICS};
 use crate::protocol::{
     AUDIO_DEVICES_PROTOCOL, CONFIG_PROTOCOL, DashboardEvent, DeviceCommand, IMAGE_CLIPBOARD_PROTOCOL, MachineView,
     PING_PROTOCOL, POWER_PROTOCOL, QUALITY_PROTOCOL, SAS_PROTOCOL, SignedView, TEXT_INPUT_PROTOCOL, is_audio, is_keyframe, timestamp_us,
@@ -33,6 +34,9 @@ pub enum Outbound {
     /// The session behind this dashboard ended (logout, account disabled):
     /// close the socket.
     Close,
+    /// The relay is stopping: close the socket as going away, and the
+    /// dashboard reconnects on its usual backoff.
+    GoingAway,
 }
 
 /// What the relay pushes to a device's socket task.
@@ -458,6 +462,9 @@ impl Registry {
             }
             let dropped = viewer.frames.try_send(frame.clone()).is_err();
             viewer.awaiting_keyframe = dropped;
+            if dropped {
+                METRICS.frame_dropped();
+            }
             if auto {
                 let waiting = viewer.frames.max_capacity() - viewer.frames.capacity();
                 device.stream.meter.queue(waiting, dropped);
@@ -1128,6 +1135,55 @@ impl Registry {
         inner.publish(machine_id);
     }
 
+    // ---- operations -------------------------------------------------------
+
+    /// What's connected, for the metrics: counts only.
+    pub fn counts(&self) -> metrics::Live {
+        let inner = self.lock();
+        let mut live = metrics::Live {
+            machines: inner.devices.len(),
+            dashboards: inner.dashboards.len(),
+            ..metrics::Live::default()
+        };
+        for viewer in inner.devices.values().flat_map(|device| device.viewers.values()) {
+            live.add_view(viewer.log.role());
+        }
+        live
+    }
+
+    /// The relay is stopping: asks every socket to close, as going away.
+    /// Each one's task then cleans up as it would on any disconnect.
+    /// Machines reconnect straight away, dashboards on their backoff.
+    pub fn close_all(&self) {
+        let inner = self.lock();
+        for device in inner.devices.values() {
+            let _ = device.outbound.send(DeviceOutbound::Close(1001, "relay shutting down"));
+        }
+        for dashboard in inner.dashboards.values() {
+            let _ = dashboard.handle.events.send(Outbound::GoingAway);
+        }
+    }
+
+    /// Whether every socket is gone.
+    pub fn is_empty(&self) -> bool {
+        let inner = self.lock();
+        inner.devices.is_empty() && inner.dashboards.is_empty()
+    }
+
+    /// Forgets the sockets that didn't close in time, ending their views
+    /// in the audit log as a disconnect would.
+    pub fn drop_all(&self) {
+        let mut inner = self.lock();
+        let dashboards: Vec<DashboardId> = inner.dashboards.keys().copied().collect();
+        for id in dashboards {
+            inner.remove_dashboard(id);
+        }
+        let devices: Vec<String> = inner.devices.keys().cloned().collect();
+        for machine_id in devices {
+            inner.drop_device(&machine_id);
+        }
+    }
+
     /// The machine was deleted: disconnect it and take it away from everyone.
     pub fn remove_machine(&self, machine_id: &str) {
         let mut inner = self.lock();
@@ -1227,6 +1283,31 @@ mod tests {
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::StartCapture { .. })));
         assert!(matches!(next(&mut device_rx), Some(DeviceCommand::ViewerJoin { .. })));
         (registry, dashboard, device_rx, events_rx)
+    }
+
+    /// The counts the metrics see; stopping asks every socket to go away
+    /// as such (never 1008, which a machine takes as a refusal), and what
+    /// stays is forgotten.
+    #[test]
+    fn counts_and_closes_everything_for_shutdown() {
+        let (registry, _dashboard, mut device_rx, mut events) = watching(Role::Control);
+        let (idle, _idle_events) = handle(3);
+        registry.add_dashboard(idle, Vec::new());
+        let live = registry.counts();
+        assert_eq!((live.machines, live.dashboards, live.views), (1, 2, [0, 1, 0, 0]));
+
+        registry.close_all();
+        assert!(matches!(device_rx.try_recv(), Ok(DeviceOutbound::Close(1001, _))));
+        let mut going_away = false;
+        while let Ok(outbound) = events.try_recv() {
+            assert!(!matches!(outbound, Outbound::Close), "a logout's close");
+            going_away |= matches!(outbound, Outbound::GoingAway);
+        }
+        assert!(going_away);
+        assert!(!registry.is_empty(), "the sockets close themselves");
+        registry.drop_all();
+        assert!(registry.is_empty());
+        assert_eq!(registry.counts(), metrics::Live::default());
     }
 
     #[test]
@@ -1615,7 +1696,7 @@ mod tests {
         registry.answer(MACHINE, dashboard, Answer::Pong { nonce: "1".to_owned() });
         let event = events.try_recv().ok().and_then(|outbound| match outbound {
             Outbound::Event(event) => Some(*event),
-            Outbound::Close => None,
+            Outbound::Close | Outbound::GoingAway => None,
         });
         assert!(matches!(event, Some(DashboardEvent::Pong { nonce, .. }) if nonce == "1"));
         registry.stop_view(dashboard, MACHINE);

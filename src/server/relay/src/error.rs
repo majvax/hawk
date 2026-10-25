@@ -48,6 +48,7 @@ impl IntoResponse for ApiError {
             Self::NotFound => (StatusCode::NOT_FOUND, json!({ "error": "not found" })),
             Self::Conflict(message) => (StatusCode::CONFLICT, json!({ "error": message })),
             Self::TooManyRequests => {
+                crate::metrics::METRICS.rate_limited();
                 (StatusCode::TOO_MANY_REQUESTS, json!({ "error": "too many attempts, try again later" }))
             }
             Self::StepUpRequired => (

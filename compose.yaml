@@ -1,0 +1,43 @@
+# An example: the relay in a container, with its database and backups on
+# volumes of their own. Copy it, set PUBLIC_URL, put the TLS certificate
+# and key in ./tls (cert.pem, key.pem, readable by uid 65532), then:
+#
+#   docker compose up -d --build
+#   docker compose logs relay    # the link to create the admin account
+#
+# See "Run it in a container" in src/server/frontend/docs/02-relay.md.
+services:
+  relay:
+    build: .
+    image: hawk-relay
+    restart: unless-stopped
+    ports:
+      - "443:8443"
+      # Metrics, for a Prometheus on this host only (see below).
+      # - "127.0.0.1:9100:9100"
+    environment:
+      PUBLIC_URL: https://relay.example.com
+      HAWK_BACKUP_DIR: /var/lib/hawk-backups
+      HAWK_BACKUP_INTERVAL: "24"   # hours
+      HAWK_BACKUP_KEEP: "7"
+      # Metrics on a port of their own, with a token. Inside the container
+      # it has to listen on every interface for the port mapping to reach it.
+      # HAWK_METRICS_ADDR: 0.0.0.0:9100
+      # HAWK_METRICS_TOKEN: ${HAWK_METRICS_TOKEN:?set a long random token}
+    volumes:
+      - hawk-data:/var/lib/hawk
+      - hawk-backups:/var/lib/hawk-backups
+      - ./tls:/etc/hawk/tls:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Drain, close sockets, write out the audit log; well within this.
+    stop_grace_period: 15s
+
+volumes:
+  hawk-data:
+  hawk-backups:
