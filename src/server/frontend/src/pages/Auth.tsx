@@ -1,7 +1,7 @@
 import { type FormEvent, type JSX, type ReactNode, useEffect, useState } from "react";
 
 import { ApiError, type InviteInfo, type User, getInvite, verifyEmail } from "../api.js";
-import { type Entered, type Identity, logIn, logOut, signUp, unlock } from "../keys.js";
+import { type Entered, type Identity, type LoginStep, logIn, logOut, signUp, unlock } from "../keys.js";
 import {
   STANDALONE,
   checkRelayProtocol,
@@ -13,7 +13,7 @@ import {
   rememberedRelays,
   useRelay,
 } from "../relay.js";
-import { CodeField } from "../stepUp.js";
+import { CodeField, PasskeyElsewhere, PasskeyOption } from "../stepUp.js";
 import { Alert, Corners, Logo } from "../ui.js";
 
 const MIN_PASSWORD_LENGTH = 10; // mirrors auth::MIN_PASSWORD_LEN
@@ -67,8 +67,8 @@ export function LoginPage({ onLogin }: { onLogin: (entered: Entered) => void }):
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  // Set once the password was right and a code is still needed.
-  const [finish, setFinish] = useState<((code: string) => Promise<Entered>) | null>(null);
+  // Set once the password was right and a second factor is still needed.
+  const [second, setSecond] = useState<SecondFactor | null>(null);
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
@@ -77,7 +77,7 @@ export function LoginPage({ onLogin }: { onLogin: (entered: Entered) => void }):
     try {
       const step = await logIn(email, password);
       if (step.kind === "entered") onLogin(step.entered);
-      else setFinish(() => step.finish);
+      else setSecond(step);
     } catch (caught) {
       setError(caught instanceof ApiError && caught.status === 403 ? "this account is disabled" : errorMessage(caught));
     } finally {
@@ -85,14 +85,14 @@ export function LoginPage({ onLogin }: { onLogin: (entered: Entered) => void }):
     }
   };
 
-  if (finish !== null) {
+  if (second !== null) {
     return (
       <SecondStep
         email={email}
-        finish={finish}
+        step={second}
         onLogin={onLogin}
         onRestart={() => {
-          setFinish(null);
+          setSecond(null);
           setPassword("");
         }}
       />
@@ -251,47 +251,69 @@ export function RelayPage(): JSX.Element {
   );
 }
 
-// The password was right; the account has a second factor too.
+type SecondFactor = Extract<LoginStep, { kind: "code" }>;
+
+// The password was right; the account has a second factor too. A passkey,
+// when it has one this page can use, is offered first.
 function SecondStep({
   email,
-  finish,
+  step,
   onLogin,
   onRestart,
 }: {
   email: string;
-  finish: (code: string) => Promise<Entered>;
+  step: SecondFactor;
   onLogin: (entered: Entered) => void;
   onRestart: () => void;
 }): JSX.Element {
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const { withPasskey } = step;
+
+  const failed = (caught: unknown): string =>
+    caught instanceof ApiError && caught.status === 403 ? "this account is disabled" : errorMessage(caught);
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      onLogin(await finish(code));
+      onLogin(await step.finish(code));
     } catch (caught) {
-      setError(caught instanceof ApiError && caught.status === 403 ? "this account is disabled" : errorMessage(caught));
+      setError(failed(caught));
       setBusy(false);
     }
   };
 
+  const usePasskey = async (): Promise<void> => {
+    if (withPasskey === null) return;
+    try {
+      onLogin(await withPasskey());
+    } catch (caught) {
+      if (caught instanceof ApiError) throw new Error(failed(caught));
+      throw caught;
+    }
+  };
+
   return (
-    <AuthFrame title="Two-factor code" onSubmit={(e) => void submit(e)}>
+    <AuthFrame title="Second factor" onSubmit={(e) => void submit(e)}>
       <p className="prose">
-        Signing in as <span className="mono">{email}</span>. Enter the code your authenticator app shows for this
-        server.
+        Signing in as <span className="mono">{email}</span>.{" "}
+        {withPasskey !== null
+          ? "Use your passkey, or enter the code your authenticator app shows for this server."
+          : "Enter the code your authenticator app shows for this server."}
       </p>
+      {withPasskey !== null && <PasskeyOption onUse={usePasskey} />}
+      {step.passkeyElsewhere && <PasskeyElsewhere />}
       <CodeField
         value={code}
         onChange={setCode}
         hint="Lost your phone? Enter one of the recovery codes you saved instead."
+        autoFocus={withPasskey === null}
       />
       {error !== null && <Alert>{error}</Alert>}
-      <button type="submit" className="btn btn-primary btn-block" disabled={busy}>
+      <button type="submit" className={withPasskey !== null ? "btn btn-block" : "btn btn-primary btn-block"} disabled={busy}>
         {busy ? "Checking…" : "Sign in"}
       </button>
       <button type="button" className="btn btn-ghost btn-block" onClick={onRestart}>

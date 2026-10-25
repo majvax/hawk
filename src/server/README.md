@@ -61,9 +61,10 @@ Configuration is by environment variable: `HOST` (default `127.0.0.1`),
 the dashboard at, used in links the relay logs and emails), `HAWK_SMTP_URL`
 and `HAWK_MAIL_FROM` (see "Email" below), `HAWK_ALLOWED_ORIGINS` (other
 origins that may sign in with bearer tokens: the desktop app and any
-separately hosted dashboard, comma separated), `HAWK_AUDIT_RETENTION_DAYS`
-(how many days the audit log keeps events, default 90, `0` for forever;
-pruned hourly), and `HAWK_SERVER_ROOT` (the
+separately hosted dashboard, comma separated), `HAWK_WEBAUTHN_RP_ID` and
+`HAWK_WEBAUTHN_ORIGINS` (where passkeys work; see "Passkeys" below),
+`HAWK_AUDIT_RETENTION_DAYS` (how many days the audit log keeps events,
+default 90, `0` for forever; pruned hourly), and `HAWK_SERVER_ROOT` (the
 directory the default paths are relative to; defaults to this directory).
 `RUST_LOG` controls log verbosity. `/healthz` answers 204 while the relay
 and its database are up, and `/api/version` gives the protocol version
@@ -120,20 +121,44 @@ Accounts are invite-only; there is no open sign-up.
   right before anything is stored. An account can have up to 8, and any of
   them signs in, so losing one phone isn't a lockout. Each factor remembers
   the last time step it accepted, so a code can't be used twice.
-- **Recovery codes:** the first authenticator comes with 10 single-use
-  codes (80 random bits each), shown once. Only their SHA-256 is stored.
+- **Passkeys (WebAuthn):** security keys, platform authenticators (Windows
+  Hello, Touch ID, Android) and synced passkeys (`passkeys.rs`): a factor
+  on top of the password, user verification preferred (and required from
+  then on of a passkey that did it at registration), no attestation (only
+  "none" or self-attestation is taken). The checks are the relay's own, in
+  pure Rust: client data (type, challenge, origin, not cross-origin),
+  authenticator data (RP ID hash, user present, backup flags, sign
+  counter) and the signature, ES256, EdDSA or RS256, with `ring`; CBOR is
+  read strictly (no trailing bytes, no indefinite lengths, small and
+  shallow). They share the authenticators' table (`mfa_factors`, kind
+  `passkey`: credential id, a JSON record with the COSE public key, its
+  algorithm and flags, the sign counter in `last_counter`, transports),
+  the limit of 8, the rules for adding and removing, and the
+  admin's reset. Each challenge lives server side, in memory, for 2
+  minutes, is spent by its first answer, and belongs to one account and to
+  one session (adding one, stepping up) or one login ticket. A sign counter
+  that goes backwards is refused and logged as a possibly copied key;
+  synced passkeys, which count 0, aren't affected. No passwordless sign-in:
+  a passkey answers where a code would.
+- **Recovery codes:** the first factor (an authenticator or a passkey)
+  comes with 10 single-use codes (80 random bits each), shown once. Only
+  their SHA-256 is stored.
   Settings can replace the whole set. Signing in with one sends a notice.
 - **Login** takes two steps for an account with a factor: the password
-  gets a ticket (in memory, 5 minutes, 5 tries), and a code trades it for
-  the session. Wrong codes count against the client IP and against the
-  account (10 per 15 minutes wherever they come from).
+  gets a ticket (in memory, 5 minutes, 5 tries), and a code, or a passkey's
+  answer to a challenge for that ticket (`POST /api/login/mfa/passkey`),
+  trades it for the session. Wrong codes and refused passkey answers count
+  against the client IP and against the account (10 per 15 minutes
+  wherever they come from), and against the ticket's tries.
 - **Step-up:** some actions need a factor proved in the last 5 minutes,
   checked by the relay on each request: enrolling, renaming, endorsing and
   removing a machine, sharing and unsharing, changing the password, adding
   and removing factors, new recovery codes, and every change in the Admin
   tab (reading it doesn't). A refused request answers 403 with
-  `"stepUp": true`; the dashboard asks for a code (`POST
-  /api/account/step-up`) and tries again. Signing in with a code counts as
+  `"stepUp": true`; the dashboard asks for a passkey (offered first, when
+  the account has one this page can use) or a code (`POST
+  /api/account/step-up`, after `/api/account/step-up/passkey` for a
+  passkey's challenge) and tries again. Signing in with either counts as
   stepping up.
 - **Control, files and shells** need the same over the dashboard socket.
   The relay can't read sealed messages, so it gates whole channels: a view
@@ -143,15 +168,50 @@ Accounts are invite-only; there is no open sign-up.
   affected), and the dashboard shows **Confirm to control**.
 - **Adding or removing a factor** ends every other session. The first
   factor is confirmed with the password, later ones by stepping up, so a
-  stolen session can't quietly add its own.
+  stolen session can't quietly add its own. A passkey is added in two
+  steps: `POST /api/account/mfa/passkey/setup` (the password or the
+  step-up is checked here) gives the challenge, and
+  `POST /api/account/mfa/passkey` registers what the browser made.
 - **Admin:** the Users table shows who has two-factor on. **Reset
   two-factor** removes every factor and recovery code of an account that
   lost them all, and signs it out. **Require two-factor** (only once the
   admin has it) confines every account without a factor to setting one up
   after signing in, and keeps anyone from removing their last one.
+- **Audit:** `mfa_added` and `mfa_removed` say which kind of factor and
+  its name; `step_up`, `sign_in` and `mfa_failed` say whether it was a
+  passkey, a code or a recovery code.
 - Security notices (a factor added or removed, new recovery codes, a
   recovery-code sign-in, a password change, a reset by the admin) go to the
   account's email address when a mailer is configured.
+
+### Passkeys
+
+A passkey is bound to a relying party ID (a domain), and browsers only let
+pages on that domain or under it use it. The relay is told both:
+
+- `HAWK_WEBAUTHN_RP_ID`: default, the host of `PUBLIC_URL` (or of the
+  listen address). An IP address can't be one, so passkeys are off on a
+  relay without a domain; `off` turns them off anyway.
+- `HAWK_WEBAUTHN_ORIGINS`: the pages that may use them, comma separated.
+  Default: the relay's own origin and every `HAWK_ALLOWED_ORIGINS` entry
+  on the RP ID. Each has to be on the RP ID (or under it), and https, or
+  http on `localhost`; the relay refuses to start otherwise.
+
+A dashboard hosted elsewhere works when it shares a parent domain with the
+relay: `dash.example.com` and `relay.example.com` with
+`HAWK_WEBAUTHN_RP_ID=example.com`. One on an unrelated domain can only
+have them if the RP ID is its domain instead (then the relay-served one
+can't). The dashboard checks its own host against the RP ID and doesn't
+offer passkeys where they can't work. That includes the desktop app,
+whose page is at `tauri.localhost` (Windows) or `tauri://localhost`: no
+relay's passkeys can be bound there, so the app only offers codes.
+Changing the RP ID orphans every passkey made under the old one, and
+turning passkeys off (or losing the domain) leaves them unusable: the
+relay warns at start when passkeys are off with some registered, and an
+account whose only factors are passkeys then needs a recovery code (or
+the admin's reset). `HAWK_WEBAUTHN_RP_ID` must be a host name (letters,
+digits, hyphens, dot-separated, at least one dot unless `localhost`; no
+scheme, port, path or IP), or the relay refuses to start.
 
 ### Email
 

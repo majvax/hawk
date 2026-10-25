@@ -48,3 +48,13 @@ The relay is the one gate in front of your machines. Use a long password,
 [turn on two-factor](/docs/accounts#two-factor-authentication) and keep
 your recovery codes safe. Check **Settings → Sessions** now and then for
 browsers you don't recognize.
+
+Prefer a **passkey** to an authenticator app where you can. A code can be
+typed into a look-alike page and passed on within its 30 seconds; a
+passkey can't be: the browser binds it to this server's domain and signs
+the page's address into every answer, so a passkey used on a phishing page
+gives that page nothing it can use here. The relay keeps only its public
+key, so a copy of the database doesn't give it away either. It checks the
+key's signature counter too: a counter that goes backwards means a copied
+key, and is refused (passkeys synced between devices don't count, and
+aren't affected).

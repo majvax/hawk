@@ -71,5 +71,12 @@ describe("activity", () => {
       "wrong password",
     );
     expect(describeDetails(event({ kind: "machine_renamed", role: null, details: { name: "Study" } }))).toBe('to "Study"');
+    expect(describeDetails(event({ kind: "mfa_added", role: null, details: { factor: "passkey", name: "YubiKey" } }))).toBe(
+      'passkey · "YubiKey"',
+    );
+    expect(describeDetails(event({ kind: "step_up", role: null, details: { factor: "passkey" } }))).toBe("with a passkey");
+    expect(describeDetails(event({ kind: "sign_in", role: null, details: { recoveryCode: true } }))).toBe(
+      "with a recovery code",
+    );
   });
 });

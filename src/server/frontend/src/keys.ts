@@ -32,6 +32,7 @@ import {
   utf8,
 } from "./crypto.js";
 import { type StoredIdentity, forgetIdentity, loadIdentity, saveIdentity } from "./keystore.js";
+import { getPasskey, passkeysUsable } from "./webauthn.js";
 
 export type Identity = StoredIdentity;
 
@@ -104,11 +105,19 @@ async function upgrade(user: api.User, password: string): Promise<Identity> {
 export type Entered = { user: api.User; identity: Identity };
 
 // What a correct password leads to: in, or for an account with a second
-// factor, a code to enter first. `finish` keeps what the password unlocked
-// in memory until then.
+// factor, a code to enter first, or a passkey to use when the account has
+// one this page can ask for. Both keep what the password unlocked in memory
+// until then.
 export type LoginStep =
   | { kind: "entered"; entered: Entered }
-  | { kind: "code"; finish: (code: string) => Promise<Entered> };
+  | {
+      kind: "code";
+      finish: (code: string) => Promise<Entered>;
+      withPasskey: (() => Promise<Entered>) | null;
+      // The account has a passkey, but not one this page can use (the
+      // desktop app, a dashboard outside the relay's domain).
+      passkeyElsewhere: boolean;
+    };
 
 export async function logIn(email: string, password: string): Promise<LoginStep> {
   const params = await api.loginParams(email);
@@ -121,7 +130,19 @@ export async function logIn(email: string, password: string): Promise<LoginStep>
     }));
   const result = await api.login(email, stretched?.authKey ?? password);
   if (!("mfaRequired" in result)) return { kind: "entered", entered: await enter(result) };
-  return { kind: "code", finish: async (code) => enter(await api.loginMfa(result.ticket, code)) };
+  const { ticket, passkeyRpId } = result;
+  const usable = passkeysUsable(passkeyRpId);
+  return {
+    kind: "code",
+    finish: async (code) => enter(await api.loginMfa(ticket, { code })),
+    withPasskey: usable
+      ? async () => {
+          const passkey = await getPasskey(await api.loginPasskeyChallenge(ticket));
+          return enter(await api.loginMfa(ticket, { passkey }));
+        }
+      : null,
+    passkeyElsewhere: passkeyRpId !== null && !usable,
+  };
 }
 
 // The derived auth key, which is what confirms an action with the password

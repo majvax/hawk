@@ -9,6 +9,7 @@ mod error;
 mod machines;
 mod mail;
 mod mfa;
+mod passkeys;
 mod protocol;
 mod quality;
 mod registry;
@@ -41,6 +42,7 @@ use crate::auth::{AccountLimiter, AllowedOrigins, LoginLimiter};
 use crate::db::Db;
 use crate::mail::Mailer;
 use crate::mfa::LoginTickets;
+use crate::passkeys::{PasskeyConfig, Passkeys};
 use crate::registry::Registry;
 use crate::totp::SecretKey;
 
@@ -72,6 +74,8 @@ pub struct AppState {
     pub allowed_origins: Arc<AllowedOrigins>,
     /// Where security-relevant events are recorded (see crate::audit).
     pub audit: Arc<AuditLog>,
+    /// WebAuthn, when it's on, and the ceremonies waiting for an answer.
+    pub passkeys: Arc<Passkeys>,
 }
 
 struct Config {
@@ -89,6 +93,10 @@ struct Config {
     allowed_origins: AllowedOrigins,
     /// How many days audit events are kept; 0 for forever.
     audit_retention_days: u32,
+    /// `HAWK_WEBAUTHN_RP_ID` and `HAWK_WEBAUTHN_ORIGINS`, read once the
+    /// relay's own address is known (see crate::passkeys::PasskeyConfig).
+    webauthn_rp_id: Option<String>,
+    webauthn_origins: Option<String>,
 }
 
 impl Config {
@@ -114,6 +122,8 @@ impl Config {
             public_url: std::env::var("PUBLIC_URL").ok().map(|url| url.trim_end_matches('/').to_owned()),
             allowed_origins: AllowedOrigins::parse(&std::env::var("HAWK_ALLOWED_ORIGINS").unwrap_or_default())?,
             audit_retention_days: audit::retention_days(std::env::var("HAWK_AUDIT_RETENTION_DAYS").ok().as_deref())?,
+            webauthn_rp_id: std::env::var("HAWK_WEBAUTHN_RP_ID").ok(),
+            webauthn_origins: std::env::var("HAWK_WEBAUTHN_ORIGINS").ok(),
         })
     }
 }
@@ -160,6 +170,7 @@ fn spawn_cleanup(state: AppState, audit_retention_days: u32) {
             state.limiter.prune();
             state.mfa_limiter.prune();
             state.mfa_tickets.prune();
+            state.passkeys.prune();
         }
     });
 }
@@ -267,6 +278,33 @@ async fn main() -> Result<(), String> {
         warn!("PUBLIC_URL is not set: links in emails point at {base_url}");
     }
     let host = base_url.split_once("://").map_or(base_url.as_str(), |(_, host)| host);
+    let passkey_config = PasskeyConfig::parse(
+        &base_url,
+        &config.allowed_origins,
+        config.webauthn_rp_id.as_deref(),
+        config.webauthn_origins.as_deref(),
+    )?;
+    match &passkey_config {
+        Some(passkeys) => {
+            let origins: Vec<&str> = passkeys.origins.iter().map(|origin| origin.as_str()).collect();
+            info!(rp_id = %passkeys.rp_id, ?origins, "passkeys are on");
+        }
+        None => {
+            info!(
+                "passkeys are off: the relay's address has no domain name (set PUBLIC_URL), or HAWK_WEBAUTHN_RP_ID=off"
+            );
+            let registered = db.call(db::count_passkeys).await.map_err(|error| error.to_string())?;
+            if registered > 0 {
+                warn!(
+                    registered,
+                    "passkeys are off, but accounts have passkeys registered: those can't be used until they're \
+                     back on under the same RP ID, and an account whose only factors are passkeys has to sign in \
+                     with a recovery code (or have its second factor reset by an admin)"
+                );
+            }
+        }
+    }
+    let passkeys = Passkeys::new(passkey_config.as_ref());
 
     let (view_ended, view_ended_rx) = mpsc::unbounded_channel();
     let (audit, audit_rx) = AuditLog::new(audit::QUEUE_LEN);
@@ -290,6 +328,7 @@ async fn main() -> Result<(), String> {
         mailer: mailer.map(Arc::new),
         allowed_origins: Arc::new(config.allowed_origins.clone()),
         audit,
+        passkeys: Arc::new(passkeys),
     };
     spawn_cleanup(state.clone(), config.audit_retention_days);
     machines::spawn_share_clock(state.clone());
@@ -305,6 +344,7 @@ async fn main() -> Result<(), String> {
         .route("/api/login", post(api::login))
         .route("/api/login/params", post(api::login_params))
         .route("/api/login/mfa", post(api::login_mfa))
+        .route("/api/login/mfa/passkey", post(passkeys::login_start))
         .route("/api/logout", post(api::logout))
         .route("/api/signup", post(api::signup))
         .route("/api/invites/{token}", get(api::invite_info))
@@ -314,9 +354,12 @@ async fn main() -> Result<(), String> {
         .route("/api/account/verify-email", post(api::verify_email))
         .route("/api/account/verify-email/resend", post(api::resend_verification))
         .route("/api/account/step-up", post(mfa::step_up))
+        .route("/api/account/step-up/passkey", post(passkeys::step_up_start))
         .route("/api/account/mfa", get(mfa::list_factors))
         .route("/api/account/mfa/totp/setup", post(mfa::totp_setup))
         .route("/api/account/mfa/totp", post(mfa::add_totp))
+        .route("/api/account/mfa/passkey/setup", post(passkeys::register_start))
+        .route("/api/account/mfa/passkey", post(passkeys::register_finish))
         .route("/api/account/mfa/recovery-codes", post(mfa::regenerate_recovery_codes))
         .route("/api/account/mfa/{id}", delete(mfa::remove_factor))
         .route("/api/users/lookup", post(api::lookup_user_key))

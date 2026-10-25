@@ -2109,6 +2109,20 @@ select {
   min-width: 0;
 }
 
+/* Between a passkey and a code, wherever both answer. */
+.or-rule {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.or-rule::before,
+.or-rule::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--line);
+}
+
 .recovery-codes {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));

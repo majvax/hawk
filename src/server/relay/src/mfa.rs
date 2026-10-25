@@ -1,5 +1,7 @@
 //! Second factors: TOTP authenticators and recovery codes, the second step
-//! of a login, step-up, and the admin's reset and policy.
+//! of a login, step-up, and the admin's reset and policy. Passkeys are the
+//! other kind of factor (crate::passkeys): the same table, limits and
+//! rules, and accepted wherever a code is.
 //!
 //! An account can hold several authenticators, any of which satisfies a
 //! login, so losing one phone isn't a lockout; recovery codes are the last
@@ -20,19 +22,71 @@ use crate::AppState;
 use crate::api;
 use crate::audit::{Client, Details, Event, Kind};
 use crate::auth::{self, AdminUser, SessionUser, SteppedUp, SteppedUpAdmin};
-use crate::db::{self, NewTotp};
+use crate::db::{self, FactorKind, NewTotp};
 use crate::error::ApiError;
+use crate::passkeys::{self, Assertion, Ceremony};
 use crate::totp;
 
-const MAX_LABEL_LEN: usize = 64;
-/// More authenticators than anyone needs; keeps the per-login check cheap.
-const MAX_FACTORS: usize = 8;
+pub const MAX_LABEL_LEN: usize = 64;
+/// More factors than anyone needs; keeps the per-login check cheap.
+pub const MAX_FACTORS: usize = 8;
 
-/// Which kind of second factor a code turned out to be.
+/// Which kind of second factor an answer turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proof {
     Totp,
     RecoveryCode,
+    Passkey,
+}
+
+impl Proof {
+    /// How the audit log records it.
+    pub fn details(self) -> Details {
+        match self {
+            Self::Totp => Details { factor: Some(FactorKind::Totp), ..Details::default() },
+            Self::Passkey => Details { factor: Some(FactorKind::Passkey), ..Details::default() },
+            Self::RecoveryCode => Details { recovery_code: Some(true), ..Details::default() },
+        }
+    }
+}
+
+/// A second factor as sent: a code (from an app, or a recovery code), or a
+/// passkey's answer to the challenge crate::passkeys gave this session or
+/// login.
+#[derive(Deserialize)]
+pub struct Answer {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    passkey: Option<Box<Assertion>>,
+}
+
+impl Answer {
+    #[cfg(test)]
+    pub fn passkey(credential: Assertion) -> Self {
+        Self { code: None, passkey: Some(Box::new(credential)) }
+    }
+
+    /// What a failure is logged as.
+    pub fn details(&self) -> Details {
+        let factor = if self.passkey.is_some() { FactorKind::Passkey } else { FactorKind::Totp };
+        Details { factor: Some(factor), ..Details::default() }
+    }
+}
+
+/// Checks an answer: a passkey's against `ceremony`'s challenge, or a code.
+/// Ok(None): wrong.
+pub async fn check_answer(
+    state: &AppState,
+    user_id: i64,
+    ceremony: Ceremony,
+    answer: &Answer,
+) -> Result<Option<Proof>, ApiError> {
+    match (&answer.passkey, &answer.code) {
+        (Some(credential), _) => passkeys::check(state, user_id, ceremony, credential).await,
+        (None, Some(code)) => check_code(state, user_id, code).await,
+        (None, None) => Err(ApiError::bad_request("enter a code")),
+    }
 }
 
 /// Checks `code` against the account's authenticators, or failing that its
@@ -111,6 +165,14 @@ impl LoginTickets {
         token
     }
 
+    /// The account a live ticket is for, without counting a try: to ask its
+    /// passkey for an answer.
+    pub fn holder(&self, token: &str) -> Option<i64> {
+        let tickets = self.map();
+        let ticket = tickets.get(&auth::token_hash(token))?;
+        (ticket.issued.elapsed() < Self::TTL && ticket.tries < Self::MAX_TRIES).then_some(ticket.user_id)
+    }
+
     /// The account a live ticket is for, counting the try. A ticket that has
     /// had its tries is gone, and the password has to be entered again.
     pub fn attempt(&self, token: &str) -> Option<i64> {
@@ -136,16 +198,16 @@ impl LoginTickets {
     }
 }
 
-#[derive(Deserialize)]
-pub struct CodeRequest {
-    code: String,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SteppedUpView {
     /// Unix seconds when step-up actions will ask again.
     until: i64,
+}
+
+/// What a wrong answer is told.
+pub fn wrong_answer(answer: &Answer) -> ApiError {
+    ApiError::bad_request(if answer.passkey.is_some() { "that passkey wasn't accepted" } else { "that code isn't right" })
 }
 
 /// Proves a second factor for this session: step-up actions are allowed
@@ -154,19 +216,17 @@ pub async fn step_up(
     State(state): State<AppState>,
     client: Client,
     SessionUser(current): SessionUser,
-    Json(body): Json<CodeRequest>,
+    Json(body): Json<Answer>,
 ) -> Result<Json<SteppedUpView>, ApiError> {
     if !current.account.mfa {
         return Err(ApiError::bad_request("this account has no second factor"));
     }
-    let proof = check_code(&state, current.user.id, &body.code).await?;
+    let proof = check_answer(&state, current.user.id, Ceremony::StepUp(current.session_id), &body).await?;
     let Some(proof) = proof else {
-        state.audit.record(Event::new(Kind::MfaFailed).by(current.user.id).client(&client));
-        return Err(ApiError::bad_request("that code isn't right"));
+        state.audit.record(Event::new(Kind::MfaFailed).by(current.user.id).client(&client).details(body.details()));
+        return Err(wrong_answer(&body));
     };
-    let recovery_code = (proof == Proof::RecoveryCode).then_some(true);
-    let details = Details { recovery_code, ..Details::default() };
-    state.audit.record(Event::new(Kind::StepUp).by(current.user.id).client(&client).details(details));
+    state.audit.record(Event::new(Kind::StepUp).by(current.user.id).client(&client).details(proof.details()));
     let now = auth::now();
     let session_id = current.session_id;
     state.db.call(move |conn| db::set_step_up(conn, session_id, now)).await?;
@@ -181,6 +241,7 @@ pub async fn step_up(
 #[serde(rename_all = "camelCase")]
 pub struct FactorView {
     id: i64,
+    kind: FactorKind,
     label: String,
     created_at: i64,
     last_used_at: Option<i64>,
@@ -209,6 +270,7 @@ pub async fn list_factors(
             .into_iter()
             .map(|row| FactorView {
                 id: row.id,
+                kind: row.kind,
                 label: row.label,
                 created_at: row.created_at,
                 last_used_at: row.last_used_at,
@@ -252,9 +314,28 @@ pub struct AddTotp {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AddedTotp {
+pub struct AddedFactor {
     /// The first factor comes with recovery codes, shown this once.
     recovery_codes: Option<Vec<String>>,
+}
+
+impl AddedFactor {
+    pub fn new(recovery_codes: Option<Vec<String>>) -> Self {
+        Self { recovery_codes }
+    }
+
+    #[cfg(test)]
+    pub fn recovery_codes(&self) -> Option<&[String]> {
+        self.recovery_codes.as_deref()
+    }
+}
+
+/// For the first factor, a set of recovery codes and the hashes to store;
+/// nothing for later ones.
+pub fn first_recovery_codes(first: bool) -> (Option<Vec<String>>, Vec<Vec<u8>>) {
+    let codes = first.then(|| (0..totp::RECOVERY_CODES).map(|_| totp::new_recovery_code()).collect::<Vec<_>>());
+    let hashes = codes.iter().flatten().map(|code| auth::token_hash(&totp::normalize_recovery_code(code))).collect();
+    (codes, hashes)
 }
 
 /// Registers an authenticator once a code from it checks out. With a factor
@@ -266,7 +347,7 @@ pub async fn add_totp(
     client: Client,
     SessionUser(current): SessionUser,
     Json(body): Json<AddTotp>,
-) -> Result<Json<AddedTotp>, ApiError> {
+) -> Result<Json<AddedFactor>, ApiError> {
     let now = auth::now();
     let first = !current.account.mfa;
     if first {
@@ -288,15 +369,10 @@ pub async fn add_totp(
     };
 
     let user_id = current.user.id;
-    let recovery_codes = first.then(|| (0..totp::RECOVERY_CODES).map(|_| totp::new_recovery_code()).collect::<Vec<_>>());
-    let hashes: Vec<Vec<u8>> = recovery_codes
-        .iter()
-        .flatten()
-        .map(|code| auth::token_hash(&totp::normalize_recovery_code(code)))
-        .collect();
+    let (recovery_codes, hashes) = first_recovery_codes(first);
     let sealed = state.secret_key.seal(&seed, &totp::seed_context(user_id));
     let keep = current.session_id;
-    let added = Event::new(Kind::MfaAdded).by(user_id).client(&client).details(Details::name(label.clone()));
+    let added = Event::new(Kind::MfaAdded).by(user_id).client(&client).details(Details::factor(FactorKind::Totp, &label));
     state
         .db
         .call(move |conn| {
@@ -311,18 +387,18 @@ pub async fn add_totp(
         })
         .await?
         .then_some(())
-        .ok_or_else(|| ApiError::Conflict(format!("an account can have at most {MAX_FACTORS} authenticators")))?;
+        .ok_or_else(|| ApiError::Conflict(format!("an account can have at most {MAX_FACTORS} second factors")))?;
 
     state.registry.close_other_sessions(user_id, keep);
     state.registry.set_mfa(user_id, true);
     state.registry.note_step_up(keep, now);
     state.audit.record(added);
     notify(&state, &current.user.email, "An authenticator app was added to your account as a second factor.");
-    Ok(Json(AddedTotp { recovery_codes }))
+    Ok(Json(AddedFactor { recovery_codes }))
 }
 
-/// Removes an authenticator; a step-up action. The last one can't go while
-/// the admin requires a second factor. Every other session is ended.
+/// Removes an authenticator or a passkey; a step-up action. The last factor
+/// can't go while the admin requires one. Every other session is ended.
 pub async fn remove_factor(
     State(state): State<AppState>,
     client: Client,
@@ -335,19 +411,18 @@ pub async fn remove_factor(
     let outcome = state
         .db
         .call(move |conn| {
-            let factors = db::list_factors(conn, user_id)?;
-            if !factors.iter().any(|factor| factor.id == factor_id) {
-                return Ok(None);
-            }
+            let mut factors = db::list_factors(conn, user_id)?;
+            let Some(index) = factors.iter().position(|factor| factor.id == factor_id) else { return Ok(None) };
             if required && factors.len() == 1 {
                 return Ok(Some(Err(())));
             }
             db::delete_factor(conn, user_id, factor_id, keep)?;
-            Ok(Some(Ok(factors.len() - 1)))
+            let removed = factors.swap_remove(index);
+            Ok(Some(Ok((removed, factors.len()))))
         })
         .await?
         .ok_or(ApiError::NotFound)?;
-    let remaining = outcome.map_err(|()| {
+    let (removed, remaining) = outcome.map_err(|()| {
         ApiError::Conflict("this server requires a second factor: add another before removing this one".into())
     })?;
 
@@ -355,8 +430,13 @@ pub async fn remove_factor(
     if remaining == 0 {
         state.registry.set_mfa(user_id, false);
     }
-    state.audit.record(Event::new(Kind::MfaRemoved).by(user_id).client(&client));
-    notify(&state, &current.user.email, "An authenticator app was removed from your account.");
+    let details = Details::factor(removed.kind, removed.label);
+    state.audit.record(Event::new(Kind::MfaRemoved).by(user_id).client(&client).details(details));
+    let what = match removed.kind {
+        FactorKind::Totp => "An authenticator app was removed from your account.",
+        FactorKind::Passkey => "A passkey was removed from your account.",
+    };
+    notify(&state, &current.user.email, what);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -373,7 +453,7 @@ pub async fn regenerate_recovery_codes(
     SteppedUp(current): SteppedUp,
 ) -> Result<Json<RecoveryCodes>, ApiError> {
     if !current.account.mfa {
-        return Err(ApiError::bad_request("add an authenticator first"));
+        return Err(ApiError::bad_request("add a second factor first"));
     }
     let codes: Vec<String> = (0..totp::RECOVERY_CODES).map(|_| totp::new_recovery_code()).collect();
     let hashes: Vec<Vec<u8>> = codes.iter().map(|code| auth::token_hash(&totp::normalize_recovery_code(code))).collect();

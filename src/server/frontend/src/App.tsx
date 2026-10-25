@@ -101,7 +101,7 @@ function SignedOutOrIn(): JSX.Element {
   }
   // Keyed so a different account never inherits the last one's dashboard.
   return (
-    <StepUpProvider>
+    <StepUpProvider user={user}>
       <Console key={user.id} user={user} identity={identity} onSessionEnded={leave} onAccountChanged={refreshUser} />
     </StepUpProvider>
   );

@@ -100,6 +100,8 @@ roots.
 | `HAWK_MAIL_FROM` | none | Sender address, e.g. `Hawk <hawk@example.com>`. |
 | `FRONTEND_DIST` | `frontend/dist` | The built dashboard to serve. |
 | `HAWK_ALLOWED_ORIGINS` | none | Other origins that may sign in to this relay, comma separated: the desktop app (`http://tauri.localhost,tauri://localhost`) and any separately hosted dashboard. They get bearer tokens instead of the cookie. |
+| `HAWK_WEBAUTHN_RP_ID` | the host of `PUBLIC_URL` | The domain passkeys are bound to; `off` turns them off. See [Passkeys](#passkeys). |
+| `HAWK_WEBAUTHN_ORIGINS` | `PUBLIC_URL`, and the `HAWK_ALLOWED_ORIGINS` on the RP ID | The pages that may use passkeys, comma separated. |
 | `HAWK_AUDIT_RETENTION_DAYS` | `90` | How many days the activity log keeps events. `0` keeps them forever. Older ones are deleted hourly. |
 | `HAWK_SERVER_ROOT` | `src/server` | The directory the default paths above are relative to. |
 | `RUST_LOG` | `info` | Log detail, e.g. `debug`. |
@@ -131,6 +133,43 @@ long as the key stays the same** (with certbot: `--reuse-key`).
 1. Add the new pin on every machine first, alongside the old one:
    `hawk-setup install machine --pin <old> --pin <new>`.
 2. Then switch the relay to the new key.
+
+## Passkeys
+
+Passkeys (security keys, Windows Hello, Touch ID, a phone) work as a
+second factor beside authenticator apps. A browser binds each passkey to a
+domain, the **RP ID**, and only lets pages on that domain or under it use
+it. That's what makes them phishing-proof, and why the relay has to know
+where the dashboard is served. At startup it logs `passkeys are on` with
+the RP ID and the origins it accepts, or why they're off.
+
+- **The dashboard served by the relay** (the usual case): nothing to set.
+  The RP ID is the host of `PUBLIC_URL`, e.g. `relay.example.com`.
+- **A dashboard hosted on another subdomain**, e.g. `dash.example.com` with
+  the relay at `relay.example.com`: set `HAWK_WEBAUTHN_RP_ID=example.com`.
+  The dashboard's origin, already in `HAWK_ALLOWED_ORIGINS`, is picked up;
+  or list every origin in `HAWK_WEBAUTHN_ORIGINS`
+  (`https://relay.example.com,https://dash.example.com`).
+- **A dashboard on an unrelated domain** (e.g. `you.github.io`): one RP ID
+  can't cover both it and the relay's domain. Pick the one people use:
+  `HAWK_WEBAUTHN_RP_ID=you.github.io` and
+  `HAWK_WEBAUTHN_ORIGINS=https://you.github.io`. The other dashboard then
+  doesn't offer passkeys; codes still work there.
+- **An IP address only** (no `PUBLIC_URL` with a domain): passkeys are off.
+  Browsers don't allow them on an IP.
+- **The desktop app** never offers passkeys: its page lives at
+  `tauri.localhost` (or `tauri://localhost`), outside any relay's RP ID.
+  People who use the app need an authenticator app or recovery codes too.
+- **Development:** with the dashboard's dev server,
+  `HAWK_WEBAUTHN_RP_ID=localhost HAWK_WEBAUTHN_ORIGINS=http://localhost:5173`.
+
+**Choose the RP ID before anyone adds a passkey.** Passkeys stay bound to
+the RP ID they were made for: after a change, they stop working and have
+to be removed (after signing in with a code) and added again.
+
+Mistakes stop the relay at startup rather than in a browser: an origin
+outside the RP ID, an IP or a URL as the RP ID, or plain `http` anywhere
+but `localhost`.
 
 ## Email
 

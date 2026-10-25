@@ -13,6 +13,7 @@ export interface ActivityDetails {
   filesDown?: number;
   elevated?: boolean;
   recoveryCode?: boolean;
+  factor?: "totp" | "passkey"; // the kind of second factor added, removed or proved
   name?: string;
   startsAt?: number;
   expiresAt?: number;
@@ -65,12 +66,12 @@ export const CATEGORIES: readonly (readonly [Category, string])[] = [
 const LABELS: Record<string, [Exclude<Category, "all">, string]> = {
   sign_in: ["account", "Signed in"],
   sign_in_failed: ["account", "Sign-in failed"],
-  mfa_failed: ["account", "Wrong second-factor code"],
-  step_up: ["account", "Confirmed with a code"],
+  mfa_failed: ["account", "Wrong second factor"],
+  step_up: ["account", "Confirmed identity"],
   signed_up: ["account", "Account created"],
   password_changed: ["account", "Password changed"],
-  mfa_added: ["account", "Authenticator added"],
-  mfa_removed: ["account", "Authenticator removed"],
+  mfa_added: ["account", "Second factor added"],
+  mfa_removed: ["account", "Second factor removed"],
   recovery_codes_regenerated: ["account", "New recovery codes"],
   mfa_reset: ["account", "Two-factor reset by the admin"],
   user_disabled: ["account", "Account disabled"],
@@ -159,6 +160,7 @@ export function describeDetails(event: ActivityEvent): string {
   if (event.subjectEmail !== null && event.subjectId !== event.userId) parts.push(event.subjectEmail);
   if (event.role !== null && event.kind !== "view_ended") parts.push(`as ${event.role}`);
   if (details.reason !== undefined) parts.push(details.reason);
+  if (details.factor !== undefined) parts.push(describeFactor(event.kind, details.factor));
   if (details.name !== undefined && event.kind !== "machine_renamed") parts.push(`"${details.name}"`);
   if (details.name !== undefined && event.kind === "machine_renamed") parts.push(`to "${details.name}"`);
   if (details.seconds !== undefined) parts.push(formatDuration(details.seconds));
@@ -175,4 +177,11 @@ export function describeDetails(event: ActivityEvent): string {
   if (details.analytics === true) parts.push("with analytics");
   if (details.requireMfa !== undefined) parts.push(details.requireMfa ? "required" : "optional");
   return parts.join(" · ");
+}
+
+// "passkey" for one added or removed, "with a passkey" for one proved.
+function describeFactor(kind: string, factor: "totp" | "passkey"): string {
+  const changed = kind === "mfa_added" || kind === "mfa_removed";
+  if (factor === "passkey") return changed ? "passkey" : "with a passkey";
+  return changed ? "authenticator app" : "with a code";
 }

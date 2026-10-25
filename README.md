@@ -169,7 +169,8 @@ Releases aren't signed with a Windows code-signing certificate, so SmartScreen w
 - [x] End-to-end encryption of video and input, with viewer access decided by the owner's signatures rather than the relay
 - [ ] Self-signed certificate automation
 - [x] Multi-factor authentication: TOTP, recovery codes, step-up, admin policy and reset
-- [ ] WebAuthn / passkeys
+- [x] WebAuthn / passkeys as a second factor and for step-up (security keys, platform and synced passkeys)
+- [ ] Passwordless sign-in with a passkey
 - [x] Email ownership verification and security notices (when the relay has a mailer)
 - [ ] Trusted-proxy address resolution, with IP allow/deny lists
 - [x] Machine analytics (CPU/RAM/GPU/disk/network, processes) with charts, history kept on the machine, end-to-end encrypted
@@ -216,21 +217,26 @@ Each of the unchecked items is described under [Planned Features](#planned-featu
 Design intent for the work that isn't built yet. Nothing in this section is
 implemented; it's here so the shape is settled before the code is.
 
-### Multi-factor authentication (TOTP and recovery codes built)
+### Multi-factor authentication (TOTP, passkeys and recovery codes built)
 
 The relay is the only gate in front of every machine, so a stolen password
-has to not be enough. TOTP, recovery codes, step-up, the admin policy and
-reset are built (`src/server/README.md`, "Two-factor authentication"), as
-are email verification and security notices. WebAuthn and email codes are
-still to come. In rough order of value:
+has to not be enough. TOTP, passkeys as a second factor, recovery codes,
+step-up, the admin policy and reset are built (`src/server/README.md`,
+"Two-factor authentication"), as are email verification and security
+notices. Passwordless sign-in and email codes are still to come. In rough
+order of value:
 
 * **TOTP** (RFC 6238, any authenticator app) — the baseline, works offline
   and needs nothing from the browser.
 * **WebAuthn / passkeys** — hardware keys (YubiKey, Titan) and platform
   authenticators (Windows Hello, Touch ID, Android). Phishing-resistant
   because the credential is bound to the relay's origin, which a password
-  or a TOTP code never is. Long-term this is the one worth making the
-  default, with a passkey-only login that skips the password entirely.
+  or a TOTP code never is. Built as a second factor, accepted wherever a
+  code is and offered first. Still to come: the passkey-only login that
+  skips the password entirely, which needs discoverable credentials (the
+  account's random WebAuthn user handle is already kept for it) and a
+  thought-out answer for the identity key, which is unwrapped with the
+  password today. Long-term that's the one worth making the default.
 * **Recovery codes** — a short set of single-use codes shown once at
   enrollment, stored the way session and invite tokens already are (32
   random bytes, only the SHA-256 kept). Without these, a lost phone means

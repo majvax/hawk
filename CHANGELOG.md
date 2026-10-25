@@ -5,6 +5,28 @@ Each release's section becomes its release notes (see
 
 ## Unreleased
 
+- **Passkeys as a second factor.** Security keys (YubiKey, Titan),
+  Windows Hello, Touch ID and phones, beside authenticator apps: add one or
+  more in **Settings → Two-factor authentication**, name them, remove them
+  (a step-up action, like adding a later one; the first is confirmed with
+  the password and comes with recovery codes). Wherever a code is asked
+  for, signing in or confirming an action, a passkey answers too and is
+  offered first. A passkey counts toward **Require two-factor**, the limit
+  of 8 factors, the code lockout (10 wrong answers per 15 minutes per
+  account) and the admin's reset. Unlike a code, it can't be phished: the
+  browser binds it to the server's domain. Challenges are kept on the
+  relay, single-use, for 2 minutes, tied to the account and the session or
+  sign-in; a signature counter that goes backwards (a copied key) is
+  refused. The activity log says which kind of factor was added, removed
+  or used. User verification preferred, no attestation; the checks
+  (client data, authenticator data, ES256/EdDSA/RS256 signatures) are the
+  relay's own, in pure Rust on `ring`, so no OpenSSL. Where passkeys
+  work is set by `HAWK_WEBAUTHN_RP_ID` and `HAWK_WEBAUTHN_ORIGINS`, by
+  default the domain of `PUBLIC_URL`; a
+  dashboard hosted elsewhere needs to share a parent domain with it. Off
+  on a relay reached by IP address, and never offered in the desktop app,
+  whose page can't be on the server's domain. A passkey is a second factor
+  only: signing in without the password is planned.
 - **Activity log.** The relay records who signed in (and who failed to,
   from where), who watched which machine and for how long, when a view
   took control, used a shell or files or pasted a picture (and how much

@@ -31,7 +31,7 @@ use tracing::{error, info, warn};
 use crate::AppState;
 use crate::api;
 use crate::auth::{self, AdminUser, CurrentUser};
-use crate::db::{self, AuditFilter, Db, MachineRow, Role, SessionOrigin};
+use crate::db::{self, AuditFilter, Db, FactorKind, MachineRow, Role, SessionOrigin};
 use crate::error::ApiError;
 
 /// Events waiting for the writer before new ones are dropped: minutes of
@@ -213,6 +213,9 @@ pub struct Details {
     /// The second factor was a recovery code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_code: Option<bool>,
+    /// The kind of second factor added, removed, or proved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factor: Option<FactorKind>,
     /// A machine's new name, an authenticator's label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -242,6 +245,11 @@ impl Details {
 
     pub fn name(name: impl Into<String>) -> Self {
         Self { name: Some(name.into()), ..Self::default() }
+    }
+
+    /// A factor added or removed: its kind and label.
+    pub fn factor(kind: FactorKind, label: impl Into<String>) -> Self {
+        Self { factor: Some(kind), name: Some(label.into()), ..Self::default() }
     }
 }
 
@@ -720,6 +728,7 @@ mod tests {
             mailer: None,
             allowed_origins: Arc::new(AllowedOrigins::default()),
             audit,
+            passkeys: Arc::new(crate::passkeys::Passkeys::new(None)),
         };
         (state, events)
     }
@@ -776,7 +785,7 @@ mod tests {
             user: db::User { id: user_id, email: format!("user{user_id}@example.com"), is_admin },
             session_id: user_id,
             step_up_at: None,
-            account: AccountFlags { mfa: false, email_verified: true, mfa_required: false },
+            account: AccountFlags { mfa: false, email_verified: true, mfa_required: false, passkeys: false },
         }
     }
 

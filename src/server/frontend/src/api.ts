@@ -5,6 +5,7 @@
 
 import { type ActivityFilter, type ActivityPage, activityQuery } from "./activity.js";
 import { apiUrl, relayPageUrl, sessionToken, setSessionToken } from "./relay.js";
+import type { CreationOptionsJson, RequestOptionsJson } from "./webauthn.js";
 
 export interface User {
   id: number;
@@ -15,6 +16,9 @@ export interface User {
   // The admin requires a second factor and this account has none: setting
   // one up is all the relay allows until it does.
   mfaSetupRequired: boolean;
+  passkeys: boolean; // one of the second factors is a passkey
+  // Where this relay's passkeys work (a domain); null when it has them off.
+  passkeyRpId: string | null;
 }
 
 export interface AdminUserRow {
@@ -53,7 +57,7 @@ export class ApiError extends Error {
   }
 }
 
-// Asks the user for a code and steps the session up; resolves false when
+// Asks the user for a second factor and steps the session up; resolves false when
 // they cancel. Set by the signed-in console (see StepUpProvider).
 let stepUpHandler: (() => Promise<boolean>) | null = null;
 
@@ -97,7 +101,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     return await send<T>(method, path, body);
   } catch (error) {
     if (!(error instanceof ApiError && error.stepUp) || stepUpHandler === null) throw error;
-    if (!(await stepUpHandler())) throw new ApiError(error.status, "cancelled: this needs a code from your authenticator");
+    if (!(await stepUpHandler())) throw new ApiError(error.status, "cancelled: this needs your passkey or a code");
     return send<T>(method, path, body);
   }
 }
@@ -129,13 +133,19 @@ export interface KeyUpload {
 
 export const loginParams = (email: string) => request<LoginParams>("POST", "/api/login/params", { email });
 // A correct password on an account with a second factor gets a ticket to
-// trade for a session with a code, rather than a session.
-export type LoginResult = User | { mfaRequired: true; ticket: string };
+// trade for a session with a code or a passkey, rather than a session.
+// passkeyRpId is set when the account has a passkey to answer with.
+export type LoginResult = User | { mfaRequired: true; ticket: string; passkeyRpId: string | null };
 // `password` is the derived auth key, or for a legacy account the password.
 export const login = (email: string, password: string) =>
   request<LoginResult>("POST", "/api/login", { email, password });
-// `code`: from an authenticator app, or a recovery code.
-export const loginMfa = (ticket: string, code: string) => request<User>("POST", "/api/login/mfa", { ticket, code });
+// A second factor as sent: a code (from an authenticator app, or a recovery
+// code), or a passkey's answer (webauthn.ts) to the challenge the relay gave.
+export type FactorAnswer = { code: string } | { passkey: unknown };
+export const loginMfa = (ticket: string, answer: FactorAnswer) =>
+  request<User>("POST", "/api/login/mfa", { ticket, ...answer });
+export const loginPasskeyChallenge = (ticket: string) =>
+  send<RequestOptionsJson>("POST", "/api/login/mfa/passkey", { ticket });
 export const logout = () => request<void>("POST", "/api/logout").finally(() => setSessionToken(null));
 export const getInvite = (token: string) => request<InviteInfo>("GET", `/api/invites/${encodeURIComponent(token)}`);
 export const signup = (token: string, email: string, password: string, key: KeyUpload) =>
@@ -162,12 +172,14 @@ export const changePassword = (currentPassword: string, newPassword: string, wra
 export const listSessions = () => request<Session[]>("GET", "/api/sessions");
 
 // Proves a second factor for this session for the next few minutes.
-export const stepUp = (code: string) => send<{ until: number }>("POST", "/api/account/step-up", { code });
+export const stepUp = (answer: FactorAnswer) => send<{ until: number }>("POST", "/api/account/step-up", answer);
+export const stepUpPasskeyChallenge = () => send<RequestOptionsJson>("POST", "/api/account/step-up/passkey");
 export const verifyEmail = (token: string) => request<void>("POST", "/api/account/verify-email", { token });
 export const resendVerification = () => request<void>("POST", "/api/account/verify-email/resend");
 
 export interface Factor {
   id: number;
+  kind: "totp" | "passkey";
   label: string;
   createdAt: number;
   lastUsedAt: number | null;
@@ -185,6 +197,12 @@ export const totpSetup = () => request<{ secret: string; uri: string }>("POST", 
 // `password` (the derived auth key) is needed for the first factor only.
 export const addTotp = (secret: string, code: string, label: string, password?: string) =>
   request<{ recoveryCodes: string[] | null }>("POST", "/api/account/mfa/totp", { secret, code, label, password });
+// A challenge to make a passkey with; `password` as for addTotp.
+export const passkeySetup = (password?: string) =>
+  request<CreationOptionsJson>("POST", "/api/account/mfa/passkey/setup", { password });
+// `credential`: what the browser made for that challenge (webauthn.ts).
+export const addPasskey = (credential: unknown, label: string) =>
+  request<{ recoveryCodes: string[] | null }>("POST", "/api/account/mfa/passkey", { credential, label });
 export const removeFactor = (id: number) => request<void>("DELETE", `/api/account/mfa/${id}`);
 export const regenerateRecoveryCodes = () =>
   request<{ recoveryCodes: string[] }>("POST", "/api/account/mfa/recovery-codes");

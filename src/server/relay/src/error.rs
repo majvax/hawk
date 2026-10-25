@@ -52,7 +52,7 @@ impl IntoResponse for ApiError {
             }
             Self::StepUpRequired => (
                 StatusCode::FORBIDDEN,
-                json!({ "error": "confirm with a code from your authenticator first", "stepUp": true }),
+                json!({ "error": "confirm with a passkey or a code from your authenticator first", "stepUp": true }),
             ),
             Self::MfaSetupRequired => (
                 StatusCode::FORBIDDEN,

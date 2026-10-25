@@ -207,6 +207,33 @@ const MIGRATIONS: &[&str] = &["
     CREATE INDEX audit_events_subject ON audit_events (subject_id, id) WHERE subject_id IS NOT NULL;
     CREATE INDEX audit_events_owner ON audit_events (owner_id, id) WHERE owner_id IS NOT NULL;
     CREATE INDEX audit_events_machine ON audit_events (machine_id, id) WHERE machine_id IS NOT NULL;
+", "
+    -- Passkeys (WebAuthn) as a second factor beside TOTP. SQLite can't
+    -- change a CHECK in place, so mfa_factors is rebuilt with the same rows.
+    -- A passkey is a public key: nothing to seal, only its integrity matters.
+    CREATE TABLE mfa_factors_new (
+        id            INTEGER PRIMARY KEY,
+        user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind          TEXT    NOT NULL CHECK (kind IN ('totp', 'passkey')),
+        label         TEXT    NOT NULL,
+        secret        BLOB,                          -- totp: the seed, sealed with auth::SecretKey
+        last_counter  INTEGER NOT NULL DEFAULT -1,   -- totp: last time step accepted; passkey: sign counter
+        created_at    INTEGER NOT NULL,
+        last_used_at  INTEGER,
+        credential_id BLOB    UNIQUE,                -- passkey: as the authenticator named it
+        credential    TEXT,                          -- passkey: COSE public key, algorithm and flags, JSON
+        transports    TEXT,                          -- passkey: how the browser reached it, JSON array
+        CHECK ((kind = 'totp') = (secret IS NOT NULL)),
+        CHECK ((kind = 'passkey') = (credential_id IS NOT NULL AND credential IS NOT NULL))
+    );
+    INSERT INTO mfa_factors_new (id, user_id, kind, label, secret, last_counter, created_at, last_used_at)
+        SELECT id, user_id, kind, label, secret, last_counter, created_at, last_used_at FROM mfa_factors;
+    DROP TABLE mfa_factors;
+    ALTER TABLE mfa_factors_new RENAME TO mfa_factors;
+    CREATE INDEX mfa_factors_user_id ON mfa_factors (user_id);
+    -- The account's WebAuthn user handle: random, so it says nothing about
+    -- the account. Made with its first passkey.
+    ALTER TABLE users ADD COLUMN webauthn_handle BLOB;
 "];
 
 #[derive(Clone)]
@@ -500,15 +527,23 @@ pub struct AccountFlags {
     pub email_verified: bool,
     /// The admin requires a second factor on every account.
     pub mfa_required: bool,
+    /// At least one of the second factors is a passkey.
+    pub passkeys: bool,
 }
 
 const ACCOUNT_FLAGS_SQL: &str = "
     EXISTS (SELECT 1 FROM mfa_factors f WHERE f.user_id = u.id),
     u.email_verified_at IS NOT NULL,
-    EXISTS (SELECT 1 FROM settings WHERE key = 'require_mfa' AND value = '1')";
+    EXISTS (SELECT 1 FROM settings WHERE key = 'require_mfa' AND value = '1'),
+    EXISTS (SELECT 1 FROM mfa_factors f WHERE f.user_id = u.id AND f.kind = 'passkey')";
 
 fn account_flags_from(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<AccountFlags> {
-    Ok(AccountFlags { mfa: row.get(first)?, email_verified: row.get(first + 1)?, mfa_required: row.get(first + 2)? })
+    Ok(AccountFlags {
+        mfa: row.get(first)?,
+        email_verified: row.get(first + 1)?,
+        mfa_required: row.get(first + 2)?,
+        passkeys: row.get(first + 3)?,
+    })
 }
 
 /// The live session for this token: not expired, user not disabled.
@@ -720,8 +755,24 @@ pub fn purge_expired(conn: &Connection, now: i64) -> rusqlite::Result<()> {
 
 // ---- second factors, email verification, settings -------------------------
 
+/// What a second factor is: an authenticator app or a passkey. Stored, and
+/// sent to the dashboard and the audit log, as its snake_case name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactorKind {
+    Totp,
+    Passkey,
+}
+
+impl FactorKind {
+    fn from_sql(text: &str) -> Self {
+        if text == "passkey" { Self::Passkey } else { Self::Totp }
+    }
+}
+
 pub struct FactorRow {
     pub id: i64,
+    pub kind: FactorKind,
     pub label: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
@@ -735,11 +786,18 @@ pub struct TotpFactor {
 
 pub fn list_factors(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<FactorRow>> {
     let mut statement = conn.prepare(
-        "SELECT id, label, created_at, last_used_at FROM mfa_factors WHERE user_id = ?1 ORDER BY created_at, id",
+        "SELECT id, kind, label, created_at, last_used_at FROM mfa_factors
+          WHERE user_id = ?1 ORDER BY created_at, id",
     )?;
     statement
         .query_map([user_id], |row| {
-            Ok(FactorRow { id: row.get(0)?, label: row.get(1)?, created_at: row.get(2)?, last_used_at: row.get(3)? })
+            Ok(FactorRow {
+                id: row.get(0)?,
+                kind: FactorKind::from_sql(&row.get::<_, String>(1)?),
+                label: row.get(2)?,
+                created_at: row.get(3)?,
+                last_used_at: row.get(4)?,
+            })
         })?
         .collect()
 }
@@ -792,6 +850,133 @@ pub fn add_totp_factor(
     }
     delete_other_sessions(&tx, user_id, keep_session)?;
     tx.commit()
+}
+
+/// A passkey as stored.
+pub struct StoredPasskey {
+    pub id: i64,
+    pub credential_id: Vec<u8>,
+    /// Its public key and flags, JSON (crate::passkeys).
+    pub credential: String,
+    /// The last sign counter seen.
+    pub counter: i64,
+    /// JSON array.
+    pub transports: Option<String>,
+}
+
+const PASSKEY_COLUMNS: &str = "id, credential_id, credential, last_counter, transports";
+
+fn passkey_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPasskey> {
+    Ok(StoredPasskey {
+        id: row.get(0)?,
+        credential_id: row.get(1)?,
+        credential: row.get(2)?,
+        counter: row.get(3)?,
+        transports: row.get(4)?,
+    })
+}
+
+/// Every passkey of the account, to ask for any of them.
+pub fn passkeys(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<StoredPasskey>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT {PASSKEY_COLUMNS} FROM mfa_factors WHERE user_id = ?1 AND kind = 'passkey' ORDER BY id"
+    ))?;
+    statement.query_map([user_id], passkey_from)?.collect()
+}
+
+/// The account's passkey with this credential id; None if it's another
+/// account's, or no one's.
+pub fn passkey(conn: &Connection, user_id: i64, credential_id: &[u8]) -> rusqlite::Result<Option<StoredPasskey>> {
+    conn.query_row(
+        &format!(
+            "SELECT {PASSKEY_COLUMNS} FROM mfa_factors
+              WHERE user_id = ?1 AND kind = 'passkey' AND credential_id = ?2"
+        ),
+        params![user_id, credential_id],
+        passkey_from,
+    )
+    .optional()
+}
+
+/// How many passkeys are registered, across every account.
+pub fn count_passkeys(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM mfa_factors WHERE kind = 'passkey'", [], |row| row.get(0))
+}
+
+/// Records a passkey's use: the sign counter it gave, and when.
+pub fn use_passkey(conn: &Connection, factor_id: i64, counter: i64, now: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mfa_factors SET last_counter = MAX(last_counter, ?1), last_used_at = ?2 WHERE id = ?3",
+        params![counter, now, factor_id],
+    )?;
+    Ok(())
+}
+
+/// A passkey to add, as the registration produced it.
+pub struct NewPasskey<'a> {
+    pub label: &'a str,
+    pub credential_id: &'a [u8],
+    pub credential: &'a str,
+    pub counter: i64,
+    /// JSON array.
+    pub transports: Option<&'a str>,
+}
+
+/// Adds a passkey and ends every other session the user has, in one step,
+/// like [`add_totp_factor`]. False when the credential is already
+/// registered, to this account or another.
+pub fn add_passkey_factor(
+    conn: &Connection,
+    user_id: i64,
+    passkey: &NewPasskey<'_>,
+    recovery_hashes: &[Vec<u8>],
+    keep_session: i64,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let inserted = tx.execute(
+        "INSERT INTO mfa_factors
+                (user_id, kind, label, credential_id, credential, last_counter, transports, created_at, last_used_at)
+         VALUES (?1, 'passkey', ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![
+            user_id,
+            passkey.label,
+            passkey.credential_id,
+            passkey.credential,
+            passkey.counter,
+            passkey.transports,
+            now
+        ],
+    );
+    match inserted {
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            return Ok(false);
+        }
+        other => {
+            other?;
+        }
+    }
+    if !recovery_hashes.is_empty() {
+        replace_recovery_codes(&tx, user_id, recovery_hashes)?;
+    }
+    delete_other_sessions(&tx, user_id, keep_session)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The account's WebAuthn user handle; `fresh` becomes it the first time.
+pub fn webauthn_handle(conn: &Connection, user_id: i64, fresh: [u8; 16]) -> rusqlite::Result<[u8; 16]> {
+    conn.execute(
+        "UPDATE users SET webauthn_handle = ?1 WHERE id = ?2 AND webauthn_handle IS NULL",
+        params![fresh.as_slice(), user_id],
+    )?;
+    let handle: Vec<u8> =
+        conn.query_row("SELECT webauthn_handle FROM users WHERE id = ?1", [user_id], |row| row.get(0))?;
+    handle.try_into().map_err(|_| {
+        rusqlite::Error::InvalidColumnType(0, "webauthn_handle".into(), rusqlite::types::Type::Blob)
+    })
 }
 
 /// Removes one of the user's factors and ends their other sessions. The
@@ -1729,5 +1914,86 @@ mod tests {
         assert!(account_flags(&conn, 1).unwrap().mfa_required);
         assert!(delete_factor(&conn, 1, id, 0).unwrap());
         assert_eq!(unused_recovery_codes(&conn, 1).unwrap(), 0);
+    }
+
+    /// The rebuild that lets a factor be a passkey keeps every authenticator
+    /// as it was; a credential belongs to one account only.
+    #[test]
+    fn passkey_migration_keeps_authenticators() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let before = MIGRATIONS.iter().position(|migration| migration.contains("mfa_factors_new")).unwrap();
+        for (version, migration) in (1_i64..).zip(&MIGRATIONS[..before]) {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        for id in [1, 2] {
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash, created_at) VALUES (?1, ?2, 'x', 0)",
+                params![id, format!("user{id}@example.com")],
+            )
+            .unwrap();
+        }
+        let factor = NewTotp { label: "phone", secret: b"sealed", counter: 10 };
+        add_totp_factor(&conn, 1, &factor, &[], 0, 100).unwrap();
+
+        migrate(&conn).unwrap();
+        let totp = totp_factors(&conn, 1).unwrap();
+        assert_eq!((totp.len(), totp[0].secret.as_slice()), (1, b"sealed".as_slice()));
+        assert!(!use_totp_counter(&conn, totp[0].id, 10, 101).unwrap());
+        assert!(!account_flags(&conn, 1).unwrap().passkeys);
+
+        let key = NewPasskey { label: "key", credential_id: b"cred", credential: "{}", counter: 0, transports: None };
+        assert!(add_passkey_factor(&conn, 1, &key, &[], 0, 100).unwrap());
+        assert!(!add_passkey_factor(&conn, 2, &key, &[], 0, 100).unwrap());
+        let flags = account_flags(&conn, 1).unwrap();
+        assert!(flags.mfa && flags.passkeys);
+        assert!(passkey(&conn, 1, b"cred").unwrap().is_some());
+        assert!(passkey(&conn, 2, b"cred").unwrap().is_none());
+        let kinds: Vec<_> = list_factors(&conn, 1).unwrap().into_iter().map(|factor| factor.kind).collect();
+        assert_eq!(kinds, [FactorKind::Totp, FactorKind::Passkey]);
+        // A passkey has no seed; an authenticator has nothing but.
+        let seedless = "INSERT INTO mfa_factors (user_id, kind, label, created_at) VALUES (1, 'totp', 'x', 0)";
+        assert!(conn.execute(seedless, []).is_err());
+        assert_eq!(webauthn_handle(&conn, 1, [1; 16]).unwrap(), [1; 16]);
+        assert_eq!(webauthn_handle(&conn, 1, [2; 16]).unwrap(), [1; 16]);
+    }
+
+    /// After the rebuild, the table still belongs to its users: no dangling
+    /// references, a factor of no one is refused, and an account's factors
+    /// go with it.
+    #[test]
+    fn passkey_migration_keeps_foreign_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let before = MIGRATIONS.iter().position(|migration| migration.contains("mfa_factors_new")).unwrap();
+        for (version, migration) in (1_i64..).zip(&MIGRATIONS[..before]) {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        conn.execute("INSERT INTO users (id, email, password_hash, created_at) VALUES (1, 'a@example.com', 'x', 0)", [])
+            .unwrap();
+        let factor = NewTotp { label: "phone", secret: b"sealed", counter: 3 };
+        add_totp_factor(&conn, 1, &factor, &[b"hash".to_vec()], 0, 100).unwrap();
+        let id: i64 = conn.query_row("SELECT id FROM mfa_factors", [], |row| row.get(0)).unwrap();
+
+        migrate(&conn).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, i64::try_from(MIGRATIONS.len()).unwrap());
+        let row: (i64, i64, String, String, i64, i64) = conn
+            .query_row("SELECT id, user_id, kind, label, last_counter, created_at FROM mfa_factors", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })
+            .unwrap();
+        assert_eq!(row, (id, 1, "totp".into(), "phone".into(), 3, 100));
+        assert_eq!(unused_recovery_codes(&conn, 1).unwrap(), 1);
+        let dangling: Vec<String> =
+            conn.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+        assert!(dangling.is_empty(), "{dangling:?}");
+        let orphan = "INSERT INTO mfa_factors (user_id, kind, label, secret, created_at) VALUES (99, 'totp', 'x', x'00', 0)";
+        assert!(conn.execute(orphan, []).is_err());
+        conn.execute("DELETE FROM users WHERE id = 1", []).unwrap();
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM mfa_factors", [], |row| row.get(0)).unwrap();
+        assert_eq!(left, 0);
     }
 }

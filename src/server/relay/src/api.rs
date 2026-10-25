@@ -10,7 +10,8 @@
 //! sends the password itself one last time to upgrade them.
 //!
 //! An account with a second factor logs in in two steps: the password earns
-//! a short-lived ticket, and a code trades it for a session (see crate::mfa).
+//! a short-lived ticket, and a code or a passkey trades it for a session (see
+//! crate::mfa and crate::passkeys).
 //! With a mailer configured, a new account also has to confirm its email
 //! address before machines can be shared with it or enrolled under it.
 
@@ -31,7 +32,8 @@ use crate::db::{self, AccountFlags, NewCredentials, SignupError, User};
 use crate::e2e;
 use crate::error::ApiError;
 use crate::mail;
-use crate::mfa::{self, Proof};
+use crate::mfa::{self, Answer, Proof};
+use crate::passkeys::Ceremony;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +47,11 @@ pub struct UserView {
     /// The admin requires a second factor and this account has none: the
     /// dashboard only offers setting one up.
     mfa_setup_required: bool,
+    /// One of the second factors is a passkey.
+    passkeys: bool,
+    /// Where passkeys work (crate::passkeys): None when they're off on this
+    /// relay. A dashboard on a page outside it doesn't offer them.
+    passkey_rp_id: Option<String>,
 }
 
 impl UserView {
@@ -56,6 +63,8 @@ impl UserView {
             mfa: account.mfa,
             email_verified: email_verified(state, account),
             mfa_setup_required: account.mfa_required && !account.mfa,
+            passkeys: account.passkeys,
+            passkey_rp_id: state.passkeys.rp_id().map(str::to_owned),
         }
     }
 
@@ -160,6 +169,9 @@ pub enum LoginOutcome {
     MfaRequired {
         mfa_required: bool,
         ticket: String,
+        /// The relying party ID, when the account has a passkey to answer
+        /// with (and passkeys are on): the dashboard offers it first.
+        passkey_rp_id: Option<String>,
     },
 }
 
@@ -222,7 +234,8 @@ pub async fn login(
     let account = state.db.call(move |conn| db::account_flags(conn, user_id)).await?;
     if account.mfa {
         let ticket = state.mfa_tickets.issue(user_id, session_origin(peer, &headers));
-        return Ok((jar, None, Json(LoginOutcome::MfaRequired { mfa_required: true, ticket })));
+        let passkey_rp_id = state.passkeys.rp_id().filter(|_| account.passkeys).map(str::to_owned);
+        return Ok((jar, None, Json(LoginOutcome::MfaRequired { mfa_required: true, ticket, passkey_rp_id })));
     }
     let (jar, token) = start_session(&state, jar, &headers, user_id, session_origin(peer, &headers), false).await?;
     state.audit.record(Event::new(Kind::SignIn).by(user_id).client(&client));
@@ -232,12 +245,20 @@ pub async fn login(
 #[derive(Deserialize)]
 pub struct SecondStep {
     ticket: String,
-    code: String,
+    #[serde(flatten)]
+    answer: Answer,
 }
 
-/// The second step of a login: a code from an authenticator, or a recovery
-/// code, for the ticket the password earned. The new session counts as
-/// stepped up.
+impl SecondStep {
+    #[cfg(test)]
+    pub fn new(ticket: String, answer: Answer) -> Self {
+        Self { ticket, answer }
+    }
+}
+
+/// The second step of a login: a code from an authenticator, a recovery
+/// code, or a passkey's answer (see crate::passkeys::login_start), for the
+/// ticket the password earned. The new session counts as stepped up.
 pub async fn login_mfa(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -252,10 +273,11 @@ pub async fn login_mfa(
     let expired = || ApiError::bad_request("this sign-in has expired: enter your password again");
     let user_id = state.mfa_tickets.attempt(&body.ticket).ok_or_else(expired)?;
     let client = Client::from(&session_origin(peer, &headers));
-    let Some(proof) = mfa::check_code(&state, user_id, &body.code).await? else {
+    let ceremony = Ceremony::Login(auth::token_hash(&body.ticket));
+    let Some(proof) = mfa::check_answer(&state, user_id, ceremony, &body.answer).await? else {
         state.limiter.record_failure(ip);
-        state.audit.record(Event::new(Kind::MfaFailed).by(user_id).client(&client));
-        return Err(ApiError::bad_request("that code isn't right"));
+        state.audit.record(Event::new(Kind::MfaFailed).by(user_id).client(&client).details(body.answer.details()));
+        return Err(mfa::wrong_answer(&body.answer));
     };
     let redeemed = state.mfa_tickets.redeem(&body.ticket).ok_or_else(expired)?;
 
@@ -269,10 +291,8 @@ pub async fn login_mfa(
         .await?
         .ok_or(ApiError::Forbidden)?;
     let (jar, token) = start_session(&state, jar, &headers, redeemed.user_id, redeemed.origin, true).await?;
-    let recovery_code = proof == Proof::RecoveryCode;
-    let details = Details { recovery_code: recovery_code.then_some(true), ..Details::default() };
-    state.audit.record(Event::new(Kind::SignIn).by(user.id).client(&client).details(details));
-    if recovery_code {
+    state.audit.record(Event::new(Kind::SignIn).by(user.id).client(&client).details(proof.details()));
+    if proof == Proof::RecoveryCode {
         mfa::notify(&state, &user.email, "Someone signed in to your account with a recovery code.");
     }
     Ok((jar, token, Json(UserView::new(&state, user, account))))
