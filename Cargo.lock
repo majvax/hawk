@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "hawk-app"
-version = "1.0.0-rc.8"
+version = "1.0.0-rc.9"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "hawk-relay"
-version = "1.0.0-rc.8"
+version = "1.0.0-rc.9"
 dependencies = [
  "argon2",
  "axum",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "hawk-setup"
-version = "1.0.0-rc.8"
+version = "1.0.0-rc.9"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "hawk-update"
-version = "1.0.0-rc.8"
+version = "1.0.0-rc.9"
 dependencies = [
  "minisign",
  "minisign-verify",

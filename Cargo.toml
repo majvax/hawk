@@ -6,7 +6,7 @@ resolver = "3"
 members = ["src/server/relay", "src/update", "src/installer", "src/app"]
 
 [workspace.package]
-version = "1.0.0-rc.8"
+version = "1.0.0-rc.9"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
